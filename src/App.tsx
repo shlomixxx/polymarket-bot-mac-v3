@@ -1,0 +1,2693 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LineChart, Line, XAxis, YAxis, Tooltip, ReferenceLine, ResponsiveContainer } from "recharts";
+import { api, engineUrl } from "./api";
+import {
+  chartAxisTick,
+  chartTooltipStyle,
+  chartStroke,
+  smoothCurveType,
+  btcPriceLineCurveType,
+} from "./chartConstants";
+import { formatPnlAxisTime, formatPctAxisTick } from "./pnlChartFormatters";
+import { useChartAnimationGate } from "./hooks/useChartAnimationGate";
+import { Button } from "./ui/Button";
+import { Card } from "./ui/Card";
+import { ChartCard } from "./ui/ChartCard";
+import { SectionTitle } from "./ui/SectionTitle";
+import { PnlOpenAreaChart, PnlClosedAreaChart } from "./ui/PnlSessionAreaCharts";
+import TipsV2 from "./TipsV2";
+import SignalsPanel from "./SignalsPanel";
+import TriggerTrader from "./TriggerTrader";
+
+type Market = {
+  slug: string;
+  epoch: number;
+  title: string;
+  token_up: string;
+  token_down: string;
+  order_min_size: number;
+  window_sec?: number;
+  btc_window?: string;
+  seconds_left: number;
+  price_to_beat: number | null;
+  price_to_beat_note: string;
+};
+
+type SideSummary = { bid: number | null; ask: number | null; mid: number | null };
+type OrderbookSummary = {
+  slug: string;
+  up: SideSummary;
+  down: SideSummary;
+};
+
+type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "tips_v2" | "help";
+
+type Trade = {
+  id?: string;
+  ts?: number;
+  type?: string;
+  side?: string;
+  contracts?: number;
+  price?: number;
+  fee_est?: number;
+  token_id?: string;
+  session_id?: string;
+  realized_pnl?: number;
+  trade_num?: number;
+  peak_unrealized_pct?: number;
+  trough_unrealized_pct?: number;
+  potential_peak_unrealized_pct?: number;
+  potential_trough_unrealized_pct?: number;
+  peak_mark_bid?: number;
+  trough_mark_bid?: number;
+  peak_ts?: number;
+  trough_ts?: number;
+  pnl_path?: { ts: number; upnl_pct: number; bid?: number }[];
+  epoch?: number;
+  slug?: string;
+  window_sec?: number;
+  /** פירוק מחלון (ממנוע הדמו — פרוקסי Binance, לא Chainlink) */
+  settlement_btc_start?: number;
+  settlement_btc_end?: number;
+  settlement_won?: boolean;
+  resolved_outcome?: string;
+  settlement_price_source?: string;
+  [k: string]: unknown;
+};
+
+/** תואם ל־FEE_RATE במנוע הדמו (עמלת מכירה במימוש) */
+const ENGINE_FEE_RATE = 0.002;
+
+function usdToCentsLabel(usd: number): string {
+  if (!Number.isFinite(usd)) return "—";
+  return `${(usd * 100).toFixed(1)}¢`;
+}
+
+/** מחיר BTC בדולרים לתצוגת פירוק (ייחוס / סוף חלון) */
+function formatBtcUsdLabel(usd: number | null | undefined): string {
+  if (usd == null || !Number.isFinite(Number(usd))) return "—";
+  const n = Number(usd);
+  return `$${n.toLocaleString("en-US", { maximumFractionDigits: 0, minimumFractionDigits: 0 })}`;
+}
+
+const TIP_SETTLEMENT_BTC =
+  "פירוק Up/Down לפי Polymarket: אם מחיר ה-BTC בסוף החלון ≥ מחיר בתחילת החלון — מנצח Up; אחרת Down. " +
+  "המספרים כאן מהמנוע (פרוקסי Binance 1m), לא Chainlink הרשמי לפירוק.";
+
+const TIP_OPEN_BTC_LIVE =
+  "ייחוס פתיחת החלון (Price to Beat) מול מחיר BTC חי מהמסך. " +
+  "בסוף החלון: אם סוף ≥ ייחוס — מנצח Up; אחרת Down. במהלך החלון זה רק מצב נוכחי, לא פירוק סופי.";
+
+/** עלות הרגל לפי יציאת TP: proceeds − realized (כמו ב־demo_engine) */
+function legCostFromTpExit(t: Trade): number | null {
+  const c = Number(t.contracts);
+  const px = Number(t.price);
+  const rp = t.realized_pnl;
+  if (!c || c <= 0 || !Number.isFinite(px) || rp == null || !Number.isFinite(Number(rp))) return null;
+  const proceeds = px * c * (1 - ENGINE_FEE_RATE);
+  const legCost = proceeds - Number(rp);
+  return legCost > 0 ? legCost : null;
+}
+
+/** bid (דולרים) שמתאים לתשואה % היפותטית מול אותה עלות */
+function bidFromHypotheticalPct(legCost: number, contracts: number, pct: number): number | null {
+  if (!Number.isFinite(pct) || contracts <= 0 || legCost <= 0) return null;
+  const legVal = legCost * (1 + pct / 100);
+  return legVal / (contracts * (1 - ENGINE_FEE_RATE));
+}
+
+/** שינוי % במחיר הביד לעומת מחיר יציאת TP (לא מול עלות) */
+function pctVsExitPrice(exitUsd: number, bidUsd: number): number | null {
+  if (!Number.isFinite(exitUsd) || exitUsd <= 0 || !Number.isFinite(bidUsd)) return null;
+  return ((bidUsd - exitUsd) / exitUsd) * 100;
+}
+
+type SessionGroup = { sessionId: string; trades: Trade[] };
+
+function groupTradesBySession(trades: Trade[]): SessionGroup[] {
+  /** יציאות (EXPIRE/SELL) בלי session_id — מצמידים ל-session של ה-BUY באותו token_id */
+  const sorted = [...trades].sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+  const sessionByToken = new Map<string, string>();
+  for (const t of sorted) {
+    if (t.type === "BUY" && t.token_id) {
+      const sid = t.session_id || t.id;
+      if (sid) sessionByToken.set(t.token_id, sid);
+    }
+  }
+  const bySession = new Map<string, Trade[]>();
+  for (const t of trades) {
+    let sid = t.session_id;
+    if (!sid && t.token_id) {
+      const fromTok = sessionByToken.get(t.token_id);
+      if (fromTok) sid = fromTok;
+    }
+    if (!sid) {
+      sid = (t.type === "BUY" ? t.id : null) || `orphan-${t.id || Math.random()}`;
+    }
+    const key = sid || "none";
+    if (!bySession.has(key)) bySession.set(key, []);
+    bySession.get(key)!.push(t);
+  }
+  const groups: SessionGroup[] = [];
+  for (const [sessionId, list] of bySession) {
+    list.sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+    groups.push({ sessionId, trades: list });
+  }
+  groups.sort((a, b) => {
+    const tsA = a.trades[0]?.ts ?? 0;
+    const tsB = b.trades[0]?.ts ?? 0;
+    return (tsB as number) - (tsA as number);
+  });
+  return groups;
+}
+
+type LogEntry = { ts: number; msg: string; type: string; session_id?: string };
+type Leg = {
+  token_id?: string;
+  peak_unrealized_pct?: number;
+  trough_unrealized_pct?: number;
+  peak_ts?: number;
+  trough_ts?: number;
+  /** תשואה % מול עלות — עדכני מ־mark_to_market (כל ~1s עם רענון מסך) */
+  unrealized_pct?: number;
+  /** כש־CLOB לא החזיר bid — רגל מסומנת כלא עדכנית; המנוע לא מוסיף דגימות חדשות ל־pnl_path */
+  book_stale?: boolean;
+  pnl_path?: { ts: number; upnl_pct: number }[];
+};
+type LastMark = { legs?: Leg[]; book_stale?: boolean; ts?: number } | null;
+
+/** הסבר ל-tooltips: אחוזים = תשואה מול עלות, לא מחיר ליחידה (0.01–0.99) */
+const TIP_PCT_ROI =
+  "אחוז תשואה ביחס לעלות הממוצעת (רווח או הפסד לא ממומשים). אין לבלבל עם מחיר החוזה: מחיר ליחידה נשמר בדרך כלל בטווח 0.01–0.99 דולר. תשואה העולה על 100% אפשרית כאשר הערך ביחס לעלות מוכפל.";
+const TIP_PCT_POTENTIAL_AFTER_TP =
+  "מדד משני: תשואה באחוזים ביחס לעלות הכניסה, בנקודות הביקוש לאחר יציאה ביעד רווח — ולא ביחס למחיר היציאה.";
+const TIP_AFTER_TP_VS_EXIT =
+  "לאחר יציאה ביעד רווח: השוואה בין מחיר הביקוש הנוכחי למחיר היציאה (בסנטים ובאחוזים). המדד משמש להערכת תנודה ביחס ליציאה בפועל.";
+
+/** ציר Y: כולל שיא/שפל מסומני מים + מרווח נשימה */
+function yDomainForPnlChart(
+  series: { upnl: number }[],
+  peak?: number | null,
+  trough?: number | null,
+): [number, number] {
+  const vals: number[] = [];
+  for (const p of series) {
+    if (Number.isFinite(p.upnl)) vals.push(p.upnl);
+  }
+  if (peak != null && Number.isFinite(peak)) vals.push(peak);
+  if (trough != null && Number.isFinite(trough)) vals.push(trough);
+  if (vals.length === 0) return [-5, 5];
+  let lo = Math.min(...vals);
+  let hi = Math.max(...vals);
+  if (lo === hi) {
+    lo -= 1;
+    hi += 1;
+  }
+  const pad = Math.max((hi - lo) * 0.06, 0.5);
+  return [lo - pad, hi + pad];
+}
+
+/**
+ * מוסיף נקודות שיא/שפל מסומני מים אם חסרות במסלול (הדגימה פספסה קצה בין טיקים).
+ */
+function enrichPnlSeriesWithExtrema(
+  series: { ts: number; upnl: number; t: string }[],
+  opts: {
+    peak?: number | null;
+    peak_ts?: number | null;
+    trough?: number | null;
+    trough_ts?: number | null;
+  },
+): { ts: number; upnl: number; t: string }[] {
+  const out = series.map((p) => ({ ...p }));
+  const pushIf = (ts: number | null | undefined, upnl: number | null | undefined) => {
+    if (ts == null || !Number.isFinite(Number(ts)) || upnl == null || !Number.isFinite(Number(upnl))) return;
+    const t = Number(ts);
+    const u = Number(upnl);
+    const covered = out.some(
+      (p) => Math.abs(p.ts - t) < 2.0 && Math.abs(p.upnl - u) < 0.25,
+    );
+    if (covered) return;
+    out.push({ ts: t, upnl: u, t: formatPnlAxisTime(t) });
+  };
+  pushIf(opts.peak_ts, opts.peak);
+  pushIf(opts.trough_ts, opts.trough);
+  out.sort((a, b) => a.ts - b.ts);
+  for (let i = 1; i < out.length; i++) {
+    if (out[i].ts <= out[i - 1].ts) {
+      out[i].ts = out[i - 1].ts + 1e-6;
+      out[i].t = formatPnlAxisTime(out[i].ts);
+    }
+  }
+  return out;
+}
+
+/**
+ * נתוני גרף תשואה: נקודות מהשרת + זנב חי לפי unrealized_pct.
+ * חשוב: ציר X חייב להיות **זמן מספרי (epoch seconds)** — לא מחרוזת שעה.
+ * אין דדופ לפי ts בלבד — באותה שנייה יכולות להיות שתי רמות שונות (קפיצה).
+ */
+function buildPnlChartSeries(
+  pnlPath: { ts: number; upnl_pct: number }[] | undefined,
+  opts: {
+    isOpen: boolean;
+    liveUnrealizedPct: number | null | undefined;
+    nowSec: number;
+    /** זמן last_mark מהמנוע — לזנב כש־stale / נקודת ייחוס */
+    lastMarkTs?: number | null;
+    bookStale?: boolean;
+  },
+): { ts: number; upnl: number; t: string }[] {
+  const raw = (pnlPath ?? [])
+    .map((p) => ({
+      ts: Number(p.ts),
+      upnl: p.upnl_pct,
+    }))
+    .filter((p) => Number.isFinite(p.ts) && Number.isFinite(p.upnl));
+  raw.sort((a, b) => a.ts - b.ts);
+  const deduped: typeof raw = [];
+  for (const p of raw) {
+    const prev = deduped[deduped.length - 1];
+    if (prev && prev.ts === p.ts && prev.upnl === p.upnl) continue;
+    deduped.push(p);
+  }
+  let base = deduped.map((p) => ({ ts: p.ts, upnl: p.upnl, t: formatPnlAxisTime(p.ts) }));
+
+  const u = opts.liveUnrealizedPct;
+  const canLive = opts.isOpen && u != null && Number.isFinite(u);
+  const stale = Boolean(opts.bookStale);
+
+  if (!canLive) return base;
+
+  if (stale) {
+    if (base.length > 0) return base;
+    // בלי pnl_path אין מה להציג — לא מייצרים שתי נקודות עם אותו upnl (נראה כמו קו אופקי "שבור")
+    return [];
+  }
+
+  if (base.length === 0) {
+    // עד דגימת path ראשונה מהמנוע (~POSITION_TRACKING_PATH_INTERVAL) — placeholder בממשק, לא קו מזויף
+    return [];
+  }
+  const last = base[base.length - 1];
+  /**
+   * תשואה חיה מוצגת רק בעדכון **Y** על זמן הדגימה האחרונה של pnl_path (last.ts).
+   * לא מותחים X ל־last_mark.ts / עכשיו — כי mark_to_market יכול להתקדם בלי דגימת path חדשה,
+   * ואז נוצר קטע אופקי ארוך + גמגום ברינדורים מהירים.
+   * האחוז למעלה בממשק עדיין חי מ־last_mark.legs.
+   */
+  return [...base.slice(0, -1), { ts: last.ts, upnl: u, t: formatPnlAxisTime(last.ts) }];
+}
+
+/** אורך חלון BTC לעסקה — לטבלה/גרף (5m=300, 15m=900) */
+function windowSecForTrade(t: Trade, fallbackSec: number): number {
+  if (typeof t.window_sec === "number" && t.window_sec > 0) {
+    return t.window_sec;
+  }
+  const slug = typeof t.slug === "string" ? t.slug : "";
+  if (slug.includes("15m")) return 900;
+  if (slug.includes("5m")) return 300;
+  return fallbackSec > 0 ? fallbackSec : 300;
+}
+
+function formatWindowFromTrade(t: Trade): string {
+  const epoch = t.epoch != null ? Number(t.epoch) : undefined;
+  const dur = windowSecForTrade(t, 300);
+  const ts = Number(t.ts) || 0;
+  const windowStartSec = epoch ?? (ts ? Math.floor(ts / dur) * dur : 0);
+  if (!windowStartSec) return "";
+  const start = new Date(windowStartSec * 1000);
+  const end = new Date((windowStartSec + dur) * 1000);
+  return `${start.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" })}–${end.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+/** משך זמן מחזור: מכניסה ראשונה (או עסקה ראשונה) עד יציאה אחרונה */
+function formatDurationSec(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  const s = Math.floor(sec % 60);
+  const m = Math.floor((sec / 60) % 60);
+  const h = Math.floor(sec / 3600);
+  if (h > 0) return `${h} שע׳ ${m} דק׳`;
+  if (m > 0) return `${m} דק׳ ${s} שנ׳`;
+  return `${s} שנ׳`;
+}
+
+function isSessionExitTrade(t: Trade): boolean {
+  const ty = t.type;
+  return (
+    ty === "SELL_TP" ||
+    ty === "EXPIRE_0" ||
+    ty === "SETTLE_WIN" ||
+    ty === "SETTLE_LOSS" ||
+    ty === "SETTLE_UNKNOWN" ||
+    (typeof ty === "string" && ty.startsWith("SELL"))
+  );
+}
+
+/** תווית קצרה לטבלת מחזורים: TP / EXPIRE / SETTLE_WIN */
+function sessionExitLabel(lastType: string | undefined): string {
+  if (!lastType) return "";
+  if (lastType === "SETTLE_WIN") return "SETTLE_WIN";
+  if (lastType === "EXPIRE_0" || lastType === "SETTLE_LOSS" || lastType === "SETTLE_UNKNOWN") {
+    return "EXPIRE";
+  }
+  return "TP";
+}
+
+function sessionEntryExitTimes(g: { trades: Trade[] }): {
+  startSec: number;
+  endSec: number | null;
+} {
+  const buys = g.trades.filter((t) => t.type === "BUY");
+  const exits = g.trades.filter(isSessionExitTrade);
+  const tsList = (arr: Trade[]) =>
+    arr.map((t) => Number(t.ts) || 0).filter((x) => x > 0);
+  const buyTs = tsList(buys);
+  const allTs = tsList(g.trades);
+  const exitTs = tsList(exits);
+  let startSec = 0;
+  if (buyTs.length > 0) startSec = Math.min(...buyTs);
+  else if (allTs.length > 0) startSec = Math.min(...allTs);
+  const endSec = exitTs.length > 0 ? Math.max(...exitTs) : null;
+  return { startSec, endSec };
+}
+
+function TradesBySession({
+  trades,
+  logEntries = [],
+  lastMark,
+  fallbackWindowSec = 300,
+  liveBtcUsd = null,
+  priceToBeatUsd = null,
+  marketEpoch = null,
+  priceToBeatNote = "",
+}: {
+  trades: Trade[];
+  logEntries?: LogEntry[];
+  lastMark?: LastMark;
+  /** כשאין window_sec בעסקה (היסטוריה ישנה) — לפי השוק הנוכחי / הגדרת btc_window */
+  fallbackWindowSec?: number;
+  /** מחיר BTC חי (לשורת עסקה פתוחה) */
+  liveBtcUsd?: number | null;
+  /** ייחוס פתיחת החלון מהשוק הנוכחי — `/api/market/current` */
+  priceToBeatUsd?: number | null;
+  /** epoch של השוק הפעיל — להתאמה לכניסה (שדה epoch בעסקת BUY) */
+  marketEpoch?: number | null;
+  priceToBeatNote?: string;
+}) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  /** מסלול PnL אחרון לפי session — כשהשרת מחזיר רגעית pnl_path ריק (throttle / מרוץ) לא נוריד את הגרף */
+  const lastOpenPnlPathBySessionRef = useRef<Record<string, { ts: number; upnl_pct: number }[]>>({});
+  const groups = useMemo(() => groupTradesBySession(trades.slice().reverse().slice(0, 5000)), [trades]);
+  const toggle = (sid: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(sid)) next.delete(sid);
+      else next.add(sid);
+      return next;
+    });
+  };
+  return (
+    <>
+      <p style={{ fontSize: 12, opacity: 0.85, marginBottom: 8 }}>
+        שיא/שפל % — יחסית לעלות הרגל (כולל עמלת כניסה), לא מסך יתרת החשבון.
+      </p>
+      <div
+        className="table-scroll"
+        style={{
+          maxHeight: 400,
+          overflow: "auto",
+          borderRadius: 10,
+        }}
+      >
+      {groups.map((g, idx) => {
+        const buys = g.trades.filter((t) => t.type === "BUY");
+        const exits = g.trades.filter(isSessionExitTrade);
+        const isOpen = exits.length === 0;
+        const side = buys[0]?.side || "—";
+        const exitType = exits.length ? sessionExitLabel(exits[exits.length - 1]?.type) : "";
+        const realized = g.trades.reduce((s, t) => s + (Number(t.realized_pnl) || 0), 0);
+        const lastExit = exits[exits.length - 1];
+        const tokenId = buys[0]?.token_id;
+        const liveLeg = tokenId
+          ? lastMark?.legs?.find((l) => l.token_id === tokenId)
+          : undefined;
+        const peak = lastExit?.peak_unrealized_pct ?? liveLeg?.peak_unrealized_pct;
+        const trough = lastExit?.trough_unrealized_pct ?? liveLeg?.trough_unrealized_pct;
+        const potentialPeak = lastExit?.potential_peak_unrealized_pct;
+        const potentialTrough = lastExit?.potential_trough_unrealized_pct;
+        const sid = g.sessionId;
+        const isExp = expanded.has(sid);
+        const firstTrade = g.trades[0];
+        const windowStr = firstTrade ? formatWindowFromTrade(firstTrade) : "";
+        const { startSec: sessStart, endSec: sessEnd } = sessionEntryExitTimes(g);
+        const durationClosedSec =
+          sessEnd != null && sessStart > 0 && sessEnd >= sessStart ? sessEnd - sessStart : null;
+        const durationOpenSec =
+          isOpen && sessStart > 0 ? Math.max(0, Date.now() / 1000 - sessStart) : null;
+        const durationLabel =
+          durationClosedSec != null
+            ? formatDurationSec(durationClosedSec)
+            : durationOpenSec != null
+              ? `${formatDurationSec(durationOpenSec)} (עד עכשיו)`
+              : null;
+        const entryClock =
+          sessStart > 0
+            ? new Date(sessStart * 1000).toLocaleTimeString("he-IL", {
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+              })
+            : null;
+        const exitClock =
+          sessEnd != null && sessEnd > 0
+            ? new Date(sessEnd * 1000).toLocaleTimeString("he-IL", {
+                hour: "2-digit",
+                minute: "2-digit",
+                second: "2-digit",
+              })
+            : null;
+        // trade_num קבוע מהשרת (נשמר לדיסק); אם חסר (היסטוריה ישנה) — idx+1 כגיבוי
+        const tradeNum = buys.find(b => b.trade_num != null)?.trade_num ?? (idx + 1);
+        const summaryMainBase =
+          `עסקה #${tradeNum} — ${side} ` +
+          (buys.length > 1 ? `DCA ×${buys.length} ` : "") +
+          (exitType ? `→ ${exitType}` : "(פתוחה)") +
+          (windowStr ? ` | חלון ${windowStr}` : "") +
+          (durationLabel ? ` | משך ${durationLabel}` : "");
+        const showRealized = realized !== 0 && Number.isFinite(realized);
+        const hasExit = exits.length > 0;
+        const peakStr = peak != null ? `${peak.toFixed(1)}%` : "—";
+        const troughStr = trough != null ? `${trough.toFixed(1)}%` : "—";
+        const potentialPeakStr = potentialPeak != null ? `${potentialPeak.toFixed(1)}%` : "—";
+        const potentialTroughStr = potentialTrough != null ? `${potentialTrough.toFixed(1)}%` : "—";
+        const tpExit = lastExit?.type === "SELL_TP" ? lastExit : undefined;
+        const legCost = tpExit ? legCostFromTpExit(tpExit) : null;
+        const exitBidUsd = tpExit && tpExit.price != null ? Number(tpExit.price) : null;
+        const contractsN = tpExit && tpExit.contracts != null ? Number(tpExit.contracts) : 0;
+        const bidPeakHyp =
+          legCost != null && contractsN > 0 && potentialPeak != null
+            ? bidFromHypotheticalPct(legCost, contractsN, potentialPeak)
+            : null;
+        const bidTroughHyp =
+          legCost != null && contractsN > 0 && potentialTrough != null
+            ? bidFromHypotheticalPct(legCost, contractsN, potentialTrough)
+            : null;
+        const canShowCentsPanel =
+          Boolean(tpExit) &&
+          legCost != null &&
+          (potentialPeak != null || potentialTrough != null) &&
+          exitBidUsd != null &&
+          contractsN > 0;
+        const deltaCents = (bidUsd: number | null) => {
+          if (bidUsd == null || exitBidUsd == null || !Number.isFinite(bidUsd) || !Number.isFinite(exitBidUsd)) return null;
+          return (bidUsd - exitBidUsd) * 100;
+        };
+        const dPeakC = bidPeakHyp != null ? deltaCents(bidPeakHyp) : null;
+        const dTroughC = bidTroughHyp != null ? deltaCents(bidTroughHyp) : null;
+        const pctVsExitPeak =
+          exitBidUsd != null && bidPeakHyp != null ? pctVsExitPrice(exitBidUsd, bidPeakHyp) : null;
+        const pctVsExitTrough =
+          exitBidUsd != null && bidTroughHyp != null ? pctVsExitPrice(exitBidUsd, bidTroughHyp) : null;
+        const btcRef = lastExit?.settlement_btc_start;
+        const btcEndPx = lastExit?.settlement_btc_end;
+        const hasSettlementBtc =
+          typeof btcRef === "number" &&
+          Number.isFinite(btcRef) &&
+          typeof btcEndPx === "number" &&
+          Number.isFinite(btcEndPx);
+        const resolvedMarket = lastExit?.resolved_outcome;
+        const settleWon = lastExit?.settlement_won;
+        const firstBuyEpoch =
+          buys[0]?.epoch != null && Number.isFinite(Number(buys[0].epoch))
+            ? Number(buys[0].epoch)
+            : null;
+        const openWindowMatchesDashboard =
+          marketEpoch != null &&
+          firstBuyEpoch != null &&
+          marketEpoch === firstBuyEpoch;
+        const ptbOpen = priceToBeatUsd;
+        const liveSpot = liveBtcUsd;
+        const openHasRef =
+          isOpen &&
+          openWindowMatchesDashboard &&
+          ptbOpen != null &&
+          Number.isFinite(ptbOpen);
+        const openHasLive =
+          liveSpot != null && Number.isFinite(liveSpot) && liveSpot > 0;
+        let liveVsRefHint: string | null = null;
+        if (openHasRef && openHasLive && ptbOpen != null && liveSpot != null) {
+          const d = liveSpot - ptbOpen;
+          if (side === "Up") {
+            liveVsRefHint = d >= 0 ? "מול ייחוס: כרגע לכיוון Up" : "מול ייחוס: כרגע לכיוון Down";
+          } else if (side === "Down") {
+            liveVsRefHint = d < 0 ? "מול ייחוס: כרגע לכיוון Down" : "מול ייחוס: כרגע לכיוון Up";
+          }
+        }
+        return (
+          <div key={sid} style={{ borderBottom: "1px solid #334155" }}>
+            <div dir="rtl" style={{ display: "flex", alignItems: "stretch", width: "100%" }}>
+              <button
+                type="button"
+                onClick={() => toggle(sid)}
+                style={{
+                  flex: 1,
+                  textAlign: "right",
+                  padding: "10px 12px",
+                  background: isExp ? "#1e293b" : "#0b1220",
+                  border: "none",
+                  color: "#fff",
+                  cursor: "pointer",
+                  fontSize: 13,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "flex-end",
+                  gap: 4,
+                  minWidth: 0,
+                  width: "100%",
+                }}
+              >
+                <span style={{ width: "100%" }}>
+                  {isExp ? "▼ " : "▶ "}
+                  {summaryMainBase}
+                  {showRealized && (
+                    <span
+                      style={{
+                        fontWeight: 700,
+                        color: realized >= 0 ? "var(--up)" : "var(--down)",
+                        marginInlineStart: 4,
+                      }}
+                    >
+                      {` ${realized >= 0 ? "+" : "-"}$${Math.abs(realized).toFixed(2)}`}
+                    </span>
+                  )}
+                </span>
+                {isOpen && (
+                  <span
+                    style={{
+                      display: "flex",
+                      gap: 8,
+                      flexWrap: "wrap",
+                      justifyContent: "flex-end",
+                      width: "100%",
+                    }}
+                  >
+                    {openHasRef && openHasLive ? (
+                      <span
+                        title={`${TIP_OPEN_BTC_LIVE}${priceToBeatNote ? ` — ${priceToBeatNote}` : ""}`}
+                        style={{
+                          fontSize: 11,
+                          color: "#e2e8f0",
+                          padding: "2px 8px",
+                          background: "rgba(59, 130, 246, 0.15)",
+                          borderRadius: 6,
+                          border: "1px solid rgba(59, 130, 246, 0.35)",
+                          textAlign: "right",
+                          maxWidth: "100%",
+                        }}
+                      >
+                        <span style={{ fontSize: 10, color: "var(--muted)", display: "block" }}>
+                          פתוח — ייחוס חלון (לניצחון Up בסוף: סוף ≥ ייחוס)
+                        </span>
+                        ייחוס {formatBtcUsdLabel(ptbOpen)} · BTC עכשיו {formatBtcUsdLabel(liveSpot)}
+                        {liveVsRefHint ? (
+                          <span style={{ color: "var(--muted)", marginInlineStart: 4 }}>· {liveVsRefHint}</span>
+                        ) : null}
+                      </span>
+                    ) : null}
+                    {isOpen && openHasRef && !openHasLive ? (
+                      <span
+                        style={{ fontSize: 11, color: "var(--muted)", padding: "2px 8px" }}
+                        title={TIP_OPEN_BTC_LIVE}
+                      >
+                        ייחוס {formatBtcUsdLabel(ptbOpen)} · מחיר חי: טוען…
+                      </span>
+                    ) : null}
+                    {isOpen && !openWindowMatchesDashboard && openHasLive ? (
+                      <span style={{ fontSize: 11, color: "var(--muted)", padding: "2px 8px" }}>
+                        BTC עכשיו {formatBtcUsdLabel(liveSpot)}
+                        <span title="השוואת ייחוס דורשת שדה epoch בכניסה וחלון זהה לשוק המוצג">
+                          {" "}
+                          · ייחוס חלון הכניסה לא מוצג (epoch לא תואם או חסר)
+                        </span>
+                      </span>
+                    ) : null}
+                  </span>
+                )}
+                {hasExit && (
+                  <span style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                    <span
+                      title={`שיא/שפל תשואה בזמן החזקה — ${TIP_PCT_ROI}`}
+                      style={{
+                        fontSize: 11,
+                        color: "var(--muted)",
+                        padding: "2px 8px",
+                        background: "rgba(100, 116, 139, 0.2)",
+                        borderRadius: 6,
+                      }}
+                    >
+                      בזמן החזקה (מול עלות): {peakStr} | {troughStr}
+                    </span>
+                    {hasSettlementBtc && (
+                      <span
+                        title={TIP_SETTLEMENT_BTC}
+                        style={{
+                          fontSize: 11,
+                          color: "#e2e8f0",
+                          padding: "2px 8px",
+                          background: "rgba(34, 197, 94, 0.12)",
+                          borderRadius: 6,
+                          border: "1px solid rgba(34, 197, 94, 0.25)",
+                          textAlign: "right",
+                          maxWidth: "100%",
+                        }}
+                      >
+                        <span style={{ fontSize: 10, color: "var(--muted)", display: "block" }}>
+                          פירוק BTC (ייחוס פתיחה → סוף חלון)
+                        </span>
+                        ייחוס {formatBtcUsdLabel(btcRef)} · סוף {formatBtcUsdLabel(btcEndPx)}
+                        {resolvedMarket ? (
+                          <span style={{ color: "var(--muted)" }}> · מנצח השוק: {resolvedMarket}</span>
+                        ) : null}
+                        {settleWon != null ? (
+                          <span
+                            style={{
+                              color: settleWon ? "var(--up)" : "var(--down)",
+                              fontWeight: 600,
+                              marginInlineStart: 4,
+                            }}
+                          >
+                            · הימור {side}: {settleWon ? "ניצחון" : "הפסד"}
+                          </span>
+                        ) : null}
+                      </span>
+                    )}
+                    {(potentialPeak != null || potentialTrough != null) &&
+                      (canShowCentsPanel && (dPeakC != null || dTroughC != null) ? (
+                        <span
+                          title={TIP_AFTER_TP_VS_EXIT}
+                          style={{
+                            fontSize: 11,
+                            color: "#e2e8f0",
+                            padding: "2px 8px",
+                            background: "rgba(148, 163, 184, 0.15)",
+                            borderRadius: 6,
+                            border: "1px dashed #475569",
+                            textAlign: "right",
+                            maxWidth: "100%",
+                          }}
+                        >
+                          <span style={{ fontSize: 10, color: "var(--muted)", display: "block" }}>
+                            אחרי TP — מול יציאה ({exitBidUsd != null ? usdToCentsLabel(exitBidUsd) : "—"})
+                          </span>
+                          <span>
+                            {dPeakC != null && (
+                              <>
+                                שיא Δ{dPeakC >= 0 ? "+" : ""}
+                                {dPeakC.toFixed(1)}¢
+                                {pctVsExitPeak != null && (
+                                  <span style={{ color: "var(--muted)", fontSize: 10 }}> ({pctVsExitPeak >= 0 ? "+" : ""}
+                                  {pctVsExitPeak.toFixed(1)}%)</span>
+                                )}
+                              </>
+                            )}
+                            {dPeakC != null && dTroughC != null ? " · " : ""}
+                            {dTroughC != null && (
+                              <>
+                                שפל Δ{dTroughC >= 0 ? "+" : ""}
+                                {dTroughC.toFixed(1)}¢
+                                {pctVsExitTrough != null && (
+                                  <span style={{ color: "var(--muted)", fontSize: 10 }}> ({pctVsExitTrough >= 0 ? "+" : ""}
+                                  {pctVsExitTrough.toFixed(1)}%)</span>
+                                )}
+                              </>
+                            )}
+                          </span>
+                          <span style={{ fontSize: 10, color: "var(--muted)", display: "block", marginTop: 3 }}>
+                            מול עלות (משני): {potentialPeakStr} | {potentialTroughStr}
+                          </span>
+                        </span>
+                      ) : (
+                        <span
+                          title={TIP_PCT_POTENTIAL_AFTER_TP}
+                          style={{
+                            fontSize: 11,
+                            color: "var(--muted)",
+                            padding: "2px 8px",
+                            background: "rgba(148, 163, 184, 0.15)",
+                            borderRadius: 6,
+                            border: "1px dashed #475569",
+                          }}
+                        >
+                          אחרי TP — מול עלות בלבד: {potentialPeakStr} | {potentialTroughStr}
+                        </span>
+                      ))}
+                  </span>
+                )}
+              </button>
+            </div>
+            {isExp && (
+              <div style={{ padding: "0 12px 12px", background: "#111827" }}>
+                {(entryClock || sessStart > 0) && (
+                  <div
+                    style={{
+                      fontSize: 11,
+                      color: "var(--muted)",
+                      padding: "10px 0 4px",
+                      textAlign: "right",
+                      lineHeight: 1.5,
+                    }}
+                  >
+                    <strong style={{ color: "#cbd5e1" }}>זמני מחזור:</strong> כניסה ראשונה{" "}
+                    <span style={{ color: "#fff" }}>{entryClock ?? "—"}</span>
+                    {exitClock ? (
+                      <>
+                        {" "}
+                        → יציאה <span style={{ color: "#fff" }}>{exitClock}</span>
+                        {durationClosedSec != null && (
+                          <span>
+                            {" "}
+                            · משך <span style={{ color: "#fff" }}>{formatDurationSec(durationClosedSec)}</span>
+                          </span>
+                        )}
+                      </>
+                    ) : isOpen ? (
+                      <span>
+                        {" "}
+                        · פתוחה · משך מצטבר{" "}
+                        <span style={{ color: "#fff" }}>
+                          {durationOpenSec != null ? formatDurationSec(durationOpenSec) : "—"}
+                        </span>{" "}
+                        <span style={{ fontSize: 10 }}>(מתעדכן ברענון המסך)</span>
+                      </span>
+                    ) : null}
+                  </div>
+                )}
+                {(() => {
+                  const serverPnlRaw =
+                    ((lastExit?.pnl_path ?? liveLeg?.pnl_path) as
+                      | { ts: number; upnl_pct: number; bid?: number; balance?: number; equity?: number }[]
+                      | undefined) || [];
+                  const validServerPoints = serverPnlRaw.filter(
+                    (p) => Number.isFinite(Number(p.ts)) && Number.isFinite(Number(p.upnl_pct)),
+                  );
+                  if (isOpen) {
+                    if (validServerPoints.length > 0) {
+                      lastOpenPnlPathBySessionRef.current[sid] = validServerPoints.map((p) => ({
+                        ts: Number(p.ts),
+                        upnl_pct: Number(p.upnl_pct),
+                      }));
+                    }
+                  } else {
+                    delete lastOpenPnlPathBySessionRef.current[sid];
+                  }
+                  let pnlPath = serverPnlRaw;
+                  if (
+                    isOpen &&
+                    validServerPoints.length === 0 &&
+                    liveLeg?.unrealized_pct != null &&
+                    Number.isFinite(liveLeg.unrealized_pct)
+                  ) {
+                    const retained = lastOpenPnlPathBySessionRef.current[sid];
+                    if (retained && retained.length > 0) {
+                      pnlPath = retained;
+                    }
+                  }
+                  const nowSec = Date.now() / 1000;
+                  const lastMarkTs =
+                    lastMark != null && typeof (lastMark as { ts?: number }).ts === "number"
+                      ? (lastMark as { ts: number }).ts
+                      : null;
+                  const bookStale = Boolean(lastMark?.book_stale || liveLeg?.book_stale);
+                  const chartForOpen = buildPnlChartSeries(pnlPath, {
+                    isOpen: true,
+                    liveUnrealizedPct: liveLeg?.unrealized_pct,
+                    nowSec,
+                    lastMarkTs,
+                    bookStale,
+                  });
+                  const chartForClosed = buildPnlChartSeries(pnlPath, {
+                    isOpen: false,
+                    liveUnrealizedPct: undefined,
+                    nowSec,
+                    lastMarkTs,
+                    bookStale: false,
+                  });
+                  const chartForOpenDisplay = enrichPnlSeriesWithExtrema(chartForOpen, {
+                    peak: liveLeg?.peak_unrealized_pct,
+                    peak_ts: liveLeg?.peak_ts,
+                    trough: liveLeg?.trough_unrealized_pct,
+                    trough_ts: liveLeg?.trough_ts,
+                  });
+                  const chartForClosedDisplay = enrichPnlSeriesWithExtrema(chartForClosed, {
+                    peak: lastExit?.peak_unrealized_pct,
+                    peak_ts: lastExit?.peak_ts,
+                    trough: lastExit?.trough_unrealized_pct,
+                    trough_ts: lastExit?.trough_ts,
+                  });
+                  const yDomainOpen = yDomainForPnlChart(
+                    chartForOpenDisplay,
+                    liveLeg?.peak_unrealized_pct,
+                    liveLeg?.trough_unrealized_pct,
+                  );
+                  const yDomainClosed = yDomainForPnlChart(
+                    chartForClosedDisplay,
+                    lastExit?.peak_unrealized_pct,
+                    lastExit?.trough_unrealized_pct,
+                  );
+                  const showPnlEmptyPlaceholder = isOpen && chartForOpen.length === 0;
+                  const hasLiveUnrealized =
+                    liveLeg?.unrealized_pct != null && Number.isFinite(liveLeg.unrealized_pct);
+                  const sessionLogs = logEntries.filter((e) => e.session_id === sid);
+                  return (
+                    <>
+                      {hasExit &&
+                        (peak != null || trough != null || potentialPeak != null || potentialTrough != null) && (
+                        <div
+                          style={{
+                            marginBottom: 12,
+                            padding: "10px 12px",
+                            background: "#1e293b",
+                            borderRadius: 8,
+                          }}
+                        >
+                          {(peak != null || trough != null) && (
+                            <>
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: 24,
+                              justifyContent: "flex-end",
+                              flexWrap: "wrap",
+                            }}
+                          >
+                            <span title={TIP_PCT_ROI}>
+                              <span style={{ color: "var(--muted)", fontSize: 11 }}>שיא (בזמן החזקה, מול עלות)</span>{" "}
+                              <strong style={{ color: peak != null && peak >= 0 ? "var(--up)" : "inherit" }}>
+                                {peakStr}
+                              </strong>
+                            </span>
+                            <span title={TIP_PCT_ROI}>
+                              <span style={{ color: "var(--muted)", fontSize: 11 }}>שפל (מול עלות)</span>{" "}
+                              <strong style={{ color: trough != null && trough < 0 ? "var(--down)" : "inherit" }}>
+                                {troughStr}
+                              </strong>
+                            </span>
+                          </div>
+                          <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 6, textAlign: "right", lineHeight: 1.45 }}>
+                            מחושב על כל הפוזיציה — ממוצע משוקלל (DCA). האחוזים הם <strong>תשואה מול עלות</strong>, לא מחיר ליחידה —
+                            מעל 100% אפשרי; מחיר החוזה בפולימרקט נשאר בדרך כלל בטווח 0.01–0.99$.
+                          </div>
+                            </>
+                          )}
+                          {(potentialPeak != null || potentialTrough != null) && (
+                            <div
+                              style={{
+                                marginTop: 10,
+                                paddingTop: 10,
+                                borderTop: "1px dashed #334155",
+                                textAlign: "right",
+                              }}
+                            >
+                              {(bidPeakHyp != null || bidTroughHyp != null) && (
+                                <>
+                              <div style={{ color: "#86efac", fontWeight: 700, fontSize: 12, marginBottom: 6 }}>
+                                אחרי TP — מול מחיר יציאה ({exitBidUsd != null ? usdToCentsLabel(exitBidUsd) : "—"})
+                              </div>
+                              <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 8, lineHeight: 1.45 }}>
+                                {TIP_AFTER_TP_VS_EXIT}
+                              </div>
+                              {bidPeakHyp != null && dPeakC != null && pctVsExitPeak != null && (
+                                <div style={{ marginBottom: 4 }}>
+                                  <span style={{ color: "var(--muted)", fontSize: 11 }}>שיא bid: </span>
+                                  <strong style={{ color: "var(--up)" }}>{usdToCentsLabel(bidPeakHyp)}</strong>
+                                  <span style={{ color: "var(--muted)", fontSize: 11 }}>
+                                    {" "}
+                                    (Δ {dPeakC >= 0 ? "+" : ""}
+                                    {dPeakC.toFixed(1)}¢ · {pctVsExitPeak >= 0 ? "+" : ""}
+                                    {pctVsExitPeak.toFixed(1)}% מול יציאה)
+                                  </span>
+                                </div>
+                              )}
+                              {bidTroughHyp != null && dTroughC != null && pctVsExitTrough != null && (
+                                <div style={{ marginBottom: 8 }}>
+                                  <span style={{ color: "var(--muted)", fontSize: 11 }}>שפל bid: </span>
+                                  <strong
+                                    style={{
+                                      color: potentialTrough != null && potentialTrough < 0 ? "var(--down)" : "inherit",
+                                    }}
+                                  >
+                                    {usdToCentsLabel(bidTroughHyp)}
+                                  </strong>
+                                  <span style={{ color: "var(--muted)", fontSize: 11 }}>
+                                    {" "}
+                                    (Δ {dTroughC >= 0 ? "+" : ""}
+                                    {dTroughC.toFixed(1)}¢ · {pctVsExitTrough >= 0 ? "+" : ""}
+                                    {pctVsExitTrough.toFixed(1)}% מול יציאה)
+                                  </span>
+                                </div>
+                              )}
+                                </>
+                              )}
+                              <div style={{ color: "#93c5fd", fontWeight: 700, fontSize: 12, marginTop: 8, marginBottom: 4 }}>
+                                מול עלות כניסה (להשוואה — אותו בסיס כמו בזמן החזקה)
+                              </div>
+                              <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 6 }} title={TIP_PCT_POTENTIAL_AFTER_TP}>
+                                {TIP_PCT_POTENTIAL_AFTER_TP}
+                              </div>
+                              <div>
+                                <span style={{ color: "var(--muted)", fontSize: 11 }}>שיא: </span>
+                                <strong style={{ color: potentialPeak != null && potentialPeak >= 0 ? "var(--up)" : "inherit" }}>
+                                  {potentialPeakStr}
+                                </strong>
+                                <span style={{ color: "var(--muted)", fontSize: 11 }}> · שפל: </span>
+                                <strong
+                                  style={{
+                                    color: potentialTrough != null && potentialTrough < 0 ? "var(--down)" : "inherit",
+                                  }}
+                                >
+                                  {potentialTroughStr}
+                                </strong>
+                                <span style={{ color: "var(--muted)", fontSize: 11 }}> (מול עלות)</span>
+                              </div>
+                              <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 6, lineHeight: 1.45 }}>
+                                שני המדדים מתארים אותו מסלול bid אחרי TP; הראשון קריא כ&quot;עוד כמה ¢ מהיציאה&quot;, השני כמו לפני המכירה.
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {isOpen && lastMark?.book_stale && (
+                        <div className="alert-warn" style={{ marginBottom: 8, textAlign: "right" }}>
+                          ספר ההזמנות (CLOB) אינו זמין כרגע; מוצגים הנתונים האחרונים שנשמרו כדי לשמור על רצף הגרף. העדכון יתחדש עם חזרת נתוני הביקוש.
+                        </div>
+                      )}
+                      {/* תא קבוע — לא מסתירים לגמרי כשאין unrealized_pct (מונע "קפיצות" של גרף/יומן) */}
+                      {isOpen && (
+                        <div
+                          style={{
+                            marginBottom: 10,
+                            padding: "8px 10px",
+                            minHeight: 58,
+                            boxSizing: "border-box",
+                            background: "#0f172a",
+                            borderRadius: 8,
+                            textAlign: "right",
+                            border: "1px solid #334155",
+                            contain: "layout",
+                          }}
+                          title={TIP_PCT_ROI}
+                        >
+                          <span style={{ color: "var(--muted)", fontSize: 12 }}>תשואה נוכחית (ביחס לעלות): </span>
+                          {liveLeg?.unrealized_pct != null && Number.isFinite(liveLeg.unrealized_pct) ? (
+                            <>
+                              {/* מספרים ב־LTR + tabular-nums + רוחב מינימלי — מונעים הזזת שורה/גרף בכל עדכון רענון */}
+                              <strong
+                                dir="ltr"
+                                style={{
+                                  display: "inline-block",
+                                  fontSize: 15,
+                                  minWidth: "7.5ch",
+                                  fontVariantNumeric: "tabular-nums",
+                                  color: liveLeg.unrealized_pct >= 0 ? "var(--up)" : "var(--down)",
+                                  verticalAlign: "baseline",
+                                }}
+                              >
+                                {liveLeg.unrealized_pct >= 0 ? "+" : ""}
+                                {liveLeg.unrealized_pct.toFixed(1)}%
+                              </strong>
+                              <span
+                                style={{
+                                  display: "block",
+                                  marginTop: 4,
+                                  fontSize: 10,
+                                  color: "var(--muted)",
+                                }}
+                              >
+                                מתעדכן בדומה לקצב רענון המסך וסימון השוק
+                              </span>
+                            </>
+                          ) : (
+                            <span style={{ fontSize: 13, color: "var(--muted)" }}>
+                              — (ממתין לסימון שוק)
+                            </span>
+                          )}
+                        </div>
+                      )}
+                      {isOpen && (
+                        <div style={{ marginBottom: 12, minHeight: 178 }}>
+                          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 2 }}>מסלול תשואה באחוזים (ביחס לעלות, לאורך העסקה)</div>
+                          <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 6 }}>
+                            העקומה מחושבת בין נקודות הדגימה; קווים מקווקווים ירוק ואדום מסמנים שיא ושפל מסומנים. עדכון אחוזי התשואה נשען על זמן הדגימה האחרונה.
+                          </div>
+                          {!showPnlEmptyPlaceholder ? (
+                            <PnlOpenAreaChart
+                              sessionId={sid}
+                              data={chartForOpenDisplay}
+                              yDomain={yDomainOpen}
+                              peakTrough={{ peak, trough }}
+                            />
+                          ) : (
+                            <div
+                              style={{
+                                height: 140,
+                                display: "flex",
+                                flexDirection: "column",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                gap: 6,
+                                padding: "8px 12px",
+                                textAlign: "center",
+                                background: "#0b1220",
+                                borderRadius: 8,
+                                border: "1px dashed #334155",
+                              }}
+                              title={
+                                bookStale
+                                  ? "ספר ההזמנות אינו עדכני; לא יתקבלו דגימות מסלול חדשות עד לחזרת נתוני הביקוש."
+                                  : hasLiveUnrealized
+                                    ? "המנוע אוגר דגימות מסלול בתדירות קבועה; הקו יופיע לאחר הכניסה או עם שחזור הספר."
+                                    : "ממתין לסימון שוק מהמנוע (תשואה בשוטף)."
+                              }
+                            >
+                              <span style={{ color: "#475569", fontSize: 22, letterSpacing: 2, userSelect: "none" }} aria-hidden>
+                                ···
+                              </span>
+                              <span style={{ color: "#64748b", fontSize: 11, lineHeight: 1.35, maxWidth: 280 }}>
+                                {bookStale
+                                  ? "ספר ההזמנות אינו עדכני; המסלול יתעדכן עם חזרת נתוני הביקוש."
+                                  : hasLiveUnrealized
+                                    ? "ממתין לדגימת המסלול הראשונה מהמנוע."
+                                    : "ממתין לסימון שוק (תשואה בשוטף)."}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {!isOpen && chartForClosed.length > 0 && (
+                        <div style={{ marginBottom: 12 }}>
+                          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 2 }}>מסלול תשואה באחוזים (ביחס לעלות, לאורך העסקה)</div>
+                          <div style={{ fontSize: 10, color: "var(--muted)", marginBottom: 6 }}>
+                            עקומה חלקה בין נקודות דגימה; קווים מקווקווים מסמנים שיא ושפל. ציר הערכים כולל את טווח השיא והשפל גם כשנקודה בודדת חסרה במסלול.
+                          </div>
+                          <PnlClosedAreaChart
+                            sessionId={sid}
+                            data={chartForClosedDisplay}
+                            yDomain={yDomainClosed}
+                            peakTrough={{ peak, trough }}
+                          />
+                        </div>
+                      )}
+                      {sessionLogs.length > 0 && (
+                        <div style={{ marginBottom: 12 }}>
+                          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>יומן העסקה</div>
+                          <div style={{ maxHeight: 120, overflow: "auto", fontSize: 11, background: "#0b1220", padding: 8, borderRadius: 6 }}>
+                            {sessionLogs.slice(-20).map((e, i) => (
+                              <div key={i} style={{ marginBottom: 2 }}>
+                                <span style={{ color: e.type === "event" ? "var(--up)" : "var(--muted)" }}>
+                                  {new Date(e.ts * 1000).toLocaleTimeString("he-IL")}
+                                </span>
+                                {" — "}
+                                {e.msg}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr>
+                    {(
+                      [
+                        [
+                          `תחילת חלון (${Math.round(fallbackWindowSec / 60)} דק׳ נוכחי)`,
+                          "מיושר לפי אורך החלון של העסקה (5 או 15 דק׳); עסקאות ישנות לפי ברירת המסך",
+                        ],
+                        ["זמן", undefined],
+                        ["פעולה", undefined],
+                        ["צד", undefined],
+                        ["חוזים", undefined],
+                        ["מחיר", "מחיר ליחידה (למשל 0.01–0.99)"],
+                        [
+                          "עלות הכניסה",
+                          "מחיר × חוזים — כמה דולרים משקיעים בכניסה זו (ברוטו לפני עמלה; העמלה בעמודה נפרדת)",
+                        ],
+                        ["עמלה", undefined],
+                        ["רווח", undefined],
+                        ["שיא %", TIP_PCT_ROI],
+                        ["שפל %", TIP_PCT_ROI],
+                        ["Gate", undefined],
+                        ["סיבה", undefined],
+                      ] as const
+                    ).map(([h, tip]) => (
+                        <th
+                          key={h}
+                          title={tip}
+                          style={{ textAlign: "right", padding: "6px 10px", borderBottom: "1px solid #334155" }}
+                        >
+                          {h}
+                        </th>
+                      ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {g.trades.map((t, i) => (
+                    <tr key={String(t.id || i)} style={{ borderBottom: "1px solid #111827" }}>
+                      <td style={{ padding: "6px 10px", color: "var(--muted)" }}>
+                        {t.ts
+                          ? (() => {
+                              const tsNum = Number(t.ts) * 1000;
+                              const durMs = windowSecForTrade(t, fallbackWindowSec) * 1000;
+                              const winMs = Math.floor(tsNum / durMs) * durMs;
+                              return new Date(winMs).toLocaleTimeString("he-IL", {
+                                hour: "2-digit",
+                                minute: "2-digit",
+                              });
+                            })()
+                          : "—"}
+                      </td>
+                      <td style={{ padding: "6px 10px", color: "var(--muted)" }}>
+                        {t.ts ? new Date((t.ts as number) * 1000).toLocaleTimeString("he-IL") : "—"}
+                      </td>
+                      <td style={{ padding: "6px 10px" }}>
+                        {t.type === "BUY" ? "כניסה" : t.type === "SELL_TP" ? "יציאה (TP)" : t.type || ""}
+                      </td>
+                      <td style={{ padding: "6px 10px" }}>
+                        <span style={{
+                          color: t.side === "Up" ? "var(--up)"
+                               : t.side === "Down" ? "var(--down)"
+                               : "var(--muted)",
+                        }}>
+                          {t.side === "neutral" || t.side === "auto" ? "?" : (t.side ?? "—")}
+                        </span>
+                      </td>
+                      <td style={{ padding: "6px 10px" }}>{Number(t.contracts || 0).toFixed(0)}</td>
+                      <td style={{ padding: "6px 10px" }}>{t.price != null ? Number(t.price).toFixed(2) : "—"}</td>
+                      <td
+                        style={{ padding: "6px 10px", color: "var(--muted)" }}
+                        title={
+                          t.type === "BUY" &&
+                          t.price != null &&
+                          t.contracts != null &&
+                          Number.isFinite(Number(t.price)) &&
+                          Number.isFinite(Number(t.contracts))
+                            ? `${Number(t.price).toFixed(2)} × ${Number(t.contracts).toFixed(0)} חוזים`
+                            : undefined
+                        }
+                      >
+                        {(() => {
+                          if (t.type !== "BUY") return "—";
+                          const p = t.price != null ? Number(t.price) : NaN;
+                          const n = t.contracts != null ? Number(t.contracts) : NaN;
+                          if (!Number.isFinite(p) || !Number.isFinite(n)) return "—";
+                          return `$${(p * n).toFixed(2)}`;
+                        })()}
+                      </td>
+                      <td style={{ padding: "6px 10px", color: "var(--muted)" }}>
+                        {t.fee_est != null ? Number(t.fee_est).toFixed(4) : "—"}
+                      </td>
+                      <td style={{ padding: "6px 10px" }}>
+                        {t.realized_pnl != null ? (
+                          <span
+                            style={{
+                              color: Number(t.realized_pnl) >= 0 ? "var(--up)" : "var(--down)",
+                            }}
+                          >
+                            {Number(t.realized_pnl) >= 0 ? "+" : "-"}$
+                            {Math.abs(Number(t.realized_pnl)).toFixed(2)}
+                          </span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                      <td style={{ padding: "6px 10px", color: "var(--muted)", fontSize: 11 }}>
+                        {t.peak_unrealized_pct != null ? `${Number(t.peak_unrealized_pct).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{ padding: "6px 10px", color: "var(--muted)", fontSize: 11 }}>
+                        {t.trough_unrealized_pct != null ? `${Number(t.trough_unrealized_pct).toFixed(1)}%` : "—"}
+                      </td>
+                      <td style={{ padding: "6px 10px", color: "var(--muted)" }}>
+                        {t.gate ? String(t.gate) : "—"}
+                        {t.min_left_sec != null ? (
+                          <span style={{ color: "var(--muted)" }}>
+                            {" "}
+                            (
+                            {Number(t.min_left_sec) > 0
+                              ? `${(Number(t.min_left_sec) / 60).toFixed(2)} דק׳`
+                              : `${Number(t.min_left_sec).toFixed(1)}s`}
+                            )
+                          </span>
+                        ) : null}
+                      </td>
+                      <td style={{ padding: "6px 10px", color: "var(--muted)" }}>
+                        {t.reason ? String(t.reason) : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              </div>
+            )}
+          </div>
+        );
+      })}
+      </div>
+    </>
+  );
+}
+
+/** מינ׳ חוזים אפקטיבי: max(הגדרת משתמש, מינ׳ השוק) — בלי תלות בשמות ישנים של state */
+function computeEffectiveMinContracts(minContracts: number, orderMinSize: number | undefined): number {
+  const oms = orderMinSize != null ? Math.ceil(orderMinSize) : 5;
+  return Math.max(minContracts, oms);
+}
+
+const PRESETS = {
+  simple: {
+    name: "מתחיל פשוט",
+    investment_usd: 5,
+    entry_price_cents: 20,
+    take_profit_pct: 20,
+    dca_enabled: false,
+    hedge_enabled: false,
+    desc: "השקעה של 5 דולר לכניסה עד מחיר 20 סנט לחוזה (כ־25 חוזים, מינימום 5). יעד רווח 20%.",
+  },
+  dca: {
+    name: "עם DCA",
+    investment_usd: 20,
+    entry_price_cents: 25,
+    take_profit_pct: 15,
+    dca_enabled: true,
+    dca_slices: 4,
+    dca_interval_sec: 30,
+    hedge_enabled: false,
+    desc: "השקעה של 20 דולר המחולקת לארבעה מקטעים במרווח של 30 שניות בין מקטע למקטע.",
+  },
+  hedge: {
+    name: "גידור",
+    investment_usd: 10,
+    entry_price_cents: 30,
+    hedge_enabled: true,
+    hedge_combined_ask_max: 0.98,
+    side_preference: "Up" as const,
+    desc: "כניסה לכיוון Up; כאשר סכום שאלות הקנייה ל-Up ול-Down אינו עולה על 0.98 — מוצעת פתיחת רגל נוספת.",
+  },
+};
+
+export default function App() {
+  const [showOnboard, setShowOnboard] = useState(
+    () => typeof localStorage !== "undefined" && !localStorage.getItem("pm_onboard_done")
+  );
+  const [liveMode, setLiveMode] = useState(false);
+  const [tab, setTab] = useState<Tab>("dash");
+  const [market, setMarket] = useState<Market | null>(null);
+  const [btc, setBtc] = useState<{ price: number; history: { t: number; p: number }[] }>({
+    price: 0,
+    history: [],
+  });
+  const [demoState, setDemoState] = useState<Record<string, unknown>>({});
+  const [logs, setLogs] = useState<string[]>([]);
+  const [logEntries, setLogEntries] = useState<{ ts: number; msg: string; type: string; session_id?: string }[]>([]);
+  const [pending, setPending] = useState<Record<string, unknown> | null>(null);
+  const [err, setErr] = useState("");
+  const [ob, setOb] = useState<OrderbookSummary | null>(null);
+  const [engineStatus, setEngineStatus] = useState("");
+  const [engineLastTickTs, setEngineLastTickTs] = useState<number | null>(null);
+  const [cfgDirty, setCfgDirty] = useState(false);
+  const [saveFeedback, setSaveFeedback] = useState<"saved" | null>(null);
+  const cfgDirtyRef = useRef(false);
+
+  const [inv, setInv] = useState(5);
+  const [entryCents, setEntryCents] = useState(20);
+  const [tp, setTp] = useState(20);
+  const [minMin, setMinMin] = useState(3);
+  const [freezeMin, setFreezeMin] = useState(1);
+  const [interBlock, setInterBlock] = useState(true);
+  const [dca, setDca] = useState(false);
+  const [dcaSlices, setDcaSlices] = useState(4);
+  const [dcaInt, setDcaInt] = useState(30);
+  const [dcaDiscountEnabled, setDcaDiscountEnabled] = useState(false);
+  const [dcaDiscountPct, setDcaDiscountPct] = useState(2);
+  const [hedge, setHedge] = useState(false);
+  const [hedgeMax, setHedgeMax] = useState(0.98);
+  const [side, setSide] = useState<"Up" | "Down" | "signal">("Up");
+  const [botMode, setBotMode] = useState<"off" | "semi" | "auto">("off");
+  const [requireApproval, setRequireApproval] = useState(true);
+  const [autoReenter, setAutoReenter] = useState(true);
+  const [reenterCooldown, setReenterCooldown] = useState(8);
+  const [maxEntriesPerWindow, setMaxEntriesPerWindow] = useState(3);
+  const [maxNotionalPerWindow, setMaxNotionalPerWindow] = useState(1_000_000);
+  const [maxTradesPerHour, setMaxTradesPerHour] = useState(1_000);
+  const [nearEntryPct, setNearEntryPct] = useState(3);
+  const [nearTpPct, setNearTpPct] = useState(2);
+  const [dcaTpOverridePct, setDcaTpOverridePct] = useState(50);
+  /** 0 = כבוי; כל X שניות — שורת יומן עם Ask/Bid מ-Polymarket */
+  const [bookLogIntervalSec, setBookLogIntervalSec] = useState(0);
+  /** שוק Polymarket: חלון 5 או 15 דק׳ (לא מספר חוזים) */
+  const [btcWindow, setBtcWindow] = useState<"5m" | "15m">("5m");
+  /** מינ׳ חוזים — לפחות max(זה, מינ׳ השוק) */
+  const [minContracts, setMinContracts] = useState(5);
+  const [pk, setPk] = useState("");
+  /** loading state לפעולות חד-פעמיות: מונע לחיצה כפולה */
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+
+  useEffect(() => {
+    cfgDirtyRef.current = cfgDirty;
+  }, [cfgDirty]);
+
+  const markCfgDirty = useCallback(() => {
+    cfgDirtyRef.current = true;
+    setCfgDirty(true);
+  }, []);
+
+  const effectiveMinContracts = useMemo(
+    () => computeEffectiveMinContracts(minContracts, market?.order_min_size),
+    [minContracts, market?.order_min_size]
+  );
+
+  const contracts = useMemo(() => {
+    const price = entryCents / 100;
+    if (price <= 0) return 0;
+    const n = Math.floor(inv / price);
+    return n >= effectiveMinContracts ? n : 0;
+  }, [inv, entryCents, effectiveMinContracts]);
+
+  const refreshInFlight = useRef(false);
+  const refresh = useCallback(async () => {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
+    try {
+      setErr("");
+      const [m, b, st, lg, pe, cfg, obSummary, logEnt] = await Promise.all([
+        api<Market>("/api/market/current"),
+        api<{ price: number; history: { t: number; p: number }[] }>("/api/btc/live"),
+        api<Record<string, unknown>>("/api/demo/state"),
+        api<{ lines: string[] }>("/api/strategy/logs"),
+        api<{ pending: unknown }>("/api/strategy/pending"),
+        api<Record<string, unknown>>("/api/strategy/config"),
+        api<OrderbookSummary>("/api/market/orderbook-summary"),
+        api<{ entries: { ts: number; msg: string; type: string; session_id?: string }[] }>("/api/strategy/log-entries").catch(() => ({ entries: [] })),
+      ]);
+      setMarket(m);
+      setBtc(b);
+      setDemoState(st);
+      setLogs(lg.lines || []);
+      setLogEntries((logEnt?.entries as { ts: number; msg: string; type: string; session_id?: string }[]) || []);
+      setPending((pe.pending as Record<string, unknown>) || null);
+      {
+        const m = cfg.mode as string | undefined;
+        if (m === "off" || m === "semi" || m === "auto") {
+          setBotMode(m);
+          setRequireApproval(m === "semi");
+        }
+      }
+      if (typeof (cfg as any).last_status === "string") setEngineStatus((cfg as any).last_status);
+      if (typeof (cfg as any).last_tick_ts === "number") setEngineLastTickTs((cfg as any).last_tick_ts);
+      // חשוב: יש רענון כל שנייה. לא נדרוס ערכים שהמשתמש עורך לפני "שמור".
+      // כשאין עריכה פתוחה — מסנכרנים את כל ההגדרות מהשרת (אחרת אחרי F5 חוזרים לברירות מחדל מקומיות).
+      if (!cfgDirtyRef.current) {
+        const c = cfg as Record<string, unknown>;
+        if (typeof c.investment_usd === "number") setInv(c.investment_usd);
+        if (typeof c.entry_price_cents === "number") setEntryCents(c.entry_price_cents);
+        if (typeof c.take_profit_pct === "number") setTp(c.take_profit_pct);
+        if (typeof c.min_minutes_for_entry === "number") setMinMin(c.min_minutes_for_entry);
+        if (typeof c.freeze_last_minutes === "number") setFreezeMin(c.freeze_last_minutes);
+        if (typeof c.intermediate_block_new_entries === "boolean") setInterBlock(c.intermediate_block_new_entries);
+        if (typeof c.dca_enabled === "boolean") setDca(c.dca_enabled);
+        if (typeof c.dca_slices === "number") setDcaSlices(c.dca_slices);
+        if (typeof c.dca_interval_sec === "number") setDcaInt(c.dca_interval_sec);
+        if (typeof c.dca_discount_enabled === "boolean") setDcaDiscountEnabled(c.dca_discount_enabled);
+        if (typeof c.dca_discount_pct === "number") setDcaDiscountPct(c.dca_discount_pct);
+        if (typeof c.hedge_enabled === "boolean") setHedge(c.hedge_enabled);
+        if (typeof c.hedge_combined_ask_max === "number") setHedgeMax(c.hedge_combined_ask_max);
+        const sp = c.side_preference;
+        if (sp === "Up" || sp === "Down" || sp === "signal") setSide(sp);
+        if (typeof c.auto_reenter_after_tp === "boolean") setAutoReenter(c.auto_reenter_after_tp);
+        if (typeof c.reenter_cooldown_sec === "number") setReenterCooldown(c.reenter_cooldown_sec);
+        if (typeof c.max_entries_per_window === "number") setMaxEntriesPerWindow(c.max_entries_per_window);
+        if (typeof c.max_notional_per_window_usd === "number") setMaxNotionalPerWindow(c.max_notional_per_window_usd);
+        if (typeof c.max_trades_per_hour === "number") setMaxTradesPerHour(c.max_trades_per_hour);
+        if (typeof c.near_entry_pct === "number") setNearEntryPct(c.near_entry_pct);
+        if (typeof c.near_tp_pct === "number") setNearTpPct(c.near_tp_pct);
+        if (typeof c.dca_tp_override_pct === "number") setDcaTpOverridePct(c.dca_tp_override_pct);
+        if (typeof c.book_log_interval_sec === "number") setBookLogIntervalSec(c.book_log_interval_sec);
+        const bw = c.btc_window;
+        if (bw === "5m" || bw === "15m") setBtcWindow(bw);
+        if (typeof c.min_contracts === "number") setMinContracts(c.min_contracts);
+      }
+      setOb(obSummary);
+    } catch (e: unknown) {
+      setErr(
+        e instanceof Error
+          ? e.message
+          : "שגיאת רשת. יש לוודא שהמנוע פעיל (למשל: npm run engine מתוך תיקיית הפרויקט).",
+      );
+    } finally {
+      refreshInFlight.current = false;
+    }
+  }, []);
+
+  const hasOpenDemoPositions = useMemo(() => {
+    const p = (demoState as { positions?: unknown[] }).positions;
+    return Array.isArray(p) && p.length > 0;
+  }, [demoState]);
+
+  /** עדכון דינמי בלי לאפס interval (הימנעות מבזק כפול של refresh + בקשות כפולות בלוג) */
+  const hasOpenDemoPositionsRef = useRef(hasOpenDemoPositions);
+  useEffect(() => {
+    hasOpenDemoPositionsRef.current = hasOpenDemoPositions;
+  }, [hasOpenDemoPositions]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    (async () => {
+      while (!cancelled) {
+        await refresh();
+        if (cancelled) break;
+        const ms = hasOpenDemoPositionsRef.current ? 500 : 1000;
+        await sleep(ms);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [refresh]);
+
+  const pushConfig = async () => {
+    await api("/api/strategy/config", {
+      method: "POST",
+      body: JSON.stringify({
+        investment_usd: inv,
+        entry_price_cents: entryCents,
+        min_contracts: minContracts,
+        btc_window: btcWindow,
+        take_profit_pct: tp,
+        min_minutes_for_entry: minMin,
+        freeze_last_minutes: freezeMin,
+        intermediate_block_new_entries: interBlock,
+        dca_enabled: dca,
+        dca_slices: dcaSlices,
+        dca_interval_sec: dcaInt,
+        dca_discount_enabled: dcaDiscountEnabled,
+        dca_discount_pct: dcaDiscountPct,
+        hedge_enabled: hedge,
+        hedge_combined_ask_max: hedgeMax,
+        side_preference: side,
+        auto_reenter_after_tp: autoReenter,
+        reenter_cooldown_sec: reenterCooldown,
+        max_entries_per_window: maxEntriesPerWindow,
+        max_notional_per_window_usd: maxNotionalPerWindow,
+        max_trades_per_hour: maxTradesPerHour,
+        near_entry_pct: nearEntryPct,
+        near_tp_pct: nearTpPct,
+        dca_tp_override_pct: dcaTpOverridePct,
+        book_log_interval_sec: bookLogIntervalSec,
+      }),
+    });
+    cfgDirtyRef.current = false;
+    setCfgDirty(false);
+    setSaveFeedback("saved");
+    setTimeout(() => setSaveFeedback(null), 3000);
+    await refresh();
+  };
+
+  const setMode = async (m: "off" | "semi" | "auto") => {
+    await pushConfig();
+    await api("/api/strategy/mode", { method: "POST", body: JSON.stringify({ mode: m }) });
+    setBotMode(m);
+    setRequireApproval(m === "semi");
+    await refresh();
+  };
+
+  const chartData = useMemo(() => {
+    return (btc.history || []).map((x, i) => {
+      const ts = Number(x.t);
+      return {
+        i,
+        p: x.p,
+        ts,
+        t: new Date(ts * 1000).toLocaleTimeString("he-IL"),
+      };
+    });
+  }, [btc.history]);
+
+  const cumPnlChartData = useMemo(() => {
+    const trades = ((demoState as any).trades as Trade[]) || [];
+    const realizedTrades = trades.filter(
+      (t) => t.realized_pnl != null && !Number.isNaN(Number(t.realized_pnl)),
+    );
+    // חשוב: חישוב PnL מצטבר חייב להיות כרונולוגי לפי ts.
+    // אם לא ממיינים, Recharts תחבר נקודות לפי ts אבל cum יחושב בסדר אחר => גרף "קופץ".
+    // בנוסף: אם ts לא קיים/0, נזרוק כדי לא “להפיל” נקודות מוקדם מדי על הציר.
+    const withValidTs = realizedTrades
+      .map((t) => ({ t, tsSec: Number(t.ts) }))
+      .filter((x) => Number.isFinite(x.tsSec) && x.tsSec > 0);
+
+    withValidTs.sort((a, b) => a.tsSec - b.tsSec);
+
+    let cum = 0;
+    let lastTs: number | null = null;
+    const out: { i: number; pnl: number; ts: number; t: string }[] = [];
+
+    for (let i = 0; i < withValidTs.length; i++) {
+      const t = withValidTs[i].t;
+      const tsSec = withValidTs[i].tsSec;
+      cum += Number(t.realized_pnl || 0);
+
+      if (lastTs != null && Math.abs(lastTs - tsSec) < 1e-9) {
+        // כמה אירועים באותו ts — עדכן את אותה נקודה כדי למנוע "קפיצות" כפולות.
+        out[out.length - 1].pnl = cum;
+        continue;
+      }
+
+      lastTs = tsSec;
+      out.push({
+        i,
+        pnl: cum,
+        ts: tsSec,
+        t: new Date(tsSec * 1000).toLocaleTimeString("he-IL"),
+      });
+    }
+
+    return out;
+  }, [demoState]);
+
+  const cumPnlLast = cumPnlChartData.length ? cumPnlChartData[cumPnlChartData.length - 1].pnl : undefined;
+  const cumPnlAnim = useChartAnimationGate(cumPnlChartData.length, cumPnlLast, { epsilon: 0.005 });
+
+  const diff =
+    market?.price_to_beat != null && btc.price
+      ? btc.price - market.price_to_beat
+      : null;
+
+  return (
+    <div className="app-shell">
+      {showOnboard && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.85)",
+            zIndex: 1000,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 24,
+          }}
+        >
+          <div style={{ background: "var(--card)", maxWidth: 480, padding: 24, borderRadius: 16 }}>
+            <h2 style={{ marginTop: 0 }}>ברוכים הבאים</h2>
+            <ol style={{ paddingRight: 20, lineHeight: 1.8 }}>
+              <li>
+                <strong>מצב סימולציה</strong>: מסחר מדומה מול נתוני שוק בפועל, ללא חשיפה כספית.
+              </li>
+              <li>
+                <strong>חלון זמן 5 או 15 דקות</strong>: ניתן לבחור בהגדרות האסטרטגיה; המערכת תעבור בין השווקים בהתאם.
+              </li>
+              <li>
+                מומלץ לפתוח את הלשונית <strong>אסטרטגיה</strong>, לטעון את הפריסט &quot;מתחיל פשוט&quot;, לשמור את ההגדרות ולבחור מצב הפעלה (חצי־אוטומטי או אוטומטי מלא).
+              </li>
+            </ol>
+            <Button
+              variant="primary"
+              style={{ width: "100%", padding: "12px 24px" }}
+              onClick={() => {
+                localStorage.setItem("pm_onboard_done", "1");
+                setShowOnboard(false);
+              }}
+            >
+              הבנתי — המשך
+            </Button>
+          </div>
+        </div>
+      )}
+      <header className="app-header">
+        <h1 className="app-title">Polymarket BTC — מסחר Up/Down · גרסה 3</h1>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <span className={`badge-mode ${liveMode ? "badge-mode--live" : "badge-mode--demo"}`}>
+            {liveMode ? "מסחר חי" : "סימולציה"}
+          </span>
+          <Button
+            variant="primary"
+            className="header-mode-btn"
+            data-live={liveMode ? "true" : "false"}
+            onClick={() => {
+              if (
+                !liveMode &&
+                !confirm("האם לעבור למסחר חי? פעולה זו כרוכה בסיכון כספי ודורשת אחריות.")
+              )
+                return;
+              setLiveMode(!liveMode);
+            }}
+          >
+            {liveMode ? "חזרה לסימולציה" : "מעבר למסחר חי"}
+          </Button>
+        </div>
+      </header>
+
+      {liveMode && (
+        <div className="live-banner">
+          <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 8 }}>
+            יתרת הסימולציה אינה משקפת יתרה אמיתית. פקודות נשלחות ל־Polymarket בעת קיום מפתח תקף. לכיבוי שליחה:{" "}
+            <code>POLYMARKET_LIVE=0</code>
+          </div>
+          <strong>מפתח פרטי (אחסון מקומי בלבד):</strong>
+          <input
+            type="password"
+            style={{
+              width: "100%",
+              maxWidth: 480,
+              marginTop: 8,
+              padding: 8,
+              borderRadius: 6,
+              border: "1px solid #666",
+              background: "#1a1a1a",
+              color: "#fff",
+            }}
+            placeholder="0x..."
+            value={pk}
+            onChange={(e) => setPk(e.target.value)}
+          />
+          <button
+            type="button"
+            style={{ marginTop: 8, marginRight: 8, padding: "6px 12px" }}
+            onClick={async () => {
+              await api("/api/live/private-key", {
+                method: "POST",
+                body: JSON.stringify({ key: pk }),
+              });
+              alert("המפתח נשמר לסשן הנוכחי. יש להתקין את החבילה: pip install py-clob-client");
+            }}
+          >
+            שמור מפתח לסשן
+          </button>
+        </div>
+      )}
+
+      <nav className="app-nav" role="tablist" aria-label="ניווט ראשי">
+        {(
+          [
+            ["dash", "לוח בקרה"],
+            ["strategy", "אסטרטגיה"],
+            ["signals", "📡 סיגנלים"],
+            ["trigger", "⚡ מסחר מהיר"],
+            ["stats", "סטטיסטיקה"],
+            ["tips_v2", "ניתוח v3"],
+            ["help", "עזרה ותיעוד"],
+          ] as const
+        ).map(([k, l]) => (
+          <button
+            key={k}
+            type="button"
+            role="tab"
+            aria-selected={tab === k}
+            data-active={tab === k ? "true" : "false"}
+            className="tab-btn"
+            onClick={() => setTab(k)}
+          >
+            {l}
+          </button>
+        ))}
+      </nav>
+
+      {err && (
+        <div className="alert-error" role="alert">
+          {err}
+        </div>
+      )}
+
+      <main id="main-content">
+      {tab === "dash" && (
+        <>
+          {market && (
+            <Card padding="md" style={{ marginBottom: "var(--s-4)" }}>
+              <div style={{ color: "var(--muted)", fontSize: 14 }}>{market.title}</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>
+                נותרו {Math.floor(market.seconds_left / 60)}:
+                {String(Math.floor(market.seconds_left % 60)).padStart(2, "0")} עד סיום החלון · אורך החלון{" "}
+                {market.window_sec != null
+                  ? `${Math.round(market.window_sec / 60)} דקות`
+                  : "—"}{" "}
+                · מינימום הזמנה {market.order_min_size} חוזים
+              </div>
+              <p style={{ fontSize: 14, marginTop: 12 }}>
+                <strong>מחיר יעד לפתיחת החלון:</strong>{" "}
+                {market.price_to_beat != null
+                  ? `$${market.price_to_beat.toLocaleString(undefined, { maximumFractionDigits: 2 })}`
+                  : "טוען…"}{" "}
+                <span style={{ color: "var(--muted)", fontSize: 12 }}>({market.price_to_beat_note})</span>
+              </p>
+              <p>
+                <strong>מחיר BTC נוכחי:</strong> $
+                {btc.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}
+                {diff != null && (
+                  <span style={{ color: diff >= 0 ? "var(--up)" : "var(--down)" }}>
+                    ({diff >= 0 ? "↑" : "↓"} {Math.abs(diff).toFixed(2)}$ ממחיר הפתיחה)
+                  </span>
+                )}
+              </p>
+              <p style={{ fontSize: 13, color: "var(--muted)" }}>
+                כיוון Up מנצח אם במועד סיום החלון מחיר הייחוס Chainlink BTC/USD אינו נמוך ממחיר פתיחת החלון.
+              </p>
+              {ob && (
+                <div style={{ display: "flex", gap: 24, marginTop: 12, fontSize: 14 }}>
+                  <span>
+                    Up חוזה (mid):{" "}
+                    <strong>
+                      {ob.up.mid != null ? `${(ob.up.mid * 100).toFixed(1)}¢` : "—"}
+                    </strong>
+                    {ob.up.bid != null && ob.up.ask != null && (
+                      <span style={{ color: "var(--muted)", fontSize: 12 }}>
+                        {" "}
+                        (bid {(ob.up.bid * 100).toFixed(1)}¢ / ask{" "}
+                        {(ob.up.ask * 100).toFixed(1)}¢)
+                      </span>
+                    )}
+                  </span>
+                  <span>
+                    Down חוזה (mid):{" "}
+                    <strong>
+                      {ob.down.mid != null ? `${(ob.down.mid * 100).toFixed(1)}¢` : "—"}
+                    </strong>
+                    {ob.down.bid != null && ob.down.ask != null && (
+                      <span style={{ color: "var(--muted)", fontSize: 12 }}>
+                        {" "}
+                        (bid {(ob.down.bid * 100).toFixed(1)}¢ / ask{" "}
+                        {(ob.down.ask * 100).toFixed(1)}¢)
+                      </span>
+                    )}
+                  </span>
+                </div>
+              )}
+            </Card>
+          )}
+
+          <ChartCard
+            title="מחיר BTC"
+            subtitle="דגימות אחרונות במחשב המקומי; יעד הרזולוציה: Chainlink BTC/USD"
+            height={280}
+          >
+            <div style={{ width: "100%", height: 220 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={chartData} margin={{ top: 6, right: 8, bottom: 4, left: 4 }}>
+                  <XAxis
+                    dataKey="ts"
+                    type="number"
+                    domain={["dataMin", "dataMax"]}
+                    tick={{ ...chartAxisTick, fontSize: 10 }}
+                    tickFormatter={(v) => formatPnlAxisTime(Number(v))}
+                    allowDecimals
+                  />
+                  <YAxis domain={["auto", "auto"]} tick={{ ...chartAxisTick, fontSize: 10 }} width={72} />
+                  <Tooltip
+                    contentStyle={chartTooltipStyle}
+                    labelStyle={{ color: "var(--text-secondary)" }}
+                    itemStyle={{ color: "var(--text)" }}
+                    labelFormatter={(label) =>
+                      Number.isFinite(Number(label)) ? formatPnlAxisTime(Number(label)) : String(label)
+                    }
+                  />
+                  {market?.price_to_beat != null && (
+                    <ReferenceLine
+                      y={market.price_to_beat}
+                      stroke="var(--accent-bright)"
+                      strokeOpacity={0.65}
+                      strokeDasharray="4 4"
+                      label={{ value: "מחיר יעד לפתיחת החלון", fill: "var(--text-secondary)", fontSize: 11 }}
+                    />
+                  )}
+                  <Line
+                    type={btcPriceLineCurveType}
+                    dataKey="p"
+                    stroke="var(--chart-line-primary)"
+                    dot={false}
+                    strokeWidth={chartStroke.width}
+                    strokeLinecap={chartStroke.linecap}
+                    strokeLinejoin={chartStroke.linejoin}
+                    isAnimationActive
+                    animationDuration={380}
+                    animationEasing="ease-out"
+                    connectNulls
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </ChartCard>
+
+          <div style={{ marginTop: 16, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "stretch" }}>
+            <Card padding="md" style={{ flex: 1, minWidth: 200 }}>
+              יתרה במזומן:{" "}
+              <strong className="tabular-nums">${Number((demoState as any).balance_usd || 0).toFixed(2)}</strong>
+              <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 12 }}>
+                שווי נטו (כולל פוזיציות):{" "}
+                <strong className="tabular-nums" style={{ color: "var(--text)" }}>
+                  ${Number(((demoState as any).last_mark || {}).equity || (demoState as any).balance_usd || 0).toFixed(2)}
+                </strong>
+              </div>
+            </Card>
+            <Button
+              variant="primary"
+              type="button"
+              disabled={actionLoading === "reset"}
+              onClick={async () => {
+                setActionLoading("reset");
+                try {
+                  await api("/api/demo/reset", { method: "POST", body: "{}" });
+                  await refresh();
+                } finally {
+                  setActionLoading(null);
+                }
+              }}
+            >
+              {actionLoading === "reset" ? "מאפס…" : "איפוס חשבון סימולציה (10,000 דולר)"}
+            </Button>
+          </div>
+        </>
+      )}
+
+      {tab === "strategy" && (
+        <Card padding="lg">
+          <SectionTitle as="h2">הגדרות אסטרטגיה</SectionTitle>
+
+          <div style={{ marginBottom: 16 }}>
+            <strong>פריסטים:</strong>
+            {Object.entries(PRESETS).map(([k, v]) => (
+              <button
+                key={k}
+                type="button"
+                style={{ marginRight: 8, marginTop: 8, padding: "6px 10px" }}
+                onClick={() => {
+                  const p = v as Record<string, unknown>;
+                  setInv(v.investment_usd);
+                  setEntryCents(v.entry_price_cents);
+                  if ("take_profit_pct" in v) setTp(v.take_profit_pct);
+                  setDca(!!p.dca_enabled);
+                  if (p.dca_slices) setDcaSlices(Number(p.dca_slices));
+                  if (p.dca_interval_sec) setDcaInt(Number(p.dca_interval_sec));
+                  setHedge(!!v.hedge_enabled);
+                  if (p.hedge_combined_ask_max) setHedgeMax(Number(p.hedge_combined_ask_max));
+                  if (p.side_preference) setSide(p.side_preference as "Up" | "Down" | "signal");
+                  markCfgDirty();
+                  alert(v.desc);
+                }}
+              >
+                {v.name}
+              </button>
+            ))}
+          </div>
+
+          <label>
+            סכום השקעה ($) <span title="תקציב לעסקה">?</span>
+            <input
+              type="number"
+              step="0.5"
+              value={inv}
+              onChange={(e) => {
+                setInv(Number(e.target.value));
+                markCfgDirty();
+              }}
+              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+            />
+          </label>
+          <label>
+            כניסה במחיר (¢){" "}
+            <span title="Polymarket: בדרך כלל 1¢–99¢ לחוזה (0.01$–0.99$)">?</span>
+            <input
+              type="number"
+              min={1}
+              max={99}
+              value={entryCents}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                if (Number.isFinite(n)) {
+                  setEntryCents(Math.min(99, Math.max(1, Math.round(n))));
+                  markCfgDirty();
+                }
+              }}
+              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+            />
+            <span style={{ fontSize: 12, color: "var(--muted)", display: "block", marginTop: 4 }}>
+              טווח מומלץ: 1–99 (סנטים) = 0.01$–0.99$ לחוזה
+            </span>
+          </label>
+          <label style={{ display: "block", marginBottom: 12 }}>
+            שוק BTC Up/Down (אורך חלון)
+            <select
+              value={btcWindow}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === "5m" || v === "15m") {
+                  setBtcWindow(v);
+                  markCfgDirty();
+                }
+              }}
+              style={{ display: "block", width: "100%", maxWidth: 320, marginTop: 6, padding: 8 }}
+            >
+              <option value="5m">5 דק׳ — btc-updown-5m (ברירת מחדל)</option>
+              <option value="15m">15 דק׳ — btc-updown-15m</option>
+            </select>
+            <span style={{ fontSize: 12, color: "var(--muted)", display: "block", marginTop: 6 }}>
+              אחרי שינוי — לחץ &quot;שמור&quot;. הלוח והבוט יטענו את השוק המתאים (slug נפרד ב-Polymarket).
+            </span>
+          </label>
+          <label>
+            מינ׳ חוזים (לפחות)
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={minContracts}
+              onChange={(e) => {
+                setMinContracts(Number(e.target.value));
+                markCfgDirty();
+              }}
+              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, marginTop: 6, padding: 8 }}
+            />
+            <span style={{ fontSize: 12, color: "var(--muted)" }}>
+              בפועל: לפחות {effectiveMinContracts} (מקסימום בין מה שהגדרת לבין מינ׳ השוק
+              {market != null ? ` — כרגע ${Math.ceil(market.order_min_size)}` : ""}).
+            </span>
+          </label>
+          <div style={{ marginBottom: 12, color: contracts ? "var(--up)" : "#f87171" }}>
+            ≈ {contracts || `לא מספיק למינ׳ ${effectiveMinContracts}`} חוזים
+            {contracts
+              ? ` (מינ׳ ${effectiveMinContracts} — עומד)`
+              : ` — צריך לפחות ${((effectiveMinContracts * entryCents) / 100).toFixed(2)}$ ב-${entryCents}¢`}
+          </div>
+
+          <label>
+            יעד רווח % (נטו משוער)
+            <input
+              type="number"
+              value={tp}
+              onChange={(e) => {
+                setTp(Number(e.target.value));
+                markCfgDirty();
+              }}
+              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+            />
+          </label>
+          <label>
+            דק׳ מינימום לכניסה (נשאר בחלון)
+            <input
+              type="number"
+              step="0.5"
+              value={minMin}
+              onChange={(e) => {
+                setMinMin(Number(e.target.value));
+                markCfgDirty();
+              }}
+              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+            />
+          </label>
+          <label>
+            קפיאה בדקה(ות) אחרונה(ות)
+            <input
+              type="number"
+              step="0.5"
+              value={freezeMin}
+              onChange={(e) => {
+                setFreezeMin(Number(e.target.value));
+                markCfgDirty();
+              }}
+              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+            />
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <input
+              type="checkbox"
+              checked={interBlock}
+              onChange={(e) => {
+                setInterBlock(e.target.checked);
+                markCfgDirty();
+              }}
+            />
+            אזור ביניים: בלי כניסות חדשות בין {freezeMin} ל-{minMin} דק׳ לסיום
+          </label>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <input
+              type="checkbox"
+              checked={dca}
+              onChange={(e) => {
+                setDca(e.target.checked);
+                markCfgDirty();
+              }}
+            />
+            DCA
+          </label>
+          {dca && (
+            <>
+              <label>
+                מספר פריסות
+                <input
+                  type="number"
+                  value={dcaSlices}
+                  onChange={(e) => {
+                    setDcaSlices(Number(e.target.value));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", marginBottom: 8, padding: 8 }}
+                />
+              </label>
+              <label>
+                מרווח שניות
+                <input
+                  type="number"
+                  value={dcaInt}
+                  onChange={(e) => {
+                    setDcaInt(Number(e.target.value));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", marginBottom: 12, padding: 8 }}
+                />
+              </label>
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed #263244" }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                  <input
+                    type="checkbox"
+                    checked={dcaDiscountEnabled}
+                    onChange={(e) => {
+                      setDcaDiscountEnabled(e.target.checked);
+                      markCfgDirty();
+                    }}
+                  />
+                  DCA בהנחת מחיר באחוזים (לכל סל)
+                </label>
+                <label>
+                  אחוז הנחה מה-Ask (%)
+                  <input
+                    type="number"
+                    step="0.5"
+                    value={dcaDiscountPct}
+                    onChange={(e) => {
+                      setDcaDiscountPct(Number(e.target.value));
+                      markCfgDirty();
+                    }}
+                    disabled={!dcaDiscountEnabled}
+                    style={{
+                      display: "block",
+                      width: "100%",
+                      maxWidth: 240,
+                      marginBottom: 6,
+                      padding: 8,
+                      opacity: dcaDiscountEnabled ? 1 : 0.6,
+                    }}
+                  />
+                </label>
+                <div style={{ color: "var(--muted)", fontSize: 12 }}>
+                  אם לא מסמנים—הבוט נשאר בהתנהגות הנוכחית: DCA לפי זמן. אם כן—הסל הבא מוגבל X% מתחת ל-Ask.
+                </div>
+              </div>
+            </>
+          )}
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <input
+              type="checkbox"
+              checked={hedge}
+              onChange={(e) => {
+                setHedge(e.target.checked);
+                markCfgDirty();
+              }}
+            />
+            מצב גידור (רגל 2 כש-Ask משולב ≤)
+            <input
+              type="number"
+              step="0.01"
+              value={hedgeMax}
+              onChange={(e) => {
+                setHedgeMax(Number(e.target.value));
+                markCfgDirty();
+              }}
+              style={{ width: 72, marginRight: 8 }}
+            />
+          </label>
+          <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid #263244" }}>
+            <h3 style={{ marginTop: 0 }}>רווח אוטומטי (TP) + מגבלות בטיחות</h3>
+            <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <input
+                type="checkbox"
+                checked={autoReenter}
+                onChange={(e) => {
+                  setAutoReenter(e.target.checked);
+                  markCfgDirty();
+                }}
+              />
+              כניסה מחדש אוטומטית אחרי TP (אם נשאר זמן בחלון והתנאים מתקיימים)
+            </label>
+            <label>
+              Cooldown אחרי TP (שניות)
+              <input
+                type="number"
+                step="1"
+                value={reenterCooldown}
+                onChange={(e) => {
+                  setReenterCooldown(Number(e.target.value));
+                  markCfgDirty();
+                }}
+                style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+              />
+            </label>
+            <label>
+              מקס׳ כניסות בחלון (5 דק׳)
+              <input
+                type="number"
+                step="1"
+                value={maxEntriesPerWindow}
+                onChange={(e) => {
+                  setMaxEntriesPerWindow(Number(e.target.value));
+                  markCfgDirty();
+                }}
+                style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+              />
+            </label>
+            <label>
+              תקרת חשיפה בחלון ($) (רך)
+              <input
+                type="number"
+                step="10"
+                value={maxNotionalPerWindow}
+                onChange={(e) => {
+                  setMaxNotionalPerWindow(Number(e.target.value));
+                  markCfgDirty();
+                }}
+                style={{ display: "block", width: "100%", maxWidth: 240, marginBottom: 12, padding: 8 }}
+              />
+            </label>
+            <label>
+              מקס׳ עסקאות לשעה (רך)
+              <input
+                type="number"
+                step="1"
+                value={maxTradesPerHour}
+                onChange={(e) => {
+                  setMaxTradesPerHour(Number(e.target.value));
+                  markCfgDirty();
+                }}
+                style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+              />
+            </label>
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed #263244" }}>
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>סטטוס “קרוב ל…” (באחוזים)</div>
+              <label>
+                קרוב לכניסה: עד כמה % מעל היעד עדיין נחשב “קרוב”
+                <input
+                  type="number"
+                  step="0.5"
+                  value={nearEntryPct}
+                  onChange={(e) => {
+                    setNearEntryPct(Number(e.target.value));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+                />
+              </label>
+              <label>
+                קרוב ל-TP: אם חסר עד כמה % ליעד — יוצג “קרוב”
+                <input
+                  type="number"
+                  step="0.5"
+                  value={nearTpPct}
+                  onChange={(e) => {
+                    setNearTpPct(Number(e.target.value));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+                />
+              </label>
+              <label>
+                DCA override (%)
+                <input
+                  type="number"
+                  step="5"
+                  value={dcaTpOverridePct}
+                  onChange={(e) => {
+                    setDcaTpOverridePct(Number(e.target.value));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 8, padding: 8 }}
+                />
+              </label>
+              <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.55, marginBottom: 8 }}>
+                <strong>מתי זה נכנס לפעולה:</strong> רק כש־<strong>DCA מופעל</strong> ועדיין{" "}
+                <strong>לא סיימת את כל הסלייסים</strong>. אז הבוט בדרך כלל <strong>לא</strong> מוכר ב־TP עד
+                שתסיים את הפריסה — <strong>חוץ</strong> ממצבים מיוחדים: דקה(ות) אחרונות לפי &quot;קפיאה&quot;,
+                או כאן: כשהרווח הלא ממומש (מול עלות, לפי bid ברגע הבדיקה) <strong>≥ האחוז הזה</strong> — אז
+                מותרת מכירת TP גם באמצע DCA.
+                <br />
+                <strong>אחרי שכל הסלייסים בוצעו:</strong> השדה הזה <strong>לא רלוונטי</strong> — יציאה לפי{" "}
+                <strong>יעד TP</strong> (take_profit_pct) הרגיל (+ מעט עמלה בחישוב המנוע).
+                <br />
+                <strong>מספר נמוך יותר</strong> = קל יותר &quot;לפתוח&quot; TP באמצע DCA. <strong>מספר גבוה</strong> = צריך
+                רווח לא ממומש גדול יותר לפני שמותר למכור — עלול לעכב יציאה אם השוק קופץ וחוזר מהר (השיא בגרף ≠ מה
+                שהבוט ראה בטיק).
+              </div>
+              <div style={{ color: "var(--muted)", fontSize: 12 }}>
+                ברירות מחדל ל&quot;קרוב ל…&quot;: כניסה 3% / קרוב ל־TP 2%. DCA override לדוגמה 50% — רק כש־DCA חלקי.
+                {!dca && (
+                  <span style={{ display: "block", marginTop: 6, color: "#94a3b8" }}>
+                    כרגע DCA כבוי — override נשמר בהגדרות אבל לא משפיע על המנוע.
+                  </span>
+                )}
+              </div>
+            </div>
+            <label style={{ display: "block", marginTop: 12 }}>
+              יומן מחירי שוק (שניות, 0 = כבוי)
+              <span
+                title="כל כמה שניות תיכתב שורה ביומן: Ask/Bid ל־Up ו‑Down מ־Polymarket CLOB — כדי לראות שהבוט מעדכן מול השוק"
+                style={{ marginRight: 4 }}
+              >
+                ?
+              </span>
+              <input
+                type="number"
+                min={0}
+                step={1}
+                value={bookLogIntervalSec}
+                onChange={(e) => {
+                  setBookLogIntervalSec(Math.max(0, Number(e.target.value) || 0));
+                  markCfgDirty();
+                }}
+                style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, padding: 8 }}
+              />
+              <span style={{ fontSize: 12, color: "var(--muted)", display: "block", marginTop: 4 }}>
+                למשל 3–5 — לעקוב אחרי תנועת מחירים בלי להציף; 0 ללא שורות &quot;שוק CLOB&quot;.
+              </span>
+            </label>
+            <div style={{ color: "var(--muted)", fontSize: 12 }}>
+              ההגבלות כאן לא מחליפות Stop Loss — הן רק מונעות מהבוט לרוץ בצורה לא מבוקרת.
+            </div>
+          </div>
+          <label>
+            צד
+            <select
+              value={side}
+              onChange={(e) => {
+                setSide(e.target.value as "Up" | "Down" | "signal");
+                markCfgDirty();
+              }}
+              style={{ display: "block", marginBottom: 16, padding: 8 }}
+            >
+              <option value="Up">Up</option>
+              <option value="Down">Down</option>
+              <option value="signal">אוטו (הצד הזול מ-Ask)</option>
+            </select>
+          </label>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              style={{
+                padding: "10px 20px",
+                background: cfgDirty ? "var(--accent)" : "#334155",
+                border: cfgDirty ? "2px solid #f59e0b" : "none",
+                color: "#fff",
+                borderRadius: 8,
+              }}
+              onClick={pushConfig}
+            >
+              {saveFeedback === "saved" ? "נשמר בהצלחה" : "שמור הגדרות"}
+            </button>
+            {cfgDirty && (
+              <span style={{ fontSize: 13, color: "var(--muted)" }}>
+                יש שינויים לא שמורים — ההגדרות יישמרו גם להפעלות הבאות
+              </span>
+            )}
+          </div>
+
+          <h3>מצב בוט</h3>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+            <input
+              type="checkbox"
+              checked={requireApproval}
+              onChange={async (e) => {
+                const v = e.target.checked;
+                setRequireApproval(v);
+                if (botMode !== "off") {
+                  await setMode(v ? "semi" : "auto");
+                }
+              }}
+            />
+            דורש אישור לפני כניסה לעסקה (מסומן = חצי־אוטומטי, לא מסומן = נכנס בלי לשאול)
+          </label>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {(["off", "semi", "auto"] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => setMode(m)}
+                style={{
+                  padding: "10px 18px",
+                  background: botMode === m ? "var(--accent)" : "#333",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: 8,
+                }}
+              >
+                {m === "off" ? "כבוי" : m === "semi" ? "חצי-אוטומטי" : "אוטומטי מלא"}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ marginTop: 10, color: "var(--muted)", fontSize: 13 }}>
+            סטטוס מנוע: <strong style={{ color: "#fff" }}>{engineStatus || "—"}</strong>
+            {engineLastTickTs ? (
+              <div style={{ marginTop: 4 }}>
+                עדכון אחרון:{" "}
+                <strong style={{ color: "#fff" }}>
+                  {Math.max(0, Math.floor((Date.now() / 1000 - engineLastTickTs) as number))} שנ׳
+                </strong>
+              </div>
+            ) : null}
+          </div>
+
+          {pending && (
+            <div
+              style={{
+                marginTop: 20,
+                padding: 16,
+                background: "#2d3748",
+                borderRadius: 8,
+              }}
+            >
+              <strong>ממתין לאישור:</strong>
+              <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(pending, null, 2)}</pre>
+              <button
+                type="button"
+                disabled={actionLoading === "approve"}
+                style={{ marginLeft: 8, padding: "8px 16px", background: actionLoading === "approve" ? "#374151" : "var(--up)", border: "none", color: "#fff", borderRadius: 6, opacity: actionLoading === "approve" ? 0.7 : 1, cursor: actionLoading === "approve" ? "not-allowed" : "pointer" }}
+                onClick={async () => {
+                  setActionLoading("approve");
+                  try {
+                    const r = await api<{ ok?: boolean; error?: string }>("/api/strategy/approve", {
+                      method: "POST",
+                      body: JSON.stringify({ live: liveMode }),
+                    });
+                    if (r && (r as { ok?: boolean }).ok === false) {
+                      alert((r as { error?: string }).error || "כשל באישור");
+                    }
+                  } catch (e) {
+                    alert(e instanceof Error ? e.message : "שגיאה");
+                  } finally {
+                    setActionLoading(null);
+                  }
+                  await refresh();
+                }}
+              >
+                {actionLoading === "approve" ? "מאשר…" : "אשר פקודה"}
+              </button>
+              <button
+                type="button"
+                disabled={actionLoading === "reject"}
+                style={{ opacity: actionLoading === "reject" ? 0.7 : 1, cursor: actionLoading === "reject" ? "not-allowed" : "pointer" }}
+                onClick={async () => {
+                  setActionLoading("reject");
+                  try {
+                    await api("/api/strategy/reject", { method: "POST", body: "{}" });
+                  } finally {
+                    setActionLoading(null);
+                  }
+                  await refresh();
+                }}
+              >
+                {actionLoading === "reject" ? "מבטל…" : "בטל"}
+              </button>
+            </div>
+          )}
+
+          <h3 style={{ marginTop: 24 }}>יומן</h3>
+          <pre
+            style={{
+              maxHeight: 200,
+              overflow: "auto",
+              background: "#111",
+              padding: 12,
+              fontSize: 12,
+              borderRadius: 8,
+            }}
+          >
+            {logs.join("\n")}
+          </pre>
+        </Card>
+      )}
+
+      {tab === "stats" && (
+        <Card padding="lg">
+          <SectionTitle as="h2">סטטיסטיקות סימולציה</SectionTitle>
+          {(() => {
+            const trades = ((demoState as any).trades as any[]) || [];
+            const sessions = groupTradesBySession(trades);
+            const tradesCount = sessions.length;
+            const balance = Number((demoState as any).balance_usd || 0);
+            const lastMark = (demoState as any).last_mark as
+              | { equity?: number; unrealized_usd?: number; ts?: number }
+              | undefined;
+            const hasOpenPositions = ((demoState as any).positions as unknown[])?.length > 0;
+            const unreal = hasOpenPositions ? Number(lastMark?.unrealized_usd || 0) : 0;
+            const equity = hasOpenPositions ? Number(lastMark?.equity || balance) : balance;
+
+            // גרף PnL מבוסס על רווח/הפסד ממומש בלבד (realized_pnl),
+            // כך שהקו זז רק כשנסגרת עסקה ולא כשמחיר השוק זז.
+            const data = cumPnlChartData;
+
+            const allPnls = data.map((d) => d.pnl);
+            const maxPnl = allPnls.length ? Math.max(...allPnls) : 0;
+            const minPnl = allPnls.length ? Math.min(...allPnls) : 0;
+            const pnl = allPnls.length ? allPnls[allPnls.length - 1] : 0;
+
+            // יציאות עם PnL ממומש: TP / פירוק (SETTLE_*) / EXPIRE_0 — לא רק SELL כדי שלא יפספס הפסדים.
+            const exitTrades = trades.filter(
+              (t) =>
+                t.realized_pnl != null &&
+                !Number.isNaN(Number(t.realized_pnl)) &&
+                (t.type === "EXPIRE_0" ||
+                  t.type === "SETTLE_WIN" ||
+                  t.type === "SETTLE_LOSS" ||
+                  t.type === "SETTLE_UNKNOWN" ||
+                  (t.type && String(t.type).startsWith("SELL"))),
+            );
+            const wins = exitTrades.filter((t) => Number(t.realized_pnl || 0) > 0);
+            const losses = exitTrades.filter((t) => Number(t.realized_pnl || 0) < 0);
+            const winRate =
+              exitTrades.length > 0 ? (wins.length / exitTrades.length) * 100 : 0;
+            const avgWin =
+              wins.length > 0
+                ? wins.reduce((s, t) => s + Number(t.realized_pnl || 0), 0) / wins.length
+                : 0;
+            const avgLossAbs =
+              losses.length > 0
+                ? Math.abs(
+                    losses.reduce((s, t) => s + Number(t.realized_pnl || 0), 0) / losses.length,
+                  )
+                : 0;
+            const rr = avgLossAbs > 0 ? avgWin / avgLossAbs : 0;
+
+            return (
+              <>
+                <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+                  <div className="stat-pill">
+                    יתרה במזומן: <strong>${balance.toFixed(2)}</strong>
+                  </div>
+                  <div className="stat-pill">
+                    שווי נטו (כולל פוזיציות פתוחות): <strong>${equity.toFixed(2)}</strong>
+                  </div>
+                  <div className="stat-pill">
+                    רווח והפסד מצטבר:{" "}
+                    <strong style={{ color: pnl >= 0 ? "var(--up)" : "var(--down)" }}>
+                      {pnl >= 0 ? "+" : "-"}${Math.abs(pnl).toFixed(2)}
+                    </strong>
+                  </div>
+                  <div className="stat-pill">
+                    רווח והפסד לא ממומש:{" "}
+                    <strong style={{ color: unreal >= 0 ? "var(--up)" : "var(--down)" }}>
+                      {unreal >= 0 ? "+" : "-"}${Math.abs(unreal).toFixed(2)}
+                    </strong>
+                  </div>
+                  <div className="stat-pill">
+                    שיא רווח מצטבר:{" "}
+                    <strong style={{ color: maxPnl >= 0 ? "var(--up)" : "var(--down)" }}>
+                      {maxPnl >= 0 ? "+" : "-"}${Math.abs(maxPnl).toFixed(2)}
+                    </strong>
+                  </div>
+                  <div className="stat-pill">
+                    שיא הפסד מצטבר:{" "}
+                    <strong style={{ color: minPnl <= 0 ? "var(--down)" : "var(--up)" }}>
+                      {minPnl >= 0 ? "+" : "-"}${Math.abs(minPnl).toFixed(2)}
+                    </strong>
+                  </div>
+                  <div className="stat-pill" title="מספר מחזורי עסקה מלאים (מכניסה ועד יציאה)">
+                    מחזורי עסקה: <strong>{tradesCount}</strong>
+                  </div>
+                  <div className="stat-pill">
+                    אחוז עסקאות רווחיות לעומת הפסדיות:{" "}
+                    <strong style={{ color: winRate >= 50 ? "var(--up)" : "var(--down)" }}>
+                      {winRate.toFixed(1)}%
+                    </strong>
+                  </div>
+                  <div className="stat-pill">
+                    יחס רווח מול סיכון ממוצע:{" "}
+                    <strong style={{ color: rr >= 1 ? "var(--up)" : "var(--down)" }}>
+                      {rr ? rr.toFixed(2) : "—"}
+                    </strong>
+                  </div>
+                  <button
+                    type="button"
+                    style={{
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      border: "none",
+                      background: "#334155",
+                      color: "#fff",
+                    }}
+                    onClick={async () => {
+                      if (
+                        !confirm(
+                          "לאפס את נתוני הסטטיסטיקה ולסגור פוזיציות פתוחות בחשבון הסימולציה? פעולה זו תמחק היסטוריה ועסקאות ותמיר פוזיציות ליתרה."
+                        )
+                      )
+                        return;
+                      await api("/api/demo/clear-stats", { method: "POST", body: "{}" });
+                      await refresh();
+                    }}
+                  >
+                    איפוס נתוני סטטיסטיקה
+                  </button>
+                  <a
+                    href={engineUrl("/api/demo/export.csv")}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      background: "var(--accent)",
+                      color: "#fff",
+                      textDecoration: "none",
+                      fontWeight: 700,
+                    }}
+                  >
+                    ייצוא CSV
+                  </a>
+                </div>
+
+                <ChartCard
+                  title="רווח והפסד מצטברים"
+                  subtitle="רווח או הפסד ממומשים בלבד; הקו מתקדם עם סגירת עסקאות. מוצג רווח והפסד מצטברים מהאפס, ולא יתרת החשבון המלאה."
+                >
+                  <div style={{ width: "100%", height: 300 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={data} margin={{ top: 8, right: 12, bottom: 8, left: 8 }}>
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={data.length ? ["dataMin", "dataMax"] : [0, 1]}
+                          tick={{ ...chartAxisTick, fontSize: 10 }}
+                          tickFormatter={(v) => (Number(v) > 0 ? formatPnlAxisTime(Number(v)) : "")}
+                          allowDecimals
+                        />
+                        <YAxis
+                          tick={{ ...chartAxisTick, fontSize: 10 }}
+                          domain={["auto", "auto"]}
+                          width={56}
+                          tickFormatter={(v) => `$${Number(v).toFixed(0)}`}
+                        />
+                        <Tooltip
+                          contentStyle={chartTooltipStyle}
+                          labelStyle={{ color: "var(--text-secondary)" }}
+                          itemStyle={{ color: "var(--text)" }}
+                          labelFormatter={(label) =>
+                            Number(label) > 0 ? formatPnlAxisTime(Number(label)) : String(label)
+                          }
+                          formatter={(v: number) => [`$${Number(v).toFixed(2)}`, "PnL מצטבר"]}
+                        />
+                        <ReferenceLine y={0} stroke="var(--chart-axis)" strokeDasharray="3 3" />
+                        <Line
+                          // ב-PnL מצטבר עדיף להימנע מ-overshoot של "natural" כשיש מעט נקודות.
+                          type="monotone"
+                          dataKey="pnl"
+                          stroke="var(--up)"
+                          dot={false}
+                          strokeWidth={chartStroke.width}
+                          strokeLinecap={chartStroke.linecap}
+                          strokeLinejoin={chartStroke.linejoin}
+                          isAnimationActive={cumPnlAnim}
+                          animationDuration={420}
+                          animationEasing="ease-out"
+                          connectNulls
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </ChartCard>
+
+                <h3 style={{ marginTop: 18 }}>היסטוריית עסקאות</h3>
+                <p style={{ fontSize: 13, color: "var(--muted)", marginBottom: 8 }}>
+                  עמודת «תחילת חלון» מבוססת על שדה אורך החלון בכל עסקה (5 דק׳ / 15 דק׳). «עלות הכניסה» = מחיר ליחידה × חוזים בכניסה (ברוטו; העמלה בעמודה נפרדת).
+                </p>
+                <TradesBySession
+                  trades={trades}
+                  logEntries={logEntries}
+                  lastMark={(demoState as any).last_mark}
+                  fallbackWindowSec={(() => {
+                    // נגזור מה-window_sec של העסקות האחרונות (trigger trades תמיד שומרות אותו)
+                    const lastWithWindow = [...trades].reverse().find(t => (t as any).window_sec != null);
+                    return (lastWithWindow as any)?.window_sec ?? market?.window_sec ?? (btcWindow === "15m" ? 900 : 300);
+                  })()}
+                  liveBtcUsd={btc.price > 0 ? btc.price : null}
+                  priceToBeatUsd={market?.price_to_beat ?? null}
+                  marketEpoch={market?.epoch ?? null}
+                  priceToBeatNote={market?.price_to_beat_note ?? ""}
+                />
+              </>
+            );
+          })()}
+        </Card>
+      )}
+
+      {tab === "help" && (
+        <Card padding="lg" style={{ lineHeight: 1.7 }}>
+          <SectionTitle as="h2">מילון מונחים ועזרה</SectionTitle>
+          <ul>
+            <li>
+              <strong>חוזה:</strong> יחידת המסחר ב־Polymarket; גודל מינימלי לפי כללי השוק (לרוב חמישה חוזים).
+            </li>
+            <li>
+              <strong>מחיר יעד לפתיחת החלון:</strong> ערך ה־BTC בתחילת החלון (כאן באמצעות שער עקיף); הרזולוציה הרשמית לפי Chainlink.
+            </li>
+            <li>
+              <strong>שוק BTC:</strong> ניתן לבחור חלון של <strong>חמש דקות</strong> —{" "}
+              <code>btc-updown-5m-{"{epoch}"}</code> — או <strong>חמש עשרה דקות</strong> —{" "}
+              <code>btc-updown-15m-{"{epoch}"}</code>.
+            </li>
+            <li>
+              <strong>סימולציה:</strong> ביצוע הזמנות וירטואליות מול ספר הזמנות בפועל, ללא רישום על גבי הבלוקצ׳יין.
+            </li>
+            <li>
+              <strong>מסחר חי:</strong> דורש התקנת py-clob-client ומפתח תקף; יש לעמוד בתנאי השימוש של Polymarket ובדיני המדינה החלים.
+            </li>
+            <li>
+              <strong>גידור:</strong> החזקה בו־זמנית בכיווני Up ו־Down; אינה שקולה לשורט במובן הקלאסי.
+            </li>
+          </ul>
+          <h3>תקלות נפוצות</h3>
+          <p>
+            אם לא נשלחה פקודה: ייתכן שנותר פחות מדקה לסיום החלון, או שהמחיר בבקשה לקנייה עולה על הגבול שהוגדר, או שאין
+            יתרה מספקת בחשבון הסימולציה.
+          </p>
+          <h3>הפעלה</h3>
+          <pre style={{ background: "var(--bg-elevated)", padding: 12, borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}>
+            cd engine && pip install -r requirements.txt
+            cd .. && npm install && npm run dev
+          </pre>
+        </Card>
+      )}
+      {tab === "tips_v2" && <TipsV2 />}
+      {tab === "signals" && <SignalsPanel />}
+      {tab === "trigger" && <TriggerTrader />}
+      </main>
+    </div>
+  );
+}

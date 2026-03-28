@@ -1,0 +1,12 @@
+node_modules
+dist
+logs
+__pycache__
+*.pyc
+.DS_Store
+.env
+secrets*
+tips_v2_cache.json
+
+# מצב דמו (יתרה, פוזיציות, היסטוריית equity) — מתעדכן כל הזמן; לא קוד
+**/demo_state.json

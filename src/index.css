@@ -1,0 +1,383 @@
+/* Polymarket — גרסה 2: ערכת נושא מקצועית (כהה, מעודן) */
+
+@import url("https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700&family=Instrument+Sans:wght@400;500;600;700&display=swap");
+
+:root {
+  /* משטחים — אפור-כחול עמוק, לא בלוק אחיד */
+  --bg: #08090c;
+  --bg-elevated: #0f1116;
+  --card: #13161d;
+  --card-hover: #181c25;
+  --border: rgba(255, 255, 255, 0.065);
+  --border-strong: rgba(255, 255, 255, 0.1);
+
+  /* טקסט */
+  --text: #eceef2;
+  --text-secondary: #9aa3b2;
+  --muted: #7a8494;
+
+  /* מותג — כחול-פלדה מעומעם, לא ניאון */
+  --accent: #7d93b5;
+  --accent-bright: #93a9c9;
+  --accent-muted: rgba(125, 147, 181, 0.14);
+  --text-on-accent: #0a0b0d;
+
+  /* סימנטיקה פיננסית — ירוק/אדום מרוסנים */
+  --up: #4a9b7e;
+  --up-muted: rgba(74, 155, 126, 0.12);
+  --down: #b85c5c;
+  --down-muted: rgba(184, 92, 92, 0.12);
+
+  /* מצבי הפעלה */
+  --demo: #6b7280;
+  --demo-bg: rgba(107, 114, 128, 0.22);
+  --live: #b45309;
+  --live-bg: rgba(180, 83, 9, 0.2);
+
+  /* גרפים */
+  --chart-axis: #6b7280;
+  --chart-grid: rgba(107, 114, 128, 0.18);
+  --chart-tooltip-bg: #161922;
+  --chart-tooltip-border: rgba(255, 255, 255, 0.08);
+  --chart-line-primary: var(--accent-bright);
+  --chart-fill-start: rgba(147, 169, 201, 0.22);
+  --chart-fill-end: rgba(147, 169, 201, 0);
+
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 24px;
+  --s-6: 32px;
+
+  --radius-sm: 8px;
+  --radius-md: 11px;
+  --radius-lg: 13px;
+
+  --shadow-card: 0 2px 0 rgba(255, 255, 255, 0.04) inset, 0 12px 40px rgba(0, 0, 0, 0.45);
+  --font-display: "Instrument Sans", "Heebo", system-ui, sans-serif;
+  --font-body: "Heebo", "Instrument Sans", system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  font-weight: 400;
+  background: var(--bg);
+  background-image: radial-gradient(ellipse 120% 80% at 50% -20%, rgba(125, 147, 181, 0.07), transparent 55%);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.55;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.section-title {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 1.125rem;
+  margin: 0 0 var(--s-3);
+  color: var(--text);
+}
+
+@keyframes pnl-dot-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.72;
+  }
+}
+
+.pnl-live-dot {
+  animation: pnl-dot-pulse 2.4s ease-in-out infinite;
+}
+
+.app-shell {
+  padding: var(--s-4);
+  max-width: 1120px;
+  margin: 0 auto;
+  min-width: 0;
+}
+
+#main-content {
+  min-width: 0;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--s-3);
+  margin-bottom: var(--s-5);
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  padding: var(--s-3) 0;
+  margin-top: calc(-1 * var(--s-3));
+  background: linear-gradient(to bottom, var(--bg) 78%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border);
+}
+
+.app-title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.app-nav {
+  display: flex;
+  gap: var(--s-2);
+  margin-bottom: var(--s-4);
+  flex-wrap: wrap;
+}
+
+.tab-btn {
+  padding: var(--s-2) var(--s-4);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 500;
+  transition: background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+}
+
+.tab-btn:hover {
+  background: var(--card-hover);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.tab-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.tab-btn[data-active="true"] {
+  background: var(--accent-muted);
+  border-color: rgba(125, 147, 181, 0.35);
+  color: var(--accent-bright);
+  box-shadow: none;
+}
+
+.badge-mode {
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.badge-mode--demo {
+  background: var(--demo-bg);
+  color: #d1d5db;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.badge-mode--live {
+  background: var(--live-bg);
+  color: #fdba74;
+  border: 1px solid rgba(180, 83, 9, 0.35);
+}
+
+/* כפתור מצב מסחר — ללא צבע כתום שכונתי */
+.header-mode-btn[data-live="false"] {
+  background: var(--accent) !important;
+  color: var(--text-on-accent) !important;
+}
+.header-mode-btn[data-live="false"]:hover {
+  filter: brightness(1.08);
+}
+.header-mode-btn[data-live="true"] {
+  background: var(--card-hover) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border-strong) !important;
+}
+
+.ui-card {
+  background: var(--card);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-card);
+}
+
+.ui-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-4);
+  border-radius: var(--radius-sm);
+  border: none;
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: transform 0.1s ease, filter 0.15s ease, opacity 0.15s ease;
+}
+
+.ui-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.ui-btn--primary {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+.ui-btn--primary:hover {
+  filter: brightness(1.07);
+}
+
+.ui-btn--ghost {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.ui-btn--ghost:hover {
+  background: var(--card-hover);
+}
+
+.ui-btn--danger {
+  background: var(--down-muted);
+  color: #f0d6d6;
+  border: 1px solid rgba(184, 92, 92, 0.35);
+}
+
+.chart-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--s-4);
+  box-shadow: var(--shadow-card);
+  min-width: 0;
+}
+
+.chart-card__title {
+  font-family: var(--font-display);
+  font-size: 0.9375rem;
+  font-weight: 600;
+  margin: 0 0 var(--s-1);
+  color: var(--text);
+}
+
+.chart-card__subtitle {
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  margin: 0 0 var(--s-3);
+  line-height: 1.5;
+}
+
+.alert-error {
+  color: #f0d4d4;
+  margin-bottom: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  background: rgba(80, 30, 30, 0.45);
+  border: 1px solid rgba(184, 92, 92, 0.35);
+  border-radius: var(--radius-sm);
+}
+
+.alert-warn {
+  color: #fdecc8;
+  padding: var(--s-3) var(--s-4);
+  border-radius: var(--radius-sm);
+  background: rgba(60, 45, 20, 0.55);
+  border: 1px solid rgba(180, 130, 50, 0.3);
+  margin-bottom: var(--s-4);
+  font-size: 0.8125rem;
+}
+
+.live-banner {
+  background: linear-gradient(135deg, rgba(40, 32, 22, 0.9), rgba(22, 20, 16, 0.95));
+  padding: var(--s-3) var(--s-4);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--s-4);
+  border: 1px solid rgba(180, 83, 9, 0.22);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.recharts-cartesian-axis-tick-value {
+  fill: var(--chart-axis) !important;
+  font-size: 11px !important;
+  font-family: var(--font-body) !important;
+}
+
+.recharts-tooltip-wrapper {
+  outline: none;
+}
+
+.stat-pill {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  padding: var(--s-3);
+  border-radius: var(--radius-md);
+  min-width: 200px;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    padding: var(--s-3);
+  }
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+input,
+select {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text);
+  padding: var(--s-2) var(--s-3);
+}
+
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

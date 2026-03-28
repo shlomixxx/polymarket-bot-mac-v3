@@ -1,0 +1,29 @@
+{
+  "name": "polymarket-bot-mac-v3",
+  "version": "0.3.0",
+  "description": "בוט Polymarket BTC — גירסה v3 (תיקוני באגים ושיפורים)",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"npm run engine\" \"npm run dev:vite\" \"npm run dev:electron\"",
+    "engine": "bash scripts/run-engine.sh",
+    "dev:vite": "vite --host 127.0.0.1 --port 5175",
+    "dev:electron": "wait-on -v -t 3m http://127.0.0.1:5175 http://127.0.0.1:8767/api/health && node_modules/.bin/electron .",
+    "build:web": "vite build",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.15.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "concurrently": "^9.1.0",
+    "electron": "^33.2.0",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11",
+    "wait-on": "^8.0.1"
+  }
+}

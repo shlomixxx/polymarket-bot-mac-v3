@@ -1,0 +1,106 @@
+# בוט Polymarket — BTC Up/Down (גירסה v2)
+
+פרויקט **v2** הוא עותק מפותח של `polymarket-bot-mac` (v1) עם **ממשק משודרג** (טוקנים, `Card` / `ChartCard`, טאבים, גרפים מאוחדים), **אנימציית גרפים מותנית** (פחות עומס CPU ברענון תכוף), ו־**Electron** עם מינימום חלון. לוגיקת המנוע ב־Python **זהה ברובה** ל־v1.
+
+## מה השתנה למשתמש (v2 לעומת v1)
+
+| נושא | v1 (`polymarket-bot-mac`) | v2 (`polymarket-bot-mac-v2`) |
+|------|---------------------------|-------------------------------|
+| מראה | סגנונות מפוזרים ב־`App.tsx` | שכבת shell, כרטיסים, טאבים עם `data-active`, צבעי surface מדורגים |
+| גרפים | Recharts ad-hoc | `chartConstants` + Tooltip/צירים אחידים; מסלול תשואה ב־`monotone`; PnL מצטבר עם `smoothCurveType` |
+| ביצועים | אנימציה בכל רענון | `useChartAnimationGate` — אנימציה כשהאורך/הערך האחרון משתנה משמעותית |
+| פורטים | Vite 5173 / מנוע 8765 (ברירת v1) | **Vite 5174** / **מנוע 8766** — להרצה מקבילה עם v1 |
+| חלון | ללא מינימום מוגדר בקוד המצורף ב־v1 | `minWidth` 1024px, `minHeight` 680px |
+
+## דרישות
+
+- macOS  
+- Python 3.10+  
+- Node.js 18+
+
+## התקנה
+
+### מנוע (Python)
+
+במק נפוצים **שני Pythonים**: למשל אחד מ־**python.org** (`/Library/Frameworks/...`) ואחד מ־**Homebrew** (`/opt/homebrew/...`).  
+`pip` עלול להתקין ל־אחד בעוד ש־`python3` בטרמינל מצביע על השני — ואז מופיע `No module named uvicorn`.  
+הפרויקט **פותר אוטומטית** Python שבו מותקן `uvicorn` (עדיפות ל־Frameworks), ומריץ את המנוע עם אותו נתיב.
+
+**בלחיצה כפולה (מומלץ):** בתיקיית הפרויקט הרץ פעם אחת את  
+**`install-engine-deps.command`**  
+(מתקין לפי אותו סדר עדיפות), ואז **`run-bot-with-logs.command`**.
+
+**או מהטרמינל:**
+
+```bash
+cd "/Users/shlomishemtov/Documents/cursor project/polymarket-bot-mac-v2/engine"
+python3 -m pip install -r requirements.txt
+```
+
+(מומלץ `python3 -m pip` ולא רק `pip3`, כדי שהחבילות ייכנסו לאותו Python.)
+
+### ממשק (Node)
+
+```bash
+cd "/Users/shlomishemtov/Documents/cursor project/polymarket-bot-mac-v2"
+npm install
+```
+
+## הרצה בפיתוח
+
+פקודה אחת (מנוע + Vite + Electron):
+
+```bash
+cd "/Users/shlomishemtov/Documents/cursor project/polymarket-bot-mac-v2"
+npm run dev
+```
+
+- UI: `http://127.0.0.1:5174`  
+- API מנוע: `http://127.0.0.1:8766`
+
+### הרצה מקבילה של v1 ו־v2
+
+- השארו ב־v1 את הפורטים המקוריים; ב־v2 משתמשים ב־**5174** ו־**8766** כדי שלא יהיו התנגשויות.  
+- הריצו כל פרויקט ממחיצת הפרויקט שלו (`npm run dev`).
+
+### לחיצה כפולה על `run-bot-with-logs.command` — נפתח רק טרמינל בלי חלון Electron
+
+ב־macOS, הפעלה מ־Finder נותנת לעיתים **PATH קצר** — בלי `node`/`npm` הסקריפט נעצר, או ש־**Electron** מחכה לנצח כי המנוע/Vite לא עלו.
+
+- **`run-bot-with-logs.command`** מריץ את `run-with-logs.sh` דרך **`zsh -l` (login shell)** כדי לטעון את `.zprofile` / כלים כמו **fnm / Volta / asdf / nvm** כמו בטרמינל רגיל.
+- `scripts/run-with-logs.sh` מוסיף גם נתיבי Homebrew ו־nvm/fnm/volta/asdf; בתחילת הריצה מודפסים נתיבי `node`/`npm`.
+- **`dev:electron`** משתמש ב־`wait-on` עם **timeout (3 דקות)** ו־**verbose** — אם אחרי 3 דקות אין מנוע על `8766` או Vite על `5174`, תראה שגיאת timeout בטרמינל (ולא המתנה אינסופית).
+- אם עדיין אין חלון — פתח את **`logs/runs/.../combined.log`** באותה ריצה וחפש `Error`, `wait-on`, או `electron`.
+- ודא שביצעת `npm install` ו־`pip3 install -r requirements.txt` במנוע.
+- **פורט תפוס** (`8766` / `5174`) — סגור ריצה ישנה (Ctrl+C) או תהליך אחר; אל תלחץ פעמיים מהר על `.command`.
+
+## בניית Web (אימות ייצור)
+
+```bash
+npm run build:web
+```
+
+פלט ב־`dist/`.
+
+## בדיקה ידנית לפני סגירה (QA קצרה)
+
+1. **דשבורד** — טעינה, גרף BTC, מחיר לנצח, יתרה/איפוס דמו.  
+2. **אסטרטגיה** — פריסטים, שמירה, מצב בוט (כבוי/חצי/אוטו).  
+3. **סטטיסטיקה** — גרף PnL מצטבר, טבלת היסטוריה, הרחבת עסקה + גרף מסלול תשואה.  
+4. **ספר לא עדכני** (אם מופיע) — הודעת אזהרה, גרף לא נשבר.  
+5. **RTL** — כותרות טבלה וטקסט קריאים.  
+6. **חלון צר** — מעל המינימום — כפתורים וטבלאות לא נחתכים קריטית.
+
+## מבנה תיקייה (עיקרי)
+
+- `engine/` — FastAPI, דמו, אסטרטגיה  
+- `src/` — React; `ui/` רכיבים; `chartConstants.ts`  
+- `electron/` — חלון, פורט dev  
+
+## מסחר בכסף אמת (אופציונלי)
+
+כמו v1: `py-clob-client`, מפתח ב־UI, מצב לייב. ראו גם תיעוד Polymarket ותנאי שימוש. **סיכון כספי.**
+
+---
+
+מדריכים נוספים (אם קיימים בפרויקט): `docs/`.
