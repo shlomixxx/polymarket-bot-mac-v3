@@ -39,6 +39,8 @@ class ActiveMarket:
     order_min_size: float
     title: str
     window_sec: int  # 300 או 900 — לאורך החלון בשניות
+    # קישור מקור הרזולוציה מ-Gamma — ללא מחיר מספרי ב-API
+    resolution_source: Optional[str] = None
 
 
 def _parse_event(data: dict[str, Any]) -> Optional[ActiveMarket]:
@@ -88,6 +90,7 @@ def _parse_event(data: dict[str, Any]) -> Optional[ActiveMarket]:
         order_min_size=float(m.get("orderMinSize") or 5),
         title=data.get("title") or m.get("question") or "",
         window_sec=window_sec,
+        resolution_source=(m.get("resolutionSource") or None) if isinstance(m.get("resolutionSource"), str) else None,
     )
 
 

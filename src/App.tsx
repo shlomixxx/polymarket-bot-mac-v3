@@ -33,6 +33,8 @@ type Market = {
   price_to_beat_note: string;
   /** chainlink_polygon | binance_1m_fallback — מקור ייחוס לעומת Polymarket */
   price_to_beat_source?: string;
+  /** מ-Gamma API — קישור למקור הרזולוציה (אין ב-API מחיר ייחוס מספרי) */
+  polymarket_resolution_source?: string | null;
 };
 
 type SideSummary = { bid: number | null; ask: number | null; mid: number | null };
@@ -2007,6 +2009,20 @@ export default function App() {
                   : "טוען…"}{" "}
                 <span style={{ color: "var(--muted)", fontSize: 12 }}>({market.price_to_beat_note})</span>
               </p>
+              {market.polymarket_resolution_source ? (
+                <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 6 }}>
+                  מקור הרזולוציה ב-Polymarket (Gamma API):{" "}
+                  <a
+                    href={market.polymarket_resolution_source}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: "var(--accent-bright)" }}
+                  >
+                    {market.polymarket_resolution_source}
+                  </a>{" "}
+                  — ב-API אין שדה למחיר הדולר; המספר מחושב אצלנו מ-Chainlink/Binance.
+                </p>
+              ) : null}
               <p>
                 <strong>מחיר BTC נוכחי:</strong> $
                 {btc.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}

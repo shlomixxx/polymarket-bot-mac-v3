@@ -374,6 +374,8 @@ async def market_current():
         "price_to_beat": cached_open,
         "price_to_beat_source": cached_ptb_source,
         "price_to_beat_note": note_chainlink if cached_ptb_source == "chainlink_polygon" else note_binance,
+        # מ-Gamma API — אין שם מחיר BTC מספרי; רק קישור למקור הרזולוציה
+        "polymarket_resolution_source": m.resolution_source,
     }
 
 
