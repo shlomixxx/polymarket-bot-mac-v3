@@ -9,6 +9,11 @@ function getApiBase() {
   // Electron/file://
   if (!host) return "http://127.0.0.1:8767";
 
+  // אפליקציה מארוזה / index מקובץ — אין same-origin ל-API; המנוע תמיד על 8767
+  if (protocol === "file:") {
+    return "http://127.0.0.1:8767";
+  }
+
   // Local dev via Vite
   if (port === "5175") {
     return `${protocol}//${host}:8767`;

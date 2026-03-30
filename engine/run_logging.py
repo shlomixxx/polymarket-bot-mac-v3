@@ -123,6 +123,32 @@ def format_potential_after_tp_log_lines(exit_trade: dict[str, Any]) -> list[str]
     return lines
 
 
+def format_settlement_btc_log_lines(exit_trade: dict[str, Any], *, side: str = "—") -> list[str]:
+    """שורות פירוק BTC (ייחוס→סוף חלון) — לכל יציאה ששמרה settlement או SETTLE_*."""
+    s = exit_trade.get("settlement_btc_start")
+    e = exit_trade.get("settlement_btc_end")
+    if s is None or e is None:
+        return []
+    try:
+        sf = float(s)
+        ef = float(e)
+    except (TypeError, ValueError):
+        return []
+    resolved = exit_trade.get("resolved_outcome")
+    if not resolved:
+        resolved = "Up" if ef >= sf else "Down"
+    won = exit_trade.get("settlement_won")
+    if won is None and side in ("Up", "Down"):
+        up_win = ef >= sf
+        won = (side == "Up" and up_win) or (side == "Down" and not up_win)
+    lines = [
+        f"פירוק BTC: ייחוס ${sf:,.0f} · סוף ${ef:,.0f} · מנצח השוק: {resolved}",
+    ]
+    if won is not None and side in ("Up", "Down"):
+        lines.append(f"הימור {side}: {'ניצחון' if won else 'הפסד'} (לפי פירוק BTC)")
+    return lines
+
+
 def log_potential_window_closed(exit_trade: dict[str, Any]) -> None:
     """נקרא כשנסגר מעקב bid אחרי TP (סוף חלון) — נרשם ליומן ול-events."""
     lines = format_potential_after_tp_log_lines(exit_trade)
@@ -194,6 +220,10 @@ def strategy_config_dict(runner: StrategyRunner) -> dict[str, Any]:
         "near_entry_pct": c.near_entry_pct,
         "near_tp_pct": c.near_tp_pct,
         "dca_tp_override_pct": c.dca_tp_override_pct,
+        "loss_recovery_enabled": getattr(c, "loss_recovery_enabled", False),
+        "loss_recovery_step_pct": getattr(c, "loss_recovery_step_pct", 20.0),
+        "loss_recovery_every_n_losses": getattr(c, "loss_recovery_every_n_losses", 1),
+        "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 10.0),
     }
 
 
@@ -257,6 +287,8 @@ def demo_summary(demo: DemoEngine) -> dict[str, Any]:
         "equity_history_points": len(st.equity_history),
         "recent_trades_pnl": recent,
         "positions_summary": positions_summary,
+        "loss_recovery_multiplier": float(getattr(st, "loss_recovery_multiplier", 1.0) or 1.0),
+        "loss_recovery_streak": int(getattr(st, "loss_recovery_streak", 0) or 0),
     }
 
 
@@ -438,6 +470,10 @@ def write_trades_log(demo: DemoEngine) -> None:
             summary += f" | בזמן החזקה (מול עלות): שיא {peak_s} שפל {trough_s}"
         lines.append(f"{summary}  [session: {sid}]")
         last_exit = exits[-1] if exits else None
+        if last_exit:
+            btc_lines = format_settlement_btc_log_lines(last_exit, side=str(side))
+            for bl in btc_lines:
+                lines.append(f"    {bl}")
         if last_exit and last_exit.get("type") == "SELL_TP":
             pot_lines = format_potential_after_tp_log_lines(last_exit)
             for pl in pot_lines:

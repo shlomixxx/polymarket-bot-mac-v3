@@ -1,11 +1,14 @@
 import time
 
+import pytest
+
 from strategy_runner import (
     StrategyConfig,
     StrategyRuntime,
     StrategyRunner,
     contracts_from_investment,
     dca_ref_price_from_ask,
+    effective_price_for_contract_qty,
 )
 from demo_engine import DemoEngine
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
@@ -16,6 +19,13 @@ def test_contracts_from_investment_rejects_near_zero_price():
     assert contracts_from_investment(1.0, 0.01, 5) == int(1.0 // 0.01)  # 100
     assert contracts_from_investment(1.0, 1.0, 5) == 0  # מעל 0.99
     assert contracts_from_investment(10.0, MAX_LEGIT_SHARE_PRICE_USD, 5) == int(10.0 // MAX_LEGIT_SHARE_PRICE_USD)
+
+
+def test_effective_price_for_contract_qty_uses_lower_ask():
+    """כש-Ask נמוך מתקרת entry — כמות חוזים לפי Ask (תקציב / מחיר בפועל)."""
+    assert effective_price_for_contract_qty(0.50, 0.11) == pytest.approx(0.11)
+    assert effective_price_for_contract_qty(0.50, 0.60) == pytest.approx(0.50)
+    assert effective_price_for_contract_qty(0.50, None) == pytest.approx(0.50)
 
 
 def test_time_gates_freeze_and_intermediate_logic():

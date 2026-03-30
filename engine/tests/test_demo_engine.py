@@ -33,15 +33,17 @@ async def test_expire_all_outside_tokens_creates_expire_trade_and_removes_positi
         return {"start": 100.0, "end": 99.0, "source": "binance_1m_proxy"}
 
     with patch("btc_price.fetch_window_start_end_btc_usd", AsyncMock(side_effect=_px)):
-        await eng.expire_all_outside_tokens(
+        created = await eng.expire_all_outside_tokens(
             ("keep", "other"),
             context={"settled_epoch": 1_700_000_000, "settled_window_sec": 300},
         )
 
+    assert len(created) == 1
     assert [p.token_id for p in eng.state.positions] == ["keep"]
     settle_loss = [t for t in eng.state.trades if t.get("type") == "SETTLE_LOSS"]
     assert len(settle_loss) == 1
     t = settle_loss[0]
+    assert created[0]["id"] == t["id"]
     assert t["token_id"] == "old"
     assert float(t["price"]) == 0.0
     # הפסד מלא של העלות (כולל עמלה בקירוב)

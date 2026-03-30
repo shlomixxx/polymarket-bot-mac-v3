@@ -42,6 +42,9 @@ class DemoState:
     equity_history: list[tuple[float, float]] = field(default_factory=list)
     last_mark: dict = field(default_factory=dict)
     trade_seq: int = 0  # מספר סידורי — עולה בכל session חדש, נשמר לדיסק
+    # שחזור אחרי הפסד (StrategyRunner) — נשמר בדמו
+    loss_recovery_streak: int = 0
+    loss_recovery_multiplier: float = 1.0
 
     def next_trade_num(self) -> int:
         """מחזיר מספר מחזור הבא (מונוטוני, לא מתאפס)."""
@@ -56,6 +59,8 @@ class DemoState:
             "equity_history": self.equity_history[-5000:],
             "last_mark": self.last_mark,
             "trade_seq": self.trade_seq,
+            "loss_recovery_streak": self.loss_recovery_streak,
+            "loss_recovery_multiplier": self.loss_recovery_multiplier,
         }
 
     @classmethod
@@ -65,6 +70,8 @@ class DemoState:
             trades=list(d.get("trades") or []),
             equity_history=[tuple(x) for x in (d.get("equity_history") or [])],
             trade_seq=int(d.get("trade_seq", 0)),
+            loss_recovery_streak=int(d.get("loss_recovery_streak", 0) or 0),
+            loss_recovery_multiplier=float(d.get("loss_recovery_multiplier", 1.0) or 1.0),
         )
         # שחזור trade_seq מה-trades עצמם אם חסר (תאימות אחורה)
         if st.trade_seq == 0 and st.trades:
@@ -235,8 +242,11 @@ class DemoEngine:
         self,
         valid_tokens: tuple[str, str],
         context: Optional[dict[str, Any]] = None,
-    ) -> None:
-        """פירוק פוזיציות מחלון קודם — לפי תוצאת Up/Down (סוף מול תחילה, פרוקסי Binance)."""
+    ) -> list[dict[str, Any]]:
+        """פירוק פוזיציות מחלון קודם — לפי תוצאת Up/Down (סוף מול תחילה, פרוקסי Binance).
+
+        מחזיר את רשימת רשומות העסקה שנוספו (בסדר עיבוד) — לעדכון loss recovery וכו׳.
+        """
         from btc_price import fetch_window_start_end_btc_usd
 
         ctx = dict(context or {})
@@ -264,6 +274,7 @@ class DemoEngine:
                 price_cache[key] = await fetch_window_start_end_btc_usd(ep, ws)
             return price_cache[key]
 
+        created: list[dict[str, Any]] = []
         for p in to_settle:
             leg_cost = p.avg_cost * p.contracts * (1 + FEE_RATE)
             ws = int(p.window_sec or default_ws)
@@ -306,6 +317,7 @@ class DemoEngine:
                 trade["settlement_error"] = "missing_window_epoch"
                 trade["settlement_condition"] = "לא ניתן לחשב — חסר epoch לחלון"
                 self.state.trades.append(trade)
+                created.append(trade)
                 continue
 
             px = await _prices_for(ep, ws)
@@ -323,6 +335,7 @@ class DemoEngine:
                 trade["realized_pnl"] = -leg_cost
                 trade["settlement_error"] = "btc_prices_unavailable"
                 self.state.trades.append(trade)
+                created.append(trade)
                 continue
 
             resolved_up = float(end_p) >= float(start_p)
@@ -345,11 +358,13 @@ class DemoEngine:
                 trade["fee_est"] = 0.0
                 trade["realized_pnl"] = -leg_cost
             self.state.trades.append(trade)
+            created.append(trade)
 
         self.state.positions = keep
         eq = self.state.balance_usd + sum(x.contracts * x.avg_cost for x in self.state.positions)
         self.state.equity_history.append((time.time(), eq))
         self.save()
+        return created
 
     def export_csv(self) -> str:
         """מייצר CSV: עסקאות + שדות מרכזיים."""
@@ -633,7 +648,113 @@ class DemoEngine:
         self.save()
         return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
 
-    def record_live_sell(
+    def _canonical_window_epoch_ws_for_session(self, session_id: str) -> tuple[Optional[int], int]:
+        """חלון Polymarket לפי כניסה ראשונה (מסודרת לפי ts) — כולם באותו חלון 5m/15m חייבים אותו epoch."""
+        buys = [
+            t
+            for t in self.state.trades
+            if t.get("session_id") == session_id and t.get("type") == "BUY"
+        ]
+        if not buys:
+            return None, 300
+        buys.sort(key=lambda x: float(x.get("ts") or 0))
+        for bt in buys:
+            be = bt.get("epoch")
+            if be is None:
+                continue
+            bws = int(bt.get("window_sec") or 300)
+            return int(be), bws
+        return None, int(buys[0].get("window_sec") or 300)
+
+    def _infer_epoch_window_for_exit_trade(self, trade: dict[str, Any]) -> tuple[Optional[int], int]:
+        """epoch/window_sec לפירוק BTC — קודם חלון הכניסה (BUY ראשון), לא epoch על TP (שהוא מ־tp_ctx ויכול להשתנות)."""
+        sid = trade.get("session_id")
+        if sid:
+            ep, ws = self._canonical_window_epoch_ws_for_session(sid)
+            if ep is not None:
+                return ep, ws
+        ep = trade.get("epoch")
+        ws = int(trade.get("window_sec") or 300)
+        if ep is not None:
+            return int(ep), ws
+        return None, ws
+
+    async def _attach_window_btc_to_tp_trade(self, trade: dict[str, Any], *, side: str) -> None:
+        """מחירי BTC בתחילת/סוף חלון (כמו בפירוק) — למעקב גם אחרי TP, לא רק SETTLE_*."""
+        ep, ws = self._infer_epoch_window_for_exit_trade(trade)
+        if ep is None:
+            return
+        trade["epoch"] = ep
+        trade["window_sec"] = ws
+        try:
+            from btc_price import fetch_window_start_end_btc_usd
+
+            px = await fetch_window_start_end_btc_usd(int(ep), int(ws))
+        except Exception:
+            return
+        start_p = px.get("start")
+        end_p = px.get("end")
+        if start_p is not None:
+            trade["settlement_btc_start"] = float(start_p)
+        if end_p is not None:
+            trade["settlement_btc_end"] = float(end_p)
+        trade["settlement_price_source"] = px.get("source", "binance_1m_proxy")
+        trade["settlement_condition"] = trade.get(
+            "settlement_condition",
+            "BTC בסוף החלון ≥ BTC בתחילת החלון ⇒ Up (פרוקסי Binance, לא Chainlink)",
+        )
+        if start_p is not None and end_p is not None:
+            resolved_up = float(end_p) >= float(start_p)
+            trade["resolved_outcome"] = "Up" if resolved_up else "Down"
+            trade["settlement_won"] = (side == "Up" and resolved_up) or (side == "Down" and not resolved_up)
+
+    async def _backfill_missing_tp_settlement_btc(self) -> bool:
+        """אחרי סוף החלון — ממלא settlement ל-SELL_TP שלא קיבלו נר סוף בזמן ה-TP (נר עדיין לא נסגר ב-Binance)."""
+        now = time.time()
+        changed = False
+        # נקרא מ-mark_to_market בתדירות גבוהה — מגבילים קריאות Binance לעסקה אחת לכל הופעה (מספיק למילוי הדרגתי)
+        budget = 16
+        for t in self.state.trades:
+            if budget <= 0:
+                break
+            if t.get("type") != "SELL_TP":
+                continue
+            ep, ws = self._infer_epoch_window_for_exit_trade(t)
+            if ep is None:
+                continue
+            if now < float(ep) + float(ws) - 0.25:
+                continue
+            sid_tp = t.get("session_id")
+            canon_ep, _ = (
+                self._canonical_window_epoch_ws_for_session(str(sid_tp))
+                if sid_tp
+                else (None, 300)
+            )
+            tp_ep = t.get("epoch")
+            epoch_mismatch = (
+                bool(sid_tp)
+                and canon_ep is not None
+                and tp_ep is not None
+                and int(tp_ep) != int(canon_ep)
+            )
+            if (
+                t.get("settlement_btc_start") is not None
+                and t.get("settlement_btc_end") is not None
+                and not epoch_mismatch
+            ):
+                continue
+            if epoch_mismatch:
+                t.pop("settlement_btc_start", None)
+                t.pop("settlement_btc_end", None)
+                t.pop("resolved_outcome", None)
+                t.pop("settlement_won", None)
+            await self._attach_window_btc_to_tp_trade(t, side=str(t.get("side") or "Up"))
+            budget -= 1
+            if t.get("settlement_btc_start") is not None and t.get("settlement_btc_end") is not None:
+                changed = True
+        return changed
+
+    async def record_live_sell(
         self,
         token_id: str,
         bid: float,
@@ -675,6 +796,7 @@ class DemoEngine:
             trade["pnl_path"] = tr.get("path", [])
         if context:
             trade.update(context)
+        await self._attach_window_btc_to_tp_trade(trade, side=p.side)
         self.state.trades.append(trade)
         self.state.positions.pop(idx)
         epoch = context.get("epoch") if context else None
@@ -755,6 +877,7 @@ class DemoEngine:
             trade["pnl_path"] = tr.get("path", [])
         if context:
             trade.update(context)
+        await self._attach_window_btc_to_tp_trade(trade, side=p.side)
         self.state.trades.append(trade)
         self.state.positions.pop(idx)
         # מעקב שיא/שפל פוטנציאלי — מה שקרה אחרי היציאה עד סיום החלון
@@ -780,6 +903,9 @@ class DemoEngine:
 
     async def mark_to_market(self) -> dict[str, Any]:
         """מסמן את התיק לפי best bid (ערך מימוש משוער) כדי שהסטטיסטיקה תראה הפסד/רווח גם לפני יציאה."""
+        # מילוי פירוק BTC ל-TP — בכל קריאה (מגבלה פנימית לעסקאות/קריאה) כדי שה-UI יקבל נתונים מיד אחרי /api/demo/state
+        if await self._backfill_missing_tp_settlement_btc():
+            self.save()
         # Throttle: לא לפגוע ב-CLOB; ~0.55s מאפשר לרענון UI כל 1s לקבל סימון מלא ודגימת מסלול עדכנית.
         # לא מדללים כשיש פוזיציה בלי רגל תואמת ב־last_mark (למשל כניסה מיד אחרי tick) — אחרת ה־UI
         # מקבל legs ריקים / בלי pnl_path ורואה גרף נעלם + placeholder "ממתין לדגימה…".
@@ -895,6 +1021,13 @@ class DemoEngine:
                             done_trade = t
                             break
                     if done_trade is not None:
+                        if (
+                            done_trade.get("settlement_btc_start") is None
+                            or done_trade.get("settlement_btc_end") is None
+                        ):
+                            await self._attach_window_btc_to_tp_trade(
+                                done_trade, side=str(done_trade.get("side") or "Up")
+                            )
                         try:
                             from run_logging import log_potential_window_closed
 

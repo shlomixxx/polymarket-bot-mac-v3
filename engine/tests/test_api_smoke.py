@@ -78,9 +78,14 @@ def test_demo_reset_and_clear_stats(client: TestClient):
     assert engine_main.runner.rt.tp_happened_this_window is False
 
     engine_main.runner.rt.dca_done_slices = 5
+    engine_main.demo.state.loss_recovery_streak = 3
+    engine_main.demo.state.loss_recovery_multiplier = 2.0
+    engine_main.demo.save()
     r = client.post("/api/demo/clear-stats", json={})
     assert r.status_code == 200
     assert engine_main.runner.rt.dca_done_slices == 0
+    assert engine_main.demo.state.loss_recovery_streak == 0
+    assert engine_main.demo.state.loss_recovery_multiplier == pytest.approx(1.0)
     st2 = client.get("/api/demo/state").json()
     assert st2["trades"] == []
 

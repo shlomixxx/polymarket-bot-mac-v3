@@ -18,7 +18,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from btc_price import PriceHistoryBuffer, fetch_btc_spot_usdt, fetch_open_price_at_window_start
+from btc_price import (
+    PriceHistoryBuffer,
+    fetch_btc_spot_usdt,
+    fetch_chainlink_btc_usd_polygon_latest,
+    fetch_open_price_at_window_start,
+    fetch_window_start_end_btc_usd,
+)
 from demo_engine import DemoEngine
 from market_discovery import discover_active_btc_window, get_clob_book, seconds_until_window_end
 from run_logging import (
@@ -137,6 +143,10 @@ def _save_persisted_config() -> None:
             "near_tp_pct": c.near_tp_pct,
             "dca_tp_override_pct": c.dca_tp_override_pct,
             "book_log_interval_sec": getattr(c, "book_log_interval_sec", 0.0),
+            "loss_recovery_enabled": getattr(c, "loss_recovery_enabled", False),
+            "loss_recovery_step_pct": getattr(c, "loss_recovery_step_pct", 20.0),
+            "loss_recovery_every_n_losses": getattr(c, "loss_recovery_every_n_losses", 1),
+            "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 10.0),
             "mode": runner.rt.mode,
         }
         CONFIG_PERSISTED_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -147,6 +157,7 @@ _history_recorder_task: Optional[asyncio.Task] = None
 price_buf = PriceHistoryBuffer()
 last_epoch_for_open: int = 0
 cached_open: Optional[float] = None
+cached_ptb_source: str = "binance_1m"
 
 # ── Auto History Recorder state ──────────────────────────────────────────────
 _last_recorded_epoch: int = 0  # epoch of the last window we recorded
@@ -332,10 +343,23 @@ async def market_current():
     m = await discover_active_btc_window(runner.rt.config.btc_window)
     if not m:
         raise HTTPException(404, "לא נמצא שוק פעיל")
-    global last_epoch_for_open, cached_open
+    global last_epoch_for_open, cached_open, cached_ptb_source
     if m.epoch != last_epoch_for_open:
         last_epoch_for_open = m.epoch
-        cached_open = await fetch_open_price_at_window_start(m.epoch)
+        cl = await fetch_chainlink_btc_usd_polygon_latest()
+        if cl is not None:
+            cached_open = cl
+            cached_ptb_source = "chainlink_polygon"
+        else:
+            cached_open = await fetch_open_price_at_window_start(m.epoch)
+            cached_ptb_source = "binance_1m_fallback"
+    note_chainlink = (
+        "ייחוס כמו ב-Polymarket: Chainlink BTC/USD (Polygon). "
+        "BTC חי במסך מהמנוע הוא Binance spot — עשוי להסטות סנטים מהאתר."
+    )
+    note_binance = (
+        "ייחוס מ-Binance (נר 1m) — Chainlink לא זמין כרגע; מחיר ב-Polymarket עלול להשתנות עד עשרות $."
+    )
     return {
         "slug": m.slug,
         "epoch": m.epoch,
@@ -348,7 +372,8 @@ async def market_current():
         "btc_window": runner.rt.config.btc_window,
         "seconds_left": seconds_until_window_end(m.epoch, m.window_sec),
         "price_to_beat": cached_open,
-        "price_to_beat_note": "פרוקסי: פתיחת נר Binance 1m בתחילת החלון — ה-resolution לפי Chainlink",
+        "price_to_beat_source": cached_ptb_source,
+        "price_to_beat_note": note_chainlink if cached_ptb_source == "chainlink_polygon" else note_binance,
     }
 
 
@@ -360,6 +385,17 @@ async def btc_live():
         raise HTTPException(502, str(e))
     price_buf.add(p)
     return {"price": p, "history": [{"t": a, "p": b} for a, b in price_buf.points]}
+
+
+@app.get("/api/btc/window-prices")
+async def btc_window_prices(epoch: int, window_sec: int = 300):
+    """מחירי פתיחה/סוף חלון (פרוקסי Binance) — לתצוגה רטרואקטיבית כשחסרים בשמירת העסקה."""
+    if window_sec <= 0:
+        raise HTTPException(400, "window_sec must be positive")
+    try:
+        return await fetch_window_start_end_btc_usd(epoch, window_sec)
+    except Exception as e:
+        raise HTTPException(502, str(e))
 
 
 @app.get("/api/orderbook/{token_id}")
@@ -539,6 +575,10 @@ class ConfigBody(BaseModel):
     near_tp_pct: float = 2.0
     dca_tp_override_pct: float = 50.0
     book_log_interval_sec: float = 0.0
+    loss_recovery_enabled: bool = False
+    loss_recovery_step_pct: float = 20.0
+    loss_recovery_every_n_losses: int = 1
+    loss_recovery_max_multiplier: float = 10.0
 
 
 @app.post("/api/strategy/config")
@@ -552,12 +592,16 @@ async def strategy_config(body: ConfigBody):
             400,
             f"entry_price_cents must be between {MIN_LEGIT_SHARE_PRICE_USD * 100:.0f} and {MAX_LEGIT_SHARE_PRICE_USD * 100:.0f} (0.01–0.99$ per share)",
         )
+    if body.side_preference not in ("Up", "Down", "signal"):
+        raise HTTPException(400, "side_preference")
+    if int(body.loss_recovery_every_n_losses) < 1:
+        raise HTTPException(400, "loss_recovery_every_n_losses must be >= 1")
+    if float(body.loss_recovery_max_multiplier) < 1.0:
+        raise HTTPException(400, "loss_recovery_max_multiplier must be >= 1")
     c = runner.rt.config
     for k, v in body.model_dump().items():
         if hasattr(c, k):
             setattr(c, k, v)
-    if body.side_preference not in ("Up", "Down", "signal"):
-        raise HTTPException(400, "side_preference")
     c.side_preference = body.side_preference  # type: ignore
     append_event(
         "strategy_config_updated",
@@ -598,6 +642,12 @@ async def get_strategy_config():
         "near_tp_pct": c.near_tp_pct,
         "dca_tp_override_pct": c.dca_tp_override_pct,
         "book_log_interval_sec": getattr(c, "book_log_interval_sec", 0.0),
+        "loss_recovery_enabled": getattr(c, "loss_recovery_enabled", False),
+        "loss_recovery_step_pct": getattr(c, "loss_recovery_step_pct", 20.0),
+        "loss_recovery_every_n_losses": getattr(c, "loss_recovery_every_n_losses", 1),
+        "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 10.0),
+        "loss_recovery_streak": demo.state.loss_recovery_streak,
+        "loss_recovery_multiplier": demo.state.loss_recovery_multiplier,
         "mode": runner.rt.mode,
         "last_status": runner.rt.last_status,
         "last_tick_ts": runner.rt.last_tick_ts,

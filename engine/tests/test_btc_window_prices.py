@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from btc_price import (
+    _decode_chainlink_latest_round_answer,
     fetch_close_price_at_window_end,
     fetch_open_price_at_window_start,
     fetch_window_start_end_btc_usd,
@@ -35,6 +36,16 @@ async def test_fetch_close_price_uses_last_minute_candle_close():
         client_cls.return_value = client
         out = await fetch_close_price_at_window_end(epoch, window_sec)
     assert out == pytest.approx(98765.43)
+
+
+def test_decode_chainlink_latest_round_answer():
+    # ערך דמה: 65805.19 USD עם 8 ספרות עשרוניות ב-Chainlink
+    ans_raw = int(65805.19 * 10**8)
+    b = ans_raw.to_bytes(32, "big", signed=True)
+    pad = b"\x00" * 32 + b
+    hex_data = "0x" + pad.hex()
+    out = _decode_chainlink_latest_round_answer(hex_data)
+    assert out == pytest.approx(65805.19, rel=1e-9)
 
 
 @pytest.mark.asyncio

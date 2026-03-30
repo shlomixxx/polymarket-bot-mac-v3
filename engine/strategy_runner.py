@@ -71,6 +71,11 @@ class StrategyConfig:
     # 0 = כבוי; >0 = שורת יומן כל X שניות עם Ask/Bid ל־Up/Down מה־CLOB (למעקב אחרי השוק)
     book_log_interval_sec: float = 0.0
     mode: Mode = "off"
+    # שחזור אחרי הפסד: הגדלת investment_usd היעד (מכפיל) עד רווח / פירוק מנצח
+    loss_recovery_enabled: bool = False
+    loss_recovery_step_pct: float = 20.0
+    loss_recovery_every_n_losses: int = 1
+    loss_recovery_max_multiplier: float = 10.0
 
 
 @dataclass
@@ -228,6 +233,19 @@ def contracts_from_investment(inv: float, price_usd: float, minimum: int) -> int
     return n if n >= minimum else 0
 
 
+def effective_price_for_contract_qty(entry_cap_usd: float, ask: Optional[float]) -> float:
+    """מחיר ליחידה לחישוב כמות: min(cap, Ask). ה-Ask צריך להיות עדכני (הקריאה לפני כמות ברמת _tick משתמשת ב-best ask מרוענן)."""
+    if ask is None:
+        return entry_cap_usd
+    try:
+        a = float(ask)
+    except (TypeError, ValueError):
+        return entry_cap_usd
+    if not math.isfinite(a) or a < MIN_LEGIT_SHARE_PRICE_USD or a > MAX_LEGIT_SHARE_PRICE_USD:
+        return entry_cap_usd
+    return min(float(entry_cap_usd), a)
+
+
 def dca_ref_price_from_ask(ask: float, entry_target_usd: float, cfg: StrategyConfig) -> float:
     """מחיר ייחוס לקביעת ה-quantity ול-limit_price בדא״ס.
     אם דחיסון אחוזים פעיל: Q נקבע לפי המחיר המונחה (X% מתחת ל-ask),
@@ -278,6 +296,20 @@ class StrategyRunner:
     def sync_runtime_after_demo_positions_cleared(self) -> None:
         """קורא ל־sync_after_demo_positions_cleared על ה-runtime (אחרי איפוס דמו)."""
         self.rt.sync_after_demo_positions_cleared()
+        self.demo.state.loss_recovery_streak = 0
+        self.demo.state.loss_recovery_multiplier = 1.0
+        self.demo.save()
+        self.rt.log_event(
+            "שחזור הפסד: איפוס מצב (איפוס חשבון / ניקוי סטטיסטיקה) — מכפיל 1.00×, רצף 0"
+        )
+
+    def _effective_investment_usd(self, cfg: StrategyConfig) -> float:
+        if not cfg.loss_recovery_enabled:
+            return float(cfg.investment_usd)
+        m = float(self.demo.state.loss_recovery_multiplier)
+        if not math.isfinite(m) or m < 1.0:
+            m = 1.0
+        return float(cfg.investment_usd) * m
 
     def _live_trading_ok(self) -> bool:
         if os.environ.get("POLYMARKET_LIVE", "").strip().lower() in ("0", "false", "no", "off"):
@@ -289,7 +321,11 @@ class StrategyRunner:
         if not p:
             return {"ok": False, "error": "אין המתנה לאישור"}
         if p["action"] == "buy":
-            ctx = p.get("context") or {}
+            ctx = dict(p.get("context") or {})
+            cfg0 = self.rt.config
+            if cfg0.loss_recovery_enabled:
+                ctx["effective_investment_usd"] = self._effective_investment_usd(cfg0)
+                ctx["loss_recovery_multiplier"] = float(self.demo.state.loss_recovery_multiplier)
             oms = float(ctx.get("order_min_size") or 5)
             n_raw = float(p["contracts"])
             ok_sz, n_adj, verr = validate_contracts_for_market(n_raw, oms, bump_if_needed=True)
@@ -351,10 +387,16 @@ class StrategyRunner:
                 tr = r.get("trade") or {}
                 price = tr.get("price")
                 sid = tr.get("session_id")
+                cfg_a = self.rt.config
+                lr_a = ""
+                if cfg_a.loss_recovery_enabled:
+                    eff_a = self._effective_investment_usd(cfg_a)
+                    m_a = float(self.demo.state.loss_recovery_multiplier)
+                    lr_a = f" | שחזור הפסד: יעד אפקטיבי ${eff_a:.2f} (מכפיל {m_a:.2f}× על בסיס ${cfg_a.investment_usd:.2f})"
                 self.rt.log_event(
-                    f"נכנס לעסקה (חצי־אוטו): {p['side']} ×{int(n_adj)} @ {float(price):.2f}"
+                    (f"נכנס לעסקה (חצי־אוטו): {p['side']} ×{int(n_adj)} @ {float(price):.2f}{lr_a}"
                     if price is not None
-                    else f"נכנס לעסקה (חצי־אוטו): {p['side']} ×{int(n_adj)}",
+                    else f"נכנס לעסקה (חצי־אוטו): {p['side']} ×{int(n_adj)}{lr_a}"),
                     session_id=sid,
                 )
             else:
@@ -500,10 +542,11 @@ class StrategyRunner:
             return
         if m.epoch != self.rt.current_epoch:
             # לפני מעבר חלון: פירוק פוזיציות מחלון קודם (SETTLE_WIN / SETTLE_LOSS / …)
+            settlement_trades: list[dict[str, Any]] = []
             if self.rt.current_epoch != 0:
                 from market_discovery import window_step_sec
 
-                await self.demo.expire_all_outside_tokens(
+                settlement_trades = await self.demo.expire_all_outside_tokens(
                     (m.token_up, m.token_down),
                     context={
                         "settled_epoch": self.rt.current_epoch,
@@ -513,6 +556,28 @@ class StrategyRunner:
                         "reason": "EXPIRE_0 rollover",
                     },
                 )
+                cfg_lr = self.rt.config
+                if settlement_trades:
+                    has_loss = any(float(t.get("realized_pnl") or 0) < 0 for t in settlement_trades)
+                    if cfg_lr.loss_recovery_enabled:
+                        from loss_recovery import apply_loss_recovery_from_settlements
+
+                        lr_lines = apply_loss_recovery_from_settlements(
+                            self.demo.state,
+                            enabled=True,
+                            step_pct=cfg_lr.loss_recovery_step_pct,
+                            every_n_losses=cfg_lr.loss_recovery_every_n_losses,
+                            max_multiplier=cfg_lr.loss_recovery_max_multiplier,
+                            settlement_trades=settlement_trades,
+                        )
+                        self.demo.save()
+                        for line in lr_lines:
+                            self.rt.log_event(line)
+                    elif has_loss:
+                        self.rt.log_event(
+                            "שחזור הפסד: כבוי בהגדרות המנוע — פירוק עם הפסד לא מגדיל מכפיל ולא משנה סכום לסלייס. "
+                            "הפעל «שחזור אחרי הפסד», לחץ שמור הגדרות, והפעל מחדש את המנוע אם צריך לטעון config מהדיסק."
+                        )
             self.rt.log(f"מעבר חלון → {m.slug}")
             self.rt.current_epoch = m.epoch
             self.rt.dca_done_slices = 0
@@ -609,11 +674,15 @@ class StrategyRunner:
                         self.rt.log(f"TP לייב: {lo.get('error', 'כשל')}")
                         continue
                     fill_sell = float(lo.get("price") or bid_tp)
-                    r = self.demo.record_live_sell(p.token_id, fill_sell, context=tp_ctx)
+                    r = await self.demo.record_live_sell(p.token_id, fill_sell, context=tp_ctx)
                 else:
                     r = await self.demo.simulate_sell_all(p.token_id, context=tp_ctx)
                 if r.get("ok"):
                     self.rt.record_tp(cfg=cfg, side=p.side)
+                    if cfg.loss_recovery_enabled:
+                        self.demo.state.loss_recovery_streak = 0
+                        self.demo.state.loss_recovery_multiplier = 1.0
+                        self.demo.save()
                     tr = r.get("trade") or {}
                     price = tr.get("price")
                     peak = tr.get("peak_unrealized_pct")
@@ -625,6 +694,11 @@ class StrategyRunner:
                         else f"TP {p.side}: יציאה ~{upnl:.1f}% מול עלות",
                         session_id=sid,
                     )
+                    if cfg.loss_recovery_enabled:
+                        self.rt.log_event(
+                            "שחזור הפסד: איפוס אחרי TP — מכפיל 1.00×, רצף הפסדים 0 (חזרה לסכום בסיס לכניסה הבאה)",
+                            session_id=sid,
+                        )
                     if peak is not None or trough is not None:
                         peak_s = f"{peak:.1f}%" if peak is not None else "—"
                         trough_s = f"{trough:.1f}%" if trough is not None else "—"
@@ -676,8 +750,9 @@ class StrategyRunner:
                 other_side = "Down" if pos_u else "Up"
                 other_token = token_down if pos_u else token_up
                 other_ask = ask_d if pos_u else ask_u
+                eff_inv = self._effective_investment_usd(cfg)
                 n = max(min_c, contracts_from_investment(
-                    cfg.investment_usd / 2, other_ask, min_c
+                    eff_inv / 2, other_ask, min_c
                 ) or min_c)
                 if mode == "semi" and not self.rt.pending_approval:
                     self.rt.pending_approval = {
@@ -788,6 +863,16 @@ class StrategyRunner:
                 )
                 return
 
+        # Ask מעודכן מיד לפני חישוב כמות — Ask בתחילת הטיק עלול להיות ישן; בדמו/לייב המילוי משתמש ב-best ask מחדש
+        _, ask_entry = await fetch_best_bid_ask(str(token))
+        if ask_entry is not None:
+            try:
+                ae = float(ask_entry)
+            except (TypeError, ValueError):
+                ae = float("nan")
+            if math.isfinite(ae) and MIN_LEGIT_SHARE_PRICE_USD <= ae <= MAX_LEGIT_SHARE_PRICE_USD:
+                ask = ask_entry
+
         price_usd = cfg.entry_price_cents / 100.0
         if cfg.dca_enabled:
             # cap לכניסה הבאה: לא עוברים את המחיר הרצוי,
@@ -812,10 +897,12 @@ class StrategyRunner:
                 )
                 return
 
-            per = cfg.investment_usd / max(1, cfg.dca_slices)
+            eff_inv = self._effective_investment_usd(cfg)
+            per = eff_inv / max(1, cfg.dca_slices)
             # נחשב כמות שמרנית כך שהעמלות לא "יאכלו" את היתרה בסלייס הבא.
             safe_per = per / (1.0 + FEE_RATE)
-            n = contracts_from_investment(safe_per, entry_cap_price, min_c)
+            qty_px = effective_price_for_contract_qty(entry_cap_price, ask)
+            n = contracts_from_investment(safe_per, qty_px, min_c)
             now = time.time()
             if self.rt.dca_done_slices >= cfg.dca_slices:
                 return
@@ -830,7 +917,9 @@ class StrategyRunner:
                 )
                 return
         else:
-            n = contracts_from_investment(cfg.investment_usd, price_usd, min_c)
+            eff_inv = self._effective_investment_usd(cfg)
+            qty_px = effective_price_for_contract_qty(price_usd, ask)
+            n = contracts_from_investment(eff_inv, qty_px, min_c)
             entry_cap_price = price_usd
             if price_usd < MIN_LEGIT_SHARE_PRICE_USD or price_usd > MAX_LEGIT_SHARE_PRICE_USD:
                 self.rt.status(
@@ -857,6 +946,8 @@ class StrategyRunner:
             )
             return
         n = n_use
+        eff_inv_snapshot = self._effective_investment_usd(cfg)
+        lr_mult_snapshot = float(self.demo.state.loss_recovery_multiplier)
         entry_sid = self.demo._session_by_token.get(token)
         # מפתח דה-דופ אחד לכל "לפני כניסה" באותו סלייס DCA — מונע:
         # (א) שורה חוזרת כל ~6s עם אותו טקסט; (ב) קפיצה ביומן כשעוברים מ"קרוב לכניסה" ל"רק TP נעול"
@@ -937,6 +1028,9 @@ class StrategyRunner:
                 "limit_price": lim,
             }
         )
+        if cfg.loss_recovery_enabled:
+            entry_ctx["effective_investment_usd"] = eff_inv_snapshot
+            entry_ctx["loss_recovery_multiplier"] = lr_mult_snapshot
         if mode == "semi":
             if not self.rt.pending_approval:
                 self.rt.pending_approval = {
@@ -975,10 +1069,13 @@ class StrategyRunner:
             price = tr.get("price")
             sid = tr.get("session_id")
             dca_part = f" — DCA {self.rt.dca_done_slices}/{cfg.dca_slices}" if cfg.dca_enabled else ""
+            lr_part = ""
+            if cfg.loss_recovery_enabled:
+                lr_part = f" | שחזור הפסד: יעד אפקטיבי ${eff_inv_snapshot:.2f} (מכפיל {lr_mult_snapshot:.2f}× על בסיס ${cfg.investment_usd:.2f})"
             self.rt.log_event(
-                f"נכנס לעסקה (אוטומטי){dca_part}: {side} ×{n} @ {float(price):.2f}"
+                (f"נכנס לעסקה (אוטומטי){dca_part}: {side} ×{n} @ {float(price):.2f}{lr_part}"
                 if price is not None
-                else f"נכנס לעסקה (אוטומטי){dca_part}: {side} ×{n}",
+                else f"נכנס לעסקה (אוטומטי){dca_part}: {side} ×{n}{lr_part}"),
                 session_id=sid,
             )
             if cfg.dca_enabled:

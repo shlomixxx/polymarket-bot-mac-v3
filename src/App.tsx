@@ -31,6 +31,8 @@ type Market = {
   seconds_left: number;
   price_to_beat: number | null;
   price_to_beat_note: string;
+  /** chainlink_polygon | binance_1m_fallback — מקור ייחוס לעומת Polymarket */
+  price_to_beat_source?: string;
 };
 
 type SideSummary = { bid: number | null; ask: number | null; mid: number | null };
@@ -88,6 +90,34 @@ function formatBtcUsdLabel(usd: number | null | undefined): string {
   if (usd == null || !Number.isFinite(Number(usd))) return "—";
   const n = Number(usd);
   return `$${n.toLocaleString("en-US", { maximumFractionDigits: 0, minimumFractionDigits: 0 })}`;
+}
+
+/** תאי טבלה — פירוק BTC כששמור בעסקה (ניצחון/הפסד מוצגים באותה בולטות) */
+function settlementBtcTableCells(t: Trade): [string, string, string, string] {
+  const a = t.settlement_btc_start;
+  const b = t.settlement_btc_end;
+  if (a == null || b == null || !Number.isFinite(Number(a)) || !Number.isFinite(Number(b))) {
+    return ["—", "—", "—", "—"];
+  }
+  const af = Number(a);
+  const bf = Number(b);
+  const res =
+    typeof t.resolved_outcome === "string" && t.resolved_outcome
+      ? t.resolved_outcome
+      : bf >= af
+        ? "Up"
+        : "Down";
+  let match: string;
+  if (typeof t.settlement_won === "boolean") {
+    match = t.settlement_won ? "ניצחון" : "הפסד";
+  } else if (t.side === "Up" || t.side === "Down") {
+    const up = bf >= af;
+    const won = t.side === "Up" ? up : !up;
+    match = won ? "ניצחון" : "הפסד";
+  } else {
+    match = "—";
+  }
+  return [formatBtcUsdLabel(af), formatBtcUsdLabel(bf), res, match];
 }
 
 const TIP_SETTLEMENT_BTC =
@@ -399,6 +429,71 @@ function TradesBySession({
   /** מסלול PnL אחרון לפי session — כשהשרת מחזיר רגעית pnl_path ריק (throttle / מרוץ) לא נוריד את הגרף */
   const lastOpenPnlPathBySessionRef = useRef<Record<string, { ts: number; upnl_pct: number }[]>>({});
   const groups = useMemo(() => groupTradesBySession(trades.slice().reverse().slice(0, 5000)), [trades]);
+  /** מחירי חלון רטרואקטיביים כשחסרים settlement_btc_* בעסקה (היסטוריה לפני השמירה ב-TP) */
+  const [retroBtcByKey, setRetroBtcByKey] = useState<
+    Record<string, { start: number; end: number } | "loading" | "fail">
+  >({});
+  const retroFetchStartedRef = useRef(new Set<string>());
+  /** ניסיון רטרו חוזר אוטומטי — לכל מפתח epoch-window לכל היותר פעם אחת (מונע לולאה אם השרת למטה). */
+  const retroAutoRetryOnceRef = useRef(new Set<string>());
+  const scheduleRetroRetry = useCallback((key: string) => {
+    if (retroAutoRetryOnceRef.current.has(key)) return;
+    retroAutoRetryOnceRef.current.add(key);
+    window.setTimeout(() => {
+      retroFetchStartedRef.current.delete(key);
+      setRetroBtcByKey((prev) => {
+        if (prev[key] !== "fail") return prev;
+        const n = { ...prev };
+        delete n[key];
+        return n;
+      });
+    }, 3500);
+  }, []);
+  useEffect(() => {
+    for (const g of groups) {
+      const hasStored = g.trades.some(
+        (t) =>
+          typeof t.settlement_btc_start === "number" &&
+          Number.isFinite(t.settlement_btc_start) &&
+          typeof t.settlement_btc_end === "number" &&
+          Number.isFinite(t.settlement_btc_end),
+      );
+      if (hasStored) continue;
+      const buys = g.trades.filter((t) => t.type === "BUY");
+      const epRaw = buys[0]?.epoch ?? g.trades.find((t) => t.epoch != null)?.epoch;
+      const ep = epRaw != null && Number.isFinite(Number(epRaw)) ? Number(epRaw) : null;
+      if (ep == null) continue;
+      const wsRaw = buys[0]?.window_sec;
+      const ws = typeof wsRaw === "number" && wsRaw > 0 ? wsRaw : fallbackWindowSec;
+      const windowEndSec = ep + ws;
+      // עד סיום החלון אין נר סוף ב-Binance — קריאת רטרו תיכשל סתם; המילוי בא מ-/api/demo/state
+      if (Date.now() / 1000 < windowEndSec - 0.5) continue;
+      const key = `${ep}-${ws}`;
+      if (retroFetchStartedRef.current.has(key)) continue;
+      retroFetchStartedRef.current.add(key);
+      setRetroBtcByKey((p) => (p[key] !== undefined ? p : { ...p, [key]: "loading" }));
+      void api<{ start: number | null; end: number | null }>(
+        `/api/btc/window-prices?epoch=${ep}&window_sec=${ws}`,
+      )
+        .then((r) => {
+          if (
+            r.start != null &&
+            r.end != null &&
+            Number.isFinite(r.start) &&
+            Number.isFinite(r.end)
+          ) {
+            setRetroBtcByKey((prev) => ({ ...prev, [key]: { start: r.start!, end: r.end! } }));
+          } else {
+            setRetroBtcByKey((prev) => ({ ...prev, [key]: "fail" }));
+            scheduleRetroRetry(key);
+          }
+        })
+        .catch(() => {
+          setRetroBtcByKey((prev) => ({ ...prev, [key]: "fail" }));
+          scheduleRetroRetry(key);
+        });
+    }
+  }, [groups, fallbackWindowSec, scheduleRetroRetry]);
   const toggle = (sid: string) => {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -422,6 +517,25 @@ function TradesBySession({
       >
       {groups.map((g, idx) => {
         const buys = g.trades.filter((t) => t.type === "BUY");
+        const windowSecForRetro =
+          typeof buys[0]?.window_sec === "number" && buys[0].window_sec > 0
+            ? buys[0].window_sec
+            : fallbackWindowSec;
+        const epochForRetro =
+          buys[0]?.epoch != null && Number.isFinite(Number(buys[0].epoch))
+            ? Number(buys[0].epoch)
+            : (() => {
+                const t = g.trades.find((x) => x.epoch != null);
+                return t != null && Number.isFinite(Number(t.epoch)) ? Number(t.epoch) : null;
+              })();
+        const retroKey = epochForRetro != null ? `${epochForRetro}-${windowSecForRetro}` : null;
+        const retroEntry = retroKey ? retroBtcByKey[retroKey] : undefined;
+        const retroPair =
+          retroEntry && typeof retroEntry === "object" && "start" in retroEntry
+            ? retroEntry
+            : undefined;
+        const retroLoading = retroEntry === "loading";
+        const retroFailed = retroEntry === "fail";
         const exits = g.trades.filter(isSessionExitTrade);
         const isOpen = exits.length === 0;
         const side = buys[0]?.side || "—";
@@ -509,15 +623,65 @@ function TradesBySession({
           exitBidUsd != null && bidPeakHyp != null ? pctVsExitPrice(exitBidUsd, bidPeakHyp) : null;
         const pctVsExitTrough =
           exitBidUsd != null && bidTroughHyp != null ? pctVsExitPrice(exitBidUsd, bidTroughHyp) : null;
-        const btcRef = lastExit?.settlement_btc_start;
-        const btcEndPx = lastExit?.settlement_btc_end;
+        /** פירוק BTC יכול לשבת על SETTLE_* גם כשהיציאה האחרונה כרונולוגית היא TP (שני סוגי יציאה בסשן) */
+        const tradeWithSettlementBtc = [...g.trades]
+          .slice()
+          .reverse()
+          .find(
+            (t) =>
+              typeof t.settlement_btc_start === "number" &&
+              Number.isFinite(t.settlement_btc_start) &&
+              typeof t.settlement_btc_end === "number" &&
+              Number.isFinite(t.settlement_btc_end),
+          );
+        const btcRefStored = tradeWithSettlementBtc?.settlement_btc_start;
+        const btcEndStored = tradeWithSettlementBtc?.settlement_btc_end;
+        const btcRef =
+          typeof btcRefStored === "number" && Number.isFinite(btcRefStored)
+            ? btcRefStored
+            : retroPair?.start;
+        const btcEndPx =
+          typeof btcEndStored === "number" && Number.isFinite(btcEndStored)
+            ? btcEndStored
+            : retroPair?.end;
         const hasSettlementBtc =
           typeof btcRef === "number" &&
           Number.isFinite(btcRef) &&
           typeof btcEndPx === "number" &&
           Number.isFinite(btcEndPx);
-        const resolvedMarket = lastExit?.resolved_outcome;
-        const settleWon = lastExit?.settlement_won;
+        let resolvedMarket: string | undefined =
+          tradeWithSettlementBtc?.resolved_outcome ?? lastExit?.resolved_outcome;
+        if (
+          resolvedMarket == null &&
+          hasSettlementBtc &&
+          btcRef != null &&
+          btcEndPx != null
+        ) {
+          resolvedMarket = btcEndPx >= btcRef ? "Up" : "Down";
+        }
+        let settleWon: boolean | undefined;
+        if (tradeWithSettlementBtc?.settlement_won !== undefined) {
+          settleWon = tradeWithSettlementBtc.settlement_won;
+        } else if (
+          hasSettlementBtc &&
+          btcRef != null &&
+          btcEndPx != null &&
+          (side === "Up" || side === "Down")
+        ) {
+          const marketUp = btcEndPx >= btcRef;
+          settleWon = side === "Up" ? marketUp : !marketUp;
+        } else {
+          settleWon = lastExit?.settlement_won;
+        }
+        const btcPanelFromTp = tradeWithSettlementBtc?.type === "SELL_TP";
+        const windowEndSecBtc =
+          epochForRetro != null ? epochForRetro + windowSecForRetro : null;
+        const awaitingWindowCloseForBtc =
+          lastExit?.type === "SELL_TP" &&
+          windowEndSecBtc != null &&
+          Date.now() / 1000 < windowEndSecBtc - 0.5 &&
+          !hasSettlementBtc &&
+          retroPair == null;
         const firstBuyEpoch =
           buys[0]?.epoch != null && Number.isFinite(Number(buys[0].epoch))
             ? Number(buys[0].epoch)
@@ -648,40 +812,6 @@ function TradesBySession({
                     >
                       בזמן החזקה (מול עלות): {peakStr} | {troughStr}
                     </span>
-                    {hasSettlementBtc && (
-                      <span
-                        title={TIP_SETTLEMENT_BTC}
-                        style={{
-                          fontSize: 11,
-                          color: "#e2e8f0",
-                          padding: "2px 8px",
-                          background: "rgba(34, 197, 94, 0.12)",
-                          borderRadius: 6,
-                          border: "1px solid rgba(34, 197, 94, 0.25)",
-                          textAlign: "right",
-                          maxWidth: "100%",
-                        }}
-                      >
-                        <span style={{ fontSize: 10, color: "var(--muted)", display: "block" }}>
-                          פירוק BTC (ייחוס פתיחה → סוף חלון)
-                        </span>
-                        ייחוס {formatBtcUsdLabel(btcRef)} · סוף {formatBtcUsdLabel(btcEndPx)}
-                        {resolvedMarket ? (
-                          <span style={{ color: "var(--muted)" }}> · מנצח השוק: {resolvedMarket}</span>
-                        ) : null}
-                        {settleWon != null ? (
-                          <span
-                            style={{
-                              color: settleWon ? "var(--up)" : "var(--down)",
-                              fontWeight: 600,
-                              marginInlineStart: 4,
-                            }}
-                          >
-                            · הימור {side}: {settleWon ? "ניצחון" : "הפסד"}
-                          </span>
-                        ) : null}
-                      </span>
-                    )}
                     {(potentialPeak != null || potentialTrough != null) &&
                       (canShowCentsPanel && (dPeakC != null || dTroughC != null) ? (
                         <span
@@ -745,6 +875,76 @@ function TradesBySession({
                   </span>
                 )}
               </button>
+              {hasExit &&
+                (hasSettlementBtc || retroLoading || retroFailed || awaitingWindowCloseForBtc) && (
+                <div
+                  title={TIP_SETTLEMENT_BTC}
+                  dir="rtl"
+                  style={{
+                    flex: "0 0 auto",
+                    width: "min(260px, 36vw)",
+                    minWidth: 168,
+                    padding: "8px 10px",
+                    boxSizing: "border-box",
+                    borderInlineStart: "1px solid #334155",
+                    background:
+                      realized >= 0
+                        ? "rgba(34, 197, 94, 0.07)"
+                        : "rgba(34, 197, 94, 0.12)",
+                    display: "flex",
+                    flexDirection: "column",
+                    justifyContent: "center",
+                    alignItems: "stretch",
+                    textAlign: "right",
+                  }}
+                >
+                  <span style={{ fontSize: 10, color: "var(--muted)", display: "block", marginBottom: 4 }}>
+                    פירוק BTC (ייחוס פתיחה → סוף חלון)
+                    {btcPanelFromTp ? (
+                      <span style={{ color: "#94a3b8" }}> · נשמר ביציאת TP</span>
+                    ) : tradeWithSettlementBtc ? null : retroPair ? (
+                      <span style={{ color: "#94a3b8" }}> · חישוב רטרו (Binance proxy)</span>
+                    ) : null}
+                  </span>
+                  {awaitingWindowCloseForBtc ? (
+                    <span style={{ fontSize: 11, color: "var(--muted)" }}>
+                      החלון עדיין לא נסגר — מחיר סוף (לפירוק Up/Down) יתמלא אוטומטית במנוע אחרי סיום החלון.
+                      רענן את המסך אחרי סוף החלון; אין צורך ברטרו מהדפדפן.
+                    </span>
+                  ) : retroLoading && !hasSettlementBtc ? (
+                    <span style={{ fontSize: 11, color: "var(--muted)" }}>טוען פירוק BTC…</span>
+                  ) : retroFailed && !hasSettlementBtc ? (
+                    <span style={{ fontSize: 11, color: "var(--muted)" }}>
+                      לא ניתן לטעון מחירי חלון (רטרו). ודא שהמנוע רץ על 127.0.0.1:8767 — הנתונים אמורים
+                      להגיע גם מהשמירה אחרי רענון (מילוי אוטומטי בשרת).
+                    </span>
+                  ) : (
+                    <span style={{ fontSize: 11, color: "#e2e8f0", lineHeight: 1.45 }}>
+                      ייחוס {formatBtcUsdLabel(btcRef)} · סוף {formatBtcUsdLabel(btcEndPx)}
+                      {resolvedMarket ? (
+                        <span style={{ color: "var(--muted)" }}> · מנצח השוק: {resolvedMarket}</span>
+                      ) : null}
+                      {settleWon != null ? (
+                        <span
+                          style={{
+                            color: settleWon ? "#f8fafc" : "var(--down)",
+                            fontWeight: 700,
+                            display: "block",
+                            marginTop: 4,
+                            padding: "5px 8px",
+                            borderRadius: 6,
+                            background: settleWon ? "rgba(15, 23, 42, 0.65)" : "transparent",
+                            border: settleWon ? "1px solid rgba(34, 197, 94, 0.5)" : "none",
+                            textShadow: settleWon ? "0 1px 2px rgba(0,0,0,0.45)" : undefined,
+                          }}
+                        >
+                          הימור {side}: {settleWon ? "ניצחון" : "הפסד"}
+                        </span>
+                      ) : null}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
             {isExp && (
               <div style={{ padding: "0 12px 12px", background: "#111827" }}>
@@ -1139,6 +1339,16 @@ function TradesBySession({
                         ["רווח", undefined],
                         ["שיא %", TIP_PCT_ROI],
                         ["שפל %", TIP_PCT_ROI],
+                        [
+                          "ייחוס BTC",
+                          "מחיר ייחוס בתחילת החלון (כשהמנוע שמר פירוק)",
+                        ],
+                        ["סוף BTC", "מחיר בסוף החלון (פרוקסי Binance במנוע)"],
+                        ["מנצח שוק", "Up אם סוף ≥ ייחוס"],
+                        [
+                          "פירוק vs הימור",
+                          "התאמה בין כיוון השוק לבין הצד שנכנסת — לא לפי $ רווח מהמסחר",
+                        ],
                         ["Gate", undefined],
                         ["סיבה", undefined],
                       ] as const
@@ -1229,6 +1439,42 @@ function TradesBySession({
                       <td style={{ padding: "6px 10px", color: "var(--muted)", fontSize: 11 }}>
                         {t.trough_unrealized_pct != null ? `${Number(t.trough_unrealized_pct).toFixed(1)}%` : "—"}
                       </td>
+                      {(() => {
+                        const [refC, endC, winM, betM] = settlementBtcTableCells(t);
+                        const strong = betM === "ניצחון";
+                        return (
+                          <>
+                            <td
+                              style={{ padding: "6px 10px", color: "var(--muted)", fontSize: 11 }}
+                              title="פירוק BTC — ייחוס"
+                            >
+                              {refC}
+                            </td>
+                            <td
+                              style={{ padding: "6px 10px", color: "var(--muted)", fontSize: 11 }}
+                              title="פירוק BTC — סוף חלון"
+                            >
+                              {endC}
+                            </td>
+                            <td style={{ padding: "6px 10px", fontSize: 11 }}>{winM}</td>
+                            <td
+                              style={{
+                                padding: "6px 10px",
+                                fontSize: 11,
+                                fontWeight: betM !== "—" ? 600 : 400,
+                                color:
+                                  betM === "—"
+                                    ? "var(--muted)"
+                                    : strong
+                                      ? "var(--up)"
+                                      : "var(--down)",
+                              }}
+                            >
+                              {betM}
+                            </td>
+                          </>
+                        );
+                      })()}
                       <td style={{ padding: "6px 10px", color: "var(--muted)" }}>
                         {t.gate ? String(t.gate) : "—"}
                         {t.min_left_sec != null ? (
@@ -1346,6 +1592,13 @@ export default function App() {
   const [dcaTpOverridePct, setDcaTpOverridePct] = useState(50);
   /** 0 = כבוי; כל X שניות — שורת יומן עם Ask/Bid מ-Polymarket */
   const [bookLogIntervalSec, setBookLogIntervalSec] = useState(0);
+  const [lossRecoveryEnabled, setLossRecoveryEnabled] = useState(false);
+  const [lossRecoveryStepPct, setLossRecoveryStepPct] = useState(20);
+  const [lossRecoveryEveryN, setLossRecoveryEveryN] = useState(1);
+  const [lossRecoveryMaxMult, setLossRecoveryMaxMult] = useState(10);
+  /** מצב ריצה מהשרת (תמיד מסונכרן) */
+  const [lossRecoveryStreak, setLossRecoveryStreak] = useState(0);
+  const [lossRecoveryMultLive, setLossRecoveryMultLive] = useState(1);
   /** שוק Polymarket: חלון 5 או 15 דק׳ (לא מספר חוזים) */
   const [btcWindow, setBtcWindow] = useState<"5m" | "15m">("5m");
   /** מינ׳ חוזים — לפחות max(זה, מינ׳ השוק) */
@@ -1406,6 +1659,11 @@ export default function App() {
       }
       if (typeof (cfg as any).last_status === "string") setEngineStatus((cfg as any).last_status);
       if (typeof (cfg as any).last_tick_ts === "number") setEngineLastTickTs((cfg as any).last_tick_ts);
+      {
+        const lr = cfg as Record<string, unknown>;
+        if (typeof lr.loss_recovery_streak === "number") setLossRecoveryStreak(lr.loss_recovery_streak);
+        if (typeof lr.loss_recovery_multiplier === "number") setLossRecoveryMultLive(lr.loss_recovery_multiplier);
+      }
       // חשוב: יש רענון כל שנייה. לא נדרוס ערכים שהמשתמש עורך לפני "שמור".
       // כשאין עריכה פתוחה — מסנכרנים את כל ההגדרות מהשרת (אחרת אחרי F5 חוזרים לברירות מחדל מקומיות).
       if (!cfgDirtyRef.current) {
@@ -1437,6 +1695,10 @@ export default function App() {
         const bw = c.btc_window;
         if (bw === "5m" || bw === "15m") setBtcWindow(bw);
         if (typeof c.min_contracts === "number") setMinContracts(c.min_contracts);
+        if (typeof c.loss_recovery_enabled === "boolean") setLossRecoveryEnabled(c.loss_recovery_enabled);
+        if (typeof c.loss_recovery_step_pct === "number") setLossRecoveryStepPct(c.loss_recovery_step_pct);
+        if (typeof c.loss_recovery_every_n_losses === "number") setLossRecoveryEveryN(c.loss_recovery_every_n_losses);
+        if (typeof c.loss_recovery_max_multiplier === "number") setLossRecoveryMaxMult(c.loss_recovery_max_multiplier);
       }
       setOb(obSummary);
     } catch (e: unknown) {
@@ -1506,6 +1768,10 @@ export default function App() {
         near_tp_pct: nearTpPct,
         dca_tp_override_pct: dcaTpOverridePct,
         book_log_interval_sec: bookLogIntervalSec,
+        loss_recovery_enabled: lossRecoveryEnabled,
+        loss_recovery_step_pct: lossRecoveryStepPct,
+        loss_recovery_every_n_losses: Math.max(1, Math.floor(lossRecoveryEveryN)),
+        loss_recovery_max_multiplier: Math.max(1, lossRecoveryMaxMult),
       }),
     });
     cfgDirtyRef.current = false;
@@ -1912,6 +2178,13 @@ export default function App() {
               }}
               style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
             />
+            {lossRecoveryEnabled && (
+              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
+                יעד השקעה אצל המנוע כרגע:{" "}
+                <strong className="tabular-nums">${(inv * lossRecoveryMultLive).toFixed(2)}</strong> (בסיס × מכפיל{" "}
+                {lossRecoveryMultLive.toFixed(2)}) · הפסדים רצופים: {lossRecoveryStreak}
+              </div>
+            )}
           </label>
           <label>
             כניסה במחיר (¢){" "}
@@ -2277,6 +2550,101 @@ export default function App() {
                 למשל 3–5 — לעקוב אחרי תנועת מחירים בלי להציף; 0 ללא שורות &quot;שוק CLOB&quot;.
               </span>
             </label>
+            <div
+              style={{
+                marginTop: 14,
+                paddingTop: 14,
+                borderTop: "1px dashed #263244",
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>שחזור אחרי הפסד (מכפיל כניסה)</div>
+              <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 10px", lineHeight: 1.55 }}>
+                רלוונטי כשהחלון נסגר והפוזיציה נפרקת בהפסד (הזמן נגמר / Up או Down הפסיד לפי מחיר הסגירה). לא מפעילים
+                הכפלה על TP — אחרי TP מנצח המכפיל מתאפס.
+              </p>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                <input
+                  type="checkbox"
+                  checked={lossRecoveryEnabled}
+                  onChange={(e) => {
+                    setLossRecoveryEnabled(e.target.checked);
+                    markCfgDirty();
+                  }}
+                />
+                הפעל — סכום היעד לכניסה × מכפיל; אחרי פירוק מופסד המכפיל עולה; איפוס אחרי TP או פירוק מנצח
+              </label>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 12 }}>
+                <button
+                  type="button"
+                  disabled={!lossRecoveryEnabled}
+                  onClick={() => {
+                    setLossRecoveryStepPct(100);
+                    setLossRecoveryEveryN(1);
+                    markCfgDirty();
+                  }}
+                  style={{
+                    padding: "8px 12px",
+                    fontSize: 12,
+                    borderRadius: 8,
+                    border: "1px solid #475569",
+                    background: lossRecoveryEnabled ? "#1e293b" : "#0f172a",
+                    color: "#e2e8f0",
+                    cursor: lossRecoveryEnabled ? "pointer" : "not-allowed",
+                  }}
+                >
+                  הגדר הכפלה ×2 (צעד 100%, כל הפסד בפירוק)
+                </button>
+                <span style={{ fontSize: 11, color: "var(--muted)" }}>
+                  מכפיל ×2 אחרי כל פירוק מופסד, עד התקרה למטה
+                </span>
+              </div>
+              <label>
+                צעד הגדלה (% — מכפיל חדש = ישן × (1 + %/100); 100% = הכפלה)
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  value={lossRecoveryStepPct}
+                  onChange={(e) => {
+                    setLossRecoveryStepPct(Math.max(0, Number(e.target.value) || 0));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label>
+                כל כמה הפסדים רצופים (פירוק) להחיל צעד (1 = אחרי כל הפסד)
+                <input
+                  type="number"
+                  step="1"
+                  min={1}
+                  value={lossRecoveryEveryN}
+                  onChange={(e) => {
+                    setLossRecoveryEveryN(Math.max(1, Math.floor(Number(e.target.value) || 1)));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label>
+                תקרת מכפיל מול בסיס ההשקעה
+                <input
+                  type="number"
+                  step="0.5"
+                  min={1}
+                  value={lossRecoveryMaxMult}
+                  onChange={(e) => {
+                    setLossRecoveryMaxMult(Math.max(1, Number(e.target.value) || 1));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}
+                />
+              </label>
+              <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.55 }}>
+                חל על לולאת האסטרטגיה הראשית בלבד (לא Trigger Trader). סיכון מוגבר ליתרה — השתמש בתקרה וביתרה מתאימה.
+              </div>
+            </div>
             <div style={{ color: "var(--muted)", fontSize: 12 }}>
               ההגבלות כאן לא מחליפות Stop Loss — הן רק מונעות מהבוט לרוץ בצורה לא מבוקרת.
             </div>

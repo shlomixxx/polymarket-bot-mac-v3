@@ -94,11 +94,13 @@ export function PnlOpenAreaChart({
           fillOpacity={1}
           dot={(dotProps: { cx?: number; cy?: number; index?: number }) => {
             const last = data.length - 1;
+            const idx = dotProps.index ?? 0;
             if (dotProps.index !== last || dotProps.cx == null || dotProps.cy == null) {
-              return <g />;
+              return <g key={`pnl-open-dot-${idx}`} />;
             }
             return (
               <circle
+                key={`pnl-open-dot-${idx}`}
                 cx={dotProps.cx}
                 cy={dotProps.cy}
                 r={4}
@@ -188,11 +190,13 @@ export function PnlClosedAreaChart({
           fillOpacity={1}
           dot={(dotProps: { cx?: number; cy?: number; index?: number }) => {
             const last = data.length - 1;
+            const idx = dotProps.index ?? 0;
             if (dotProps.index !== last || dotProps.cx == null || dotProps.cy == null) {
-              return <g />;
+              return <g key={`pnl-closed-dot-${idx}`} />;
             }
             return (
               <circle
+                key={`pnl-closed-dot-${idx}`}
                 cx={dotProps.cx}
                 cy={dotProps.cy}
                 r={4}
