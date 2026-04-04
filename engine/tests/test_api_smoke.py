@@ -59,6 +59,8 @@ def test_strategy_config_roundtrip(client: TestClient):
     assert j["entry_price_cents"] == 30
     assert j["take_profit_pct"] == 12.5
     assert j.get("btc_window") == "15m"
+    assert isinstance(j.get("ui_runtime_started_ts"), (int, float))
+    assert isinstance(j.get("ui_runtime_uptime_sec"), (int, float))
 
 
 def test_demo_reset_and_clear_stats(client: TestClient):

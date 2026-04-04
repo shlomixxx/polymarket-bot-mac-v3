@@ -364,6 +364,15 @@ function formatDurationSec(sec: number): string {
   return `${s} שנ׳`;
 }
 
+function formatHms(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  const s = Math.floor(sec % 60);
+  const m = Math.floor((sec / 60) % 60);
+  const h = Math.floor(sec / 3600);
+  const pad2 = (n: number) => String(n).padStart(2, "0");
+  return `${pad2(h)}:${pad2(m)}:${pad2(s)}`;
+}
+
 function isSessionExitTrade(t: Trade): boolean {
   const ty = t.type;
   return (
@@ -1564,6 +1573,9 @@ export default function App() {
   const [ob, setOb] = useState<OrderbookSummary | null>(null);
   const [engineStatus, setEngineStatus] = useState("");
   const [engineLastTickTs, setEngineLastTickTs] = useState<number | null>(null);
+  /** unix seconds — נקודת התחלה לטיימר זמן ריצה (מהשרת, מתוך config) */
+  const [runtimeStartedTs, setRuntimeStartedTs] = useState<number | null>(null);
+  const [runtimeDisplaySec, setRuntimeDisplaySec] = useState<number | null>(null);
   const [cfgDirty, setCfgDirty] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<"saved" | null>(null);
   const cfgDirtyRef = useRef(false);
@@ -1613,6 +1625,17 @@ export default function App() {
     cfgDirtyRef.current = cfgDirty;
   }, [cfgDirty]);
 
+  useEffect(() => {
+    if (runtimeStartedTs == null) {
+      setRuntimeDisplaySec(null);
+      return;
+    }
+    const tick = () => setRuntimeDisplaySec(Math.max(0, Date.now() / 1000 - runtimeStartedTs));
+    tick();
+    const id = window.setInterval(tick, 1000);
+    return () => window.clearInterval(id);
+  }, [runtimeStartedTs]);
+
   const markCfgDirty = useCallback(() => {
     cfgDirtyRef.current = true;
     setCfgDirty(true);
@@ -1652,6 +1675,14 @@ export default function App() {
       setLogs(lg.lines || []);
       setLogEntries((logEnt?.entries as { ts: number; msg: string; type: string; session_id?: string }[]) || []);
       setPending((pe.pending as Record<string, unknown>) || null);
+      {
+        const ur = cfg as Record<string, unknown>;
+        if (typeof ur.ui_runtime_started_ts === "number") {
+          setRuntimeStartedTs(ur.ui_runtime_started_ts);
+        } else {
+          setRuntimeStartedTs(null);
+        }
+      }
       {
         const m = cfg.mode as string | undefined;
         if (m === "off" || m === "semi" || m === "auto") {
@@ -2872,6 +2903,12 @@ export default function App() {
             return (
               <>
                 <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+                  <div className="stat-pill" title="זמן מאז שהבוט/המנוע הופעל או מאז האיפוס האחרון (איפוס סטטיסטיקה / איפוס סימולציה / כיבוי מצב הבוט)">
+                    זמן ריצה מאז הפעלה/איפוס:{" "}
+                    <strong className="tabular-nums">
+                      {runtimeDisplaySec != null ? formatHms(runtimeDisplaySec) : "—"}
+                    </strong>
+                  </div>
                   <div className="stat-pill">
                     יתרה במזומן: <strong>${balance.toFixed(2)}</strong>
                   </div>

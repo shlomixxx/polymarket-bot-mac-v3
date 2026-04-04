@@ -50,6 +50,18 @@ runner = StrategyRunner(demo)
 trigger = TriggerEngine()
 trigger.inject(demo)
 
+# ── UI runtime timer (uptime) ────────────────────────────────────────────────
+# זהו "זמן ריצה" ל-UI: מהרגע שהמנוע עלה או מהאיפוס האחרון שבוצע דרך ה-API.
+_ui_runtime_started_ts: float = time.time()
+_ui_runtime_reason: str = "engine_start"
+
+
+def _reset_ui_runtime(reason: str) -> None:
+    global _ui_runtime_started_ts, _ui_runtime_reason
+    _ui_runtime_started_ts = time.time()
+    _ui_runtime_reason = reason
+
+
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(Path(__file__).resolve().parent))).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -288,6 +300,7 @@ async def lifespan(app: FastAPI):
     _ensure_log_run_dir()
     _load_persisted_config()
     _load_trigger_config()
+    _reset_ui_runtime("lifespan_start")
     runner.rt.mode = "off"  # תמיד אחרי טעינת הגדרות — לא מפעילים בוט אוטומטית
     runner.start_loop()
     trigger.start_loop()
@@ -506,6 +519,7 @@ class ResetBody(BaseModel):
 async def demo_reset(body: ResetBody):
     demo.reset(body.balance)
     runner.sync_runtime_after_demo_positions_cleared()
+    _reset_ui_runtime("demo_reset")
     append_event("demo_reset", {"balance": body.balance})
     write_strategy_snapshot(runner, demo)
     return {"ok": True}
@@ -515,9 +529,23 @@ async def demo_reset(body: ResetBody):
 async def demo_clear_stats():
     await demo.reset_stats_and_flatten_positions()
     runner.sync_runtime_after_demo_positions_cleared()
+    _reset_ui_runtime("demo_clear_stats")
     append_event("demo_clear_stats", {})
     write_strategy_snapshot(runner, demo)
     return {"ok": True}
+
+
+@app.get("/api/runtime")
+async def api_runtime():
+    """זמן ריצה ל-UI: מהרגע שהמנוע עלה או מהאיפוס האחרון."""
+    now = time.time()
+    started_ts = float(_ui_runtime_started_ts)
+    return {
+        "started_ts": started_ts,
+        "uptime_sec": max(0.0, now - started_ts),
+        "reason": _ui_runtime_reason,
+        "now_ts": now,
+    }
 
 
 @app.get("/api/demo/export.csv", response_class=PlainTextResponse)
@@ -653,6 +681,9 @@ async def get_strategy_config():
         "mode": runner.rt.mode,
         "last_status": runner.rt.last_status,
         "last_tick_ts": runner.rt.last_tick_ts,
+        # זמן ריצה ל-UI (מסונכרן עם /api/runtime)
+        "ui_runtime_started_ts": float(_ui_runtime_started_ts),
+        "ui_runtime_uptime_sec": max(0.0, time.time() - float(_ui_runtime_started_ts)),
     }
 
 
@@ -666,6 +697,8 @@ async def strategy_mode(body: ModeBody):
         raise HTTPException(400, "mode")
     prev = runner.rt.mode
     runner.rt.mode = body.mode  # type: ignore
+    if body.mode == "off" and prev != "off":
+        _reset_ui_runtime("strategy_mode_off")
     # כשעוברים מ-off למצב פעיל: מנקים יומן כדי שה-UI יציג "היסטוריה חדשה"
     if prev == "off" and body.mode != "off":
         runner.rt.log_lines = []
