@@ -104,6 +104,8 @@ class StrategyRuntime:
     _last_status_key: str = ""
     last_tick_ts: float = 0.0
     _last_book_log_ts: float = 0.0
+    # לשידור/סטטיסטיקה: מתחילים למדוד זמן מהכניסה הראשונה של לולאת האסטרטגיה (לא טריגר/גידור רגל 2).
+    strategy_first_buy_ts: Optional[float] = None
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -174,6 +176,7 @@ class StrategyRuntime:
         self.last_tp_ts = 0.0
         self.last_tp_side = None
         self._last_book_log_ts = 0.0
+        self.strategy_first_buy_ts = None
 
     def status(
         self,
@@ -303,6 +306,11 @@ class StrategyRunner:
             "שחזור הפסד: איפוס מצב (איפוס חשבון / ניקוי סטטיסטיקה) — מכפיל 1.00×, רצף 0"
         )
 
+    def _mark_first_strategy_buy_if_needed(self) -> None:
+        """שעון שידור: רק בכניסת BUY ראשונה בלולאת האסטרטגיה (לא גידור רגל 2)."""
+        if self.rt.strategy_first_buy_ts is None:
+            self.rt.strategy_first_buy_ts = time.time()
+
     def _effective_investment_usd(self, cfg: StrategyConfig) -> float:
         if not cfg.loss_recovery_enabled:
             return float(cfg.investment_usd)
@@ -375,6 +383,7 @@ class StrategyRunner:
                 fill = float(tr.get("price") or 0.0)
                 self.rt.dca_last_fill_price = fill if fill > 0 else None
             if r.get("ok"):
+                self._mark_first_strategy_buy_if_needed()
                 # עדכון מונים/מגבלות (בכניסה בפועל)
                 tr = (r.get("trade") or {}) if isinstance(r.get("trade"), dict) else {}
                 fill = float(tr.get("price") or 0.0)
@@ -534,6 +543,12 @@ class StrategyRunner:
         mode = self.rt.mode
         if mode == "off":
             return
+        try:
+            import main as _engine_main
+
+            _engine_main._ensure_bot_run_session_if_active()
+        except Exception:
+            pass
         # Heartbeat שמראה שהמנוע ממשיך לרוץ גם אם בינתיים אין status מפורש.
         self.rt.last_tick_ts = time.time()
         m = await discover_active_btc_window(self.rt.config.btc_window)
@@ -1057,6 +1072,7 @@ class StrategyRunner:
                 side, token, float(n), limit_price=lim, context=entry_ctx
             )
         if r.get("ok"):
+            self._mark_first_strategy_buy_if_needed()
             # עדכון מונים/מגבלות
             tr = (r.get("trade") or {}) if isinstance(r.get("trade"), dict) else {}
             fill = float(tr.get("price") or 0.0)

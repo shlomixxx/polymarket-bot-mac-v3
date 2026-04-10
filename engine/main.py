@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from btc_price import (
     PriceHistoryBuffer,
     fetch_btc_spot_usdt,
-    fetch_chainlink_btc_usd_polygon_latest,
+    fetch_chainlink_btc_usd_polygon_at_window_start,
     fetch_open_price_at_window_start,
     fetch_window_start_end_btc_usd,
 )
@@ -54,12 +54,92 @@ trigger.inject(demo)
 # זהו "זמן ריצה" ל-UI: מהרגע שהמנוע עלה או מהאיפוס האחרון שבוצע דרך ה-API.
 _ui_runtime_started_ts: float = time.time()
 _ui_runtime_reason: str = "engine_start"
+# שווי נטו (דמו) ברגע תחילת ריצת ה-UI — לחישוב רווח מצטבר מול אותה נקודת זמן
+_ui_runtime_equity_baseline_usd: float = float(demo.equity_snapshot_usd())
 
 
 def _reset_ui_runtime(reason: str) -> None:
-    global _ui_runtime_started_ts, _ui_runtime_reason
+    global _ui_runtime_started_ts, _ui_runtime_reason, _ui_runtime_equity_baseline_usd
     _ui_runtime_started_ts = time.time()
     _ui_runtime_reason = reason
+    try:
+        _ui_runtime_equity_baseline_usd = float(demo.equity_snapshot_usd())
+    except Exception:
+        _ui_runtime_equity_baseline_usd = float(demo.state.balance_usd)
+
+
+# סשן "ריצת בוט" לשידור: מרגע הפעלת semi/auto עד כיבוי — זמן ריצה, PnL מצטבר, win rate
+_bot_run_started_ts: Optional[float] = None
+_bot_run_equity_baseline_usd: Optional[float] = None
+
+
+def _start_bot_run_session() -> None:
+    global _bot_run_started_ts, _bot_run_equity_baseline_usd
+    _bot_run_started_ts = time.time()
+    try:
+        _bot_run_equity_baseline_usd = float(demo.equity_snapshot_usd())
+    except Exception:
+        _bot_run_equity_baseline_usd = float(demo.state.balance_usd)
+
+
+def _clear_bot_run_session() -> None:
+    global _bot_run_started_ts, _bot_run_equity_baseline_usd
+    _bot_run_started_ts = None
+    _bot_run_equity_baseline_usd = None
+
+
+def _ensure_bot_run_session_if_active() -> None:
+    """אם semi/auto פעיל אבל אין סשן (מנוע הופעל לפני העדכון, או מעבר מצב שלא נרשם) — מתחילים סשן עכשיו."""
+    if runner.rt.mode == "off":
+        return
+    global _bot_run_started_ts
+    if _bot_run_started_ts is None:
+        _start_bot_run_session()
+
+
+def _bot_run_win_rate_stats() -> dict[str, Any]:
+    """אחוז ניצחונות ביציאות ממומשות מתחילת סשן הבוט (כמו חישוב win rate בלשונית סטטיסטיקה)."""
+    t0 = _bot_run_started_ts
+    if t0 is None:
+        return {
+            "bot_run_win_rate_pct": None,
+            "bot_run_exit_trades_n": 0,
+            "bot_run_wins_n": 0,
+        }
+    t0f = float(t0)
+    exits: list[dict[str, Any]] = []
+    for t in demo.state.trades or []:
+        if float(t.get("ts") or 0) < t0f:
+            continue
+        rp = t.get("realized_pnl")
+        if rp is None:
+            continue
+        try:
+            float(rp)
+        except (TypeError, ValueError):
+            continue
+        typ = t.get("type") or ""
+        styp = str(typ)
+        if (
+            typ == "EXPIRE_0"
+            or typ in ("SETTLE_WIN", "SETTLE_LOSS", "SETTLE_UNKNOWN")
+            or styp.startswith("SELL")
+        ):
+            exits.append(t)
+    n = len(exits)
+    if n == 0:
+        return {
+            "bot_run_win_rate_pct": None,
+            "bot_run_exit_trades_n": 0,
+            "bot_run_wins_n": 0,
+        }
+    wins = sum(1 for x in exits if float(x.get("realized_pnl") or 0) > 0)
+    wr = 100.0 * wins / n
+    return {
+        "bot_run_win_rate_pct": round(wr, 2),
+        "bot_run_exit_trades_n": n,
+        "bot_run_wins_n": wins,
+    }
 
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(Path(__file__).resolve().parent))).resolve()
@@ -359,19 +439,22 @@ async def market_current():
     global last_epoch_for_open, cached_open, cached_ptb_source
     if m.epoch != last_epoch_for_open:
         last_epoch_for_open = m.epoch
-        cl = await fetch_chainlink_btc_usd_polygon_latest()
-        if cl is not None:
-            cached_open = cl
-            cached_ptb_source = "chainlink_polygon"
+        # Price to Beat = מחיר בתחילת החלון — לא latestRound של האורקל (זה גרם להסטות גדולות).
+        ptb = await fetch_chainlink_btc_usd_polygon_at_window_start(m.epoch)
+        if ptb is not None:
+            cached_open = ptb
+            cached_ptb_source = "chainlink_polygon_window"
         else:
             cached_open = await fetch_open_price_at_window_start(m.epoch)
             cached_ptb_source = "binance_1m_fallback"
     note_chainlink = (
-        "ייחוס כמו ב-Polymarket: Chainlink BTC/USD (Polygon). "
-        "BTC חי במסך מהמנוע הוא Binance spot — עשוי להסטות סנטים מהאתר."
+        "ייחוס: סיבוב Chainlink BTC/USD על Polygon שעודכן עד לפתיחת החלון (קרוב לפיד האונ־צ׳יין). "
+        "באתר Polymarket מוצג לעיתים Chainlink Data Streams — עשוי להסטות סנטים/דולרים בודדים. "
+        "BTC חי במסך מהמנוע הוא Binance spot."
     )
     note_binance = (
-        "ייחוס מ-Binance (נר 1m) — Chainlink לא זמין כרגע; מחיר ב-Polymarket עלול להשתנות עד עשרות $."
+        "ייחוס מ-Binance (נר 1m בפתיחת החלון) — כשהפיד של Chainlink על Polygon לא זמין; "
+        "Polymarket רשמית מסתמך על Chainlink Streams — עלול להסטות מהאתר."
     )
     return {
         "slug": m.slug,
@@ -386,7 +469,7 @@ async def market_current():
         "seconds_left": seconds_until_window_end(m.epoch, m.window_sec),
         "price_to_beat": cached_open,
         "price_to_beat_source": cached_ptb_source,
-        "price_to_beat_note": note_chainlink if cached_ptb_source == "chainlink_polygon" else note_binance,
+        "price_to_beat_note": note_chainlink if cached_ptb_source == "chainlink_polygon_window" else note_binance,
         # מ-Gamma API — אין שם מחיר BTC מספרי; רק קישור למקור הרזולוציה
         "polymarket_resolution_source": m.resolution_source,
     }
@@ -508,7 +591,14 @@ async def market_orderbook_summary():
 async def demo_state():
     # נסמן equity תמיד — כך last_mark.unrealized_usd מתאפס מיד כשאין פוזיציות
     await demo.mark_to_market()
-    return demo.state.to_dict()
+    _ensure_bot_run_session_if_active()
+    out = demo.state.to_dict()
+    # נשלח עם state כדי שדפי שידור/OBS לא יסמכו רק על /api/strategy/config או /api/runtime
+    out["ui_runtime_equity_baseline_usd"] = float(_ui_runtime_equity_baseline_usd)
+    out["bot_run_started_ts"] = _bot_run_started_ts
+    out["bot_run_equity_baseline_usd"] = _bot_run_equity_baseline_usd
+    out.update(_bot_run_win_rate_stats())
+    return out
 
 
 class ResetBody(BaseModel):
@@ -520,6 +610,10 @@ async def demo_reset(body: ResetBody):
     demo.reset(body.balance)
     runner.sync_runtime_after_demo_positions_cleared()
     _reset_ui_runtime("demo_reset")
+    if runner.rt.mode == "off":
+        _clear_bot_run_session()
+    else:
+        _start_bot_run_session()
     append_event("demo_reset", {"balance": body.balance})
     write_strategy_snapshot(runner, demo)
     return {"ok": True}
@@ -530,6 +624,10 @@ async def demo_clear_stats():
     await demo.reset_stats_and_flatten_positions()
     runner.sync_runtime_after_demo_positions_cleared()
     _reset_ui_runtime("demo_clear_stats")
+    if runner.rt.mode == "off":
+        _clear_bot_run_session()
+    else:
+        _start_bot_run_session()
     append_event("demo_clear_stats", {})
     write_strategy_snapshot(runner, demo)
     return {"ok": True}
@@ -545,6 +643,7 @@ async def api_runtime():
         "uptime_sec": max(0.0, now - started_ts),
         "reason": _ui_runtime_reason,
         "now_ts": now,
+        "equity_baseline_usd": float(_ui_runtime_equity_baseline_usd),
     }
 
 
@@ -645,6 +744,7 @@ async def strategy_config(body: ConfigBody):
 
 @app.get("/api/strategy/config")
 async def get_strategy_config():
+    _ensure_bot_run_session_if_active()
     c = runner.rt.config
     return {
         "investment_usd": c.investment_usd,
@@ -680,10 +780,18 @@ async def get_strategy_config():
         "loss_recovery_multiplier": demo.state.loss_recovery_multiplier,
         "mode": runner.rt.mode,
         "last_status": runner.rt.last_status,
+        # מפתח אחרון מ-status() — נוח למיפוי אנגלי בדף שידור/OBS
+        "strategy_status_key": getattr(runner.rt, "_last_status_key", "") or "",
         "last_tick_ts": runner.rt.last_tick_ts,
         # זמן ריצה ל-UI (מסונכרן עם /api/runtime)
         "ui_runtime_started_ts": float(_ui_runtime_started_ts),
         "ui_runtime_uptime_sec": max(0.0, time.time() - float(_ui_runtime_started_ts)),
+        "ui_runtime_equity_baseline_usd": float(_ui_runtime_equity_baseline_usd),
+        # שידור: זמן מהכניסה הראשונה בלולאת האסטרטגיה (None עד כניסה ראשונה)
+        "strategy_first_buy_ts": runner.rt.strategy_first_buy_ts,
+        "bot_run_started_ts": _bot_run_started_ts,
+        "bot_run_equity_baseline_usd": _bot_run_equity_baseline_usd,
+        **_bot_run_win_rate_stats(),
     }
 
 
@@ -697,6 +805,11 @@ async def strategy_mode(body: ModeBody):
         raise HTTPException(400, "mode")
     prev = runner.rt.mode
     runner.rt.mode = body.mode  # type: ignore
+    if body.mode == "off":
+        runner.rt.strategy_first_buy_ts = None
+        _clear_bot_run_session()
+    elif prev == "off":
+        _start_bot_run_session()
     if body.mode == "off" and prev != "off":
         _reset_ui_runtime("strategy_mode_off")
     # כשעוברים מ-off למצב פעיל: מנקים יומן כדי שה-UI יציג "היסטוריה חדשה"

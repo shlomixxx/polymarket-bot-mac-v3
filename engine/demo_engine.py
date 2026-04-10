@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 import uuid
@@ -172,6 +173,14 @@ class DemoEngine:
             if not sid and tid in token_to_session:
                 t["session_id"] = token_to_session[tid]
         self._session_by_token = {p.token_id: token_to_session[p.token_id] for p in self.state.positions if p.token_id in token_to_session}
+
+    def equity_snapshot_usd(self) -> float:
+        """הערכת שווי נטו ל-baseline (מעדיף last_mark.equity; אחרת יתרה במזומן)."""
+        lm = self.state.last_mark or {}
+        eq = lm.get("equity")
+        if isinstance(eq, (int, float)) and math.isfinite(eq) and eq >= 0:
+            return float(eq)
+        return float(self.state.balance_usd)
 
     def save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)

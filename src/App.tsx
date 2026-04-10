@@ -31,7 +31,7 @@ type Market = {
   seconds_left: number;
   price_to_beat: number | null;
   price_to_beat_note: string;
-  /** chainlink_polygon | binance_1m_fallback — מקור ייחוס לעומת Polymarket */
+  /** chainlink_polygon_window | binance_1m_fallback — מקור ייחוס לעומת Polymarket */
   price_to_beat_source?: string;
   /** מ-Gamma API — קישור למקור הרזולוציה (אין ב-API מחיר ייחוס מספרי) */
   polymarket_resolution_source?: string | null;

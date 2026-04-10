@@ -12,6 +12,8 @@ BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
 # Chainlink BTC/USD — Polygon PoS (אותו סוג oracle ש-Polymarket מציג כ-Price to beat)
 CHAINLINK_BTC_USD_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
 LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"
+# getRoundData(uint80) — סיבוב oracle ספציפי (להיסטוריה לפי זמן)
+GET_ROUND_DATA_SELECTOR = "0x9a6fc8f5"
 POLYGON_PUBLIC_RPCS = (
     "https://polygon-bor.publicnode.com",
     "https://1rpc.io/matic",
@@ -34,11 +36,105 @@ def _decode_chainlink_latest_round_answer(hex_data: str) -> Optional[float]:
     return float(answer) / 1e8
 
 
+def _decode_v3_round_full(hex_data: str) -> Optional[tuple[int, float, int, int]]:
+    """
+    מפענח תשובת latestRoundData / getRoundData:
+    (roundId, answer_usd, startedAt, updatedAt).
+    """
+    if not hex_data or hex_data in ("0x", "0x0"):
+        return None
+    h = hex_data[2:] if hex_data.startswith("0x") else hex_data
+    try:
+        raw = bytes.fromhex(h)
+    except ValueError:
+        return None
+    if len(raw) < 128:
+        return None
+    # uint80 — בתוך מילת 32 בתים (ABI); מסכים עם מזהה מלא ל-getRoundData
+    rid = int.from_bytes(raw[0:32], "big") & ((1 << 80) - 1)
+    answer = int.from_bytes(raw[32:64], "big", signed=True)
+    started_at = int.from_bytes(raw[64:96], "big")
+    updated_at = int.from_bytes(raw[96:128], "big")
+    return rid, float(answer) / 1e8, started_at, updated_at
+
+
+def _encode_get_round_data(round_id: int) -> str:
+    """ABI: getRoundData(uint80) — הארגומנט ב־32 בתים."""
+    rid = int(round_id) & ((1 << 80) - 1)
+    return GET_ROUND_DATA_SELECTOR + rid.to_bytes(32, "big").hex()
+
+
+async def _polygon_eth_call(data: str) -> Optional[str]:
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [{"to": CHAINLINK_BTC_USD_POLYGON, "data": data}, "latest"],
+        "id": 1,
+    }
+    async with httpx.AsyncClient() as client:
+        for rpc in POLYGON_PUBLIC_RPCS:
+            try:
+                r = await client.post(rpc, json=payload, timeout=8.0)
+                r.raise_for_status()
+                return r.json().get("result")
+            except Exception:
+                continue
+    return None
+
+
+async def fetch_chainlink_btc_usd_polygon_latest_full() -> Optional[tuple[int, float, int, int]]:
+    """latestRoundData מלא — לחיפוש היסטורי."""
+    res = await _polygon_eth_call(LATEST_ROUND_DATA_SELECTOR)
+    if not res or not isinstance(res, str):
+        return None
+    return _decode_v3_round_full(res)
+
+
+async def fetch_chainlink_btc_usd_polygon_get_round(round_id: int) -> Optional[tuple[int, float, int, int]]:
+    data = _encode_get_round_data(round_id)
+    res = await _polygon_eth_call(data)
+    if not res or not isinstance(res, str):
+        return None
+    return _decode_v3_round_full(res)
+
+
+async def fetch_chainlink_btc_usd_polygon_at_window_start(window_epoch_sec: int) -> Optional[float]:
+    """
+    מחיר הייחוס לפי פיד Chainlink על Polygon בתחילת החלון — לא latestRoundData.
+
+    לוקחים את ערך הסיבוב האחרון ש־updatedAt <= זמן פתיחת החלון.
+    (מזהי סיבוב גדולים מאוד — לכן חיפוש אחורה לינארי מהאחרון, לא בינארי על כל הטווח.)
+    """
+    now = int(time.time())
+    if window_epoch_sec > now + 120:
+        return await fetch_chainlink_btc_usd_polygon_latest()
+
+    latest = await fetch_chainlink_btc_usd_polygon_latest_full()
+    if latest is None:
+        return None
+    hi_id, _ans, _st, hi_upd = latest
+    if hi_upd <= window_epoch_sec:
+        return latest[1]
+
+    rid = hi_id
+    # עד כ־15 דק׳ בין עדכוני אורקל לעיתים — אלפי סיבובים אחורה מכסים גם חלון ארוך
+    max_steps = 8000
+    for _ in range(max_steps):
+        if rid <= 0:
+            break
+        rd = await fetch_chainlink_btc_usd_polygon_get_round(rid)
+        if rd is None:
+            rid -= 1
+            continue
+        _r, ans, _st2, upd = rd
+        if upd <= window_epoch_sec:
+            return ans
+        rid -= 1
+    return None
+
+
 async def fetch_chainlink_btc_usd_polygon_latest() -> Optional[float]:
-    """
-    מחיר BTC/USD מפיד Chainlink על Polygon — קרוב למה שמוצג ב-Polymarket כ-Price to beat
-    (לעומת פתיחת נר Binance 1m שיכולה להסטות עשרות דולרים).
-    """
+    """מחיר BTC/USD אחרון מפיד Chainlink על Polygon (latestRound) — לא בהכרח Price to Beat."""
     payload = {
         "jsonrpc": "2.0",
         "method": "eth_call",
@@ -54,7 +150,7 @@ async def fetch_chainlink_btc_usd_polygon_latest() -> Optional[float]:
     async with httpx.AsyncClient() as client:
         for rpc in POLYGON_PUBLIC_RPCS:
             try:
-                r = await client.post(rpc, json=payload, timeout=12.0)
+                r = await client.post(rpc, json=payload, timeout=8.0)
                 r.raise_for_status()
                 result = r.json().get("result")
                 if not result or not isinstance(result, str):
