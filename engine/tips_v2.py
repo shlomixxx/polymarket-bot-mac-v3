@@ -1133,8 +1133,24 @@ def generate_tips_v2(
     min_samples: int = 50,
     use_guardrails: bool = True,
     current_cfg: dict[str, Any] | None = None,
+    live_trades: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     all_runs = analyze_runs(max_runs=max_runs)
+    # עסקאות חיות מ־demo_state תמיד עדכניות; קבצי trades.json בריצה מתעדכנים בתדירות נמוכה יותר.
+    # ממזגים את הניתוח החי כדי ש«ניתוח v3» יתאים ללשונית סטטיסטיקה בלי להמתין לצילום דיסק.
+    cfg_for_live = current_cfg or (all_runs[-1].strategy_config if all_runs else {}) or {}
+    if live_trades:
+        try:
+            live_st = _analyze_trades(live_trades, cfg_for_live)
+            if all_runs:
+                if all_runs[0].btc_window == live_st.btc_window:
+                    all_runs[0] = live_st
+                else:
+                    all_runs.insert(0, live_st)
+            else:
+                all_runs = [live_st]
+        except Exception:
+            pass
     if not all_runs:
         empty_window = {
             "tips": [],

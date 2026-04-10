@@ -741,7 +741,17 @@ async def strategy_tips_v2(max_runs: int = 50, min_samples: int = 50, use_guardr
         max_runs_i = 50
         min_samples_i = 50
 
-    cache_key = {"max_runs": max_runs_i, "min_samples": min_samples_i, "use_guardrails": bool(use_guardrails), "v": 2}
+    try:
+        n_demo_trades = len(demo.state.trades or [])
+    except Exception:
+        n_demo_trades = 0
+    cache_key = {
+        "max_runs": max_runs_i,
+        "min_samples": min_samples_i,
+        "use_guardrails": bool(use_guardrails),
+        "v": 2,
+        "demo_trades_n": n_demo_trades,
+    }
     now = time.time()
     if TIPS_V2_CACHE_PATH.exists():
         try:
@@ -754,11 +764,13 @@ async def strategy_tips_v2(max_runs: int = 50, min_samples: int = 50, use_guardr
     from dataclasses import asdict
 
     current_cfg = asdict(runner.rt.config)
+    live_trades = list(demo.state.trades) if demo.state.trades else []
     data = generate_tips_v2(
         max_runs=max_runs_i,
         min_samples=min_samples_i,
         use_guardrails=bool(use_guardrails),
         current_cfg=current_cfg,
+        live_trades=live_trades,
     )
     try:
         TIPS_V2_CACHE_PATH.write_text(
