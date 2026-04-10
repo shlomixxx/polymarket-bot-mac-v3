@@ -734,10 +734,21 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   const positions = demo?.positions ?? [];
   const open = positions.length > 0;
 
+  /** חתימת פוזיציה — לא מסתמך רק על open: אם יש סגירה+כניסה באותו tick, open נשאר true ואז אין צלילים. */
+  const positionSig = useMemo(() => {
+    const ps = demo?.positions ?? [];
+    if (!ps.length) return "";
+    return [...ps]
+      .map((p) => String(p.token_id ?? ""))
+      .filter(Boolean)
+      .sort()
+      .join("|");
+  }, [demo?.positions]);
+
   const demoTradesRef = useRef(demo?.trades);
   demoTradesRef.current = demo?.trades;
   const exitBannerTimerRef = useRef<number | null>(null);
-  const prevOpenRef = useRef<boolean | null>(null);
+  const prevPositionSigRef = useRef<string | null>(null);
 
   useEffect(() => {
     const clearBannerTimer = () => {
@@ -746,18 +757,18 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
         exitBannerTimerRef.current = null;
       }
     };
-    if (prevOpenRef.current === null) {
-      prevOpenRef.current = open;
+    if (prevPositionSigRef.current === null) {
+      prevPositionSigRef.current = positionSig;
       return;
     }
-    if (open && !prevOpenRef.current) {
-      clearBannerTimer();
-      setExitBanner(null);
-      if (entrySoundOn) playEntryChime();
-      prevOpenRef.current = open;
-      return;
-    }
-    if (prevOpenRef.current && !open) {
+    const prev = prevPositionSigRef.current;
+    const next = positionSig;
+    if (prev === next) return;
+
+    const wasOpen = prev !== "";
+    const isOpen = next !== "";
+
+    if (wasOpen && !isOpen) {
       clearBannerTimer();
       setExitBanner(describeStreamExit(demoTradesRef.current));
       if (entrySoundOn) playExitChime();
@@ -765,11 +776,34 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
         exitBannerTimerRef.current = null;
         setExitBanner(null);
       }, 10_000);
-      prevOpenRef.current = open;
+      prevPositionSigRef.current = next;
       return;
     }
-    prevOpenRef.current = open;
-  }, [open, entrySoundOn]);
+    if (!wasOpen && isOpen) {
+      clearBannerTimer();
+      setExitBanner(null);
+      if (entrySoundOn) playEntryChime();
+      prevPositionSigRef.current = next;
+      return;
+    }
+    if (wasOpen && isOpen && prev !== next) {
+      clearBannerTimer();
+      setExitBanner(describeStreamExit(demoTradesRef.current));
+      if (entrySoundOn) {
+        playExitChime();
+        window.setTimeout(() => {
+          if (entrySoundOn) playEntryChime();
+        }, 240);
+      }
+      exitBannerTimerRef.current = window.setTimeout(() => {
+        exitBannerTimerRef.current = null;
+        setExitBanner(null);
+      }, 10_000);
+      prevPositionSigRef.current = next;
+      return;
+    }
+    prevPositionSigRef.current = next;
+  }, [positionSig, entrySoundOn]);
 
   const agg = open ? aggregateEntry(positions) : null;
 
@@ -814,10 +848,14 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   }, [livePct]);
 
   const equityNow = useMemo(() => {
+    const bal = Number(demo?.balance_usd ?? 0);
+    const safeBal = Number.isFinite(bal) ? bal : 0;
+    /** בלי פוזיציה — לא משתמשים ב־last_mark.equity (עלול להיות stale/לא עקבי ברגע יציאה ולגרום לבזק ב־P&L since bot on). */
+    if (!open) return safeBal;
     const eq = demo?.last_mark?.equity;
     if (typeof eq === "number" && Number.isFinite(eq)) return eq;
-    return Number(demo?.balance_usd ?? 0);
-  }, [demo?.last_mark?.equity, demo?.balance_usd]);
+    return safeBal;
+  }, [open, demo?.last_mark?.equity, demo?.balance_usd]);
 
   const equityBaselineUsd = useMemo(() => pickBotRunEquityBaseline(stratCfg, demo), [stratCfg, demo]);
 
@@ -1093,8 +1131,8 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
           }
           .stream-pulse-orb {
             position: relative;
-            width: 138px;
-            height: 138px;
+            width: 164px;
+            height: 164px;
             border-radius: 50%;
             display: grid;
             place-items: center;
@@ -1414,9 +1452,18 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
             </div>
           </div>
 
-          <div style={{ flex: "0 0 auto", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
+          <div style={{ flex: "0 0 auto", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
             <div
               className="stream-pulse-orb"
+              role="img"
+              aria-label={[
+                livePct != null
+                  ? `Unrealized PnL for this market window and open trade: ${livePct >= 0 ? "+" : ""}${livePct.toFixed(2)} percent`
+                  : "Unrealized PnL for this window — no data",
+                showUsd && liveUsd != null && Number.isFinite(Number(liveUsd))
+                  ? `, ${formatUsdSigned(Number(liveUsd))} unrealized USD (this window only, not account total)`
+                  : "",
+              ].join("")}
               style={
                 {
                   "--pulse-rgb": pulseRingRgb,
@@ -1424,8 +1471,21 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
                 } as React.CSSProperties
               }
             >
-              <div style={{ position: "relative", zIndex: 1, textAlign: "center", padding: 8 }}>
-                <div style={{ fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--muted)", marginBottom: 4 }}>Live PnL %</div>
+              <div style={{ position: "relative", zIndex: 1, textAlign: "center", padding: "10px 10px 8px" }}>
+                <div
+                  style={{
+                    fontSize: 11,
+                    letterSpacing: "0.05em",
+                    textTransform: "uppercase",
+                    color: "var(--muted)",
+                    fontWeight: 600,
+                    marginBottom: 5,
+                    lineHeight: 1.25,
+                    maxWidth: 148,
+                  }}
+                >
+                  Unrealized · {windowLabel(market)} window
+                </div>
                 <div
                   style={{
                     fontSize: 28,
@@ -1437,11 +1497,50 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
                 >
                   {livePct != null ? `${livePct >= 0 ? "+" : ""}${livePct.toFixed(2)}%` : "—"}
                 </div>
+                {showUsd ? (
+                  <>
+                    <div
+                      style={{
+                        fontSize: 11,
+                        letterSpacing: "0.08em",
+                        textTransform: "uppercase",
+                        color: "var(--muted)",
+                        marginTop: 8,
+                        marginBottom: 3,
+                        fontWeight: 700,
+                      }}
+                    >
+                      Unrealized $
+                    </div>
+                    <div
+                      style={{
+                        fontSize: 9,
+                        letterSpacing: "0.04em",
+                        textTransform: "uppercase",
+                        color: "var(--muted)",
+                        marginBottom: 3,
+                        fontWeight: 600,
+                        lineHeight: 1.3,
+                        maxWidth: 148,
+                      }}
+                    >
+                      Open trade · not account total
+                    </div>
+                    <div
+                      style={{
+                        fontSize: 17,
+                        fontWeight: 800,
+                        fontVariantNumeric: "tabular-nums",
+                        color: pnlColor,
+                        lineHeight: 1.15,
+                      }}
+                    >
+                      {liveUsd != null && Number.isFinite(Number(liveUsd)) ? formatUsdSigned(Number(liveUsd)) : "—"}
+                    </div>
+                  </>
+                ) : null}
               </div>
             </div>
-            <span style={{ fontSize: 11, color: "var(--muted)", textAlign: "center", maxWidth: 140 }}>
-              Pulse speed ↑ when PnL ticks fast
-            </span>
           </div>
         </section>
       ) : null}
@@ -1481,20 +1580,26 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
           label="Avg entry"
           value={open && agg!.avgEntryCents > 0 ? `${agg!.avgEntryCents.toFixed(1)}¢` : "—"}
         />
-        <StreamBlock
-          label="Live PnL %"
-          value={livePct != null ? `${livePct >= 0 ? "+" : ""}${livePct.toFixed(2)}%` : "—"}
-          valueColor={pnlColor}
-          large
-        />
-        {showUsd && (
-          <StreamBlock
-            label="Live PnL $"
-            value={liveUsd != null && Number.isFinite(Number(liveUsd)) ? formatUsdSigned(Number(liveUsd)) : "—"}
-            valueColor={pnlColor}
-            large
-          />
-        )}
+        {!isShowcase ? (
+          <>
+            <StreamBlock
+              label="Unrealized %"
+              sub="This market window · open trade (not account P&L)"
+              value={livePct != null ? `${livePct >= 0 ? "+" : ""}${livePct.toFixed(2)}%` : "—"}
+              valueColor={pnlColor}
+              large
+            />
+            {showUsd ? (
+              <StreamBlock
+                label="Unrealized $"
+                sub="This window only — not account total"
+                value={liveUsd != null && Number.isFinite(Number(liveUsd)) ? formatUsdSigned(Number(liveUsd)) : "—"}
+                valueColor={pnlColor}
+                large
+              />
+            ) : null}
+          </>
+        ) : null}
         <StreamBlock label="Window" value={windowLabel(market)} />
         <StreamBlock label="Time left" value={market ? formatTimeLeft(market.seconds_left) : "—"} />
         <StreamBlock
@@ -1510,37 +1615,86 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
           large
           sub="Net equity vs. when you enabled semi/auto"
         />
-      </div>
-
-      <div style={{ marginBottom: fitBroadcast ? 12 : 24 }}>
-        <StreamBlock
-          label="Win rate (this bot run)"
-          value={
+        <div
+          className={winRateHot ? "stream-winrate-gold" : undefined}
+          role="status"
+          title={
             stratCfg?.mode === "off"
+              ? "Win rate (this bot run) — bot is off"
+              : winRateExits === 0 || winRatePct == null
+                ? "Win rate (this bot run) — no closed trades yet"
+                : `Win rate (this bot run): ${winRatePct!.toFixed(1)}% — ${winRateWins} / ${winRateExits} winning exits (realized)`
+          }
+          aria-label={
+            stratCfg?.mode === "off"
+              ? "Win rate this bot run: unavailable, bot off"
+              : winRateExits === 0 || winRatePct == null
+                ? "Win rate this bot run: no closed trades yet"
+                : `Win rate this bot run ${winRatePct!.toFixed(1)} percent, ${winRateWins} of ${winRateExits} winning exits`
+          }
+          style={{
+            width: "100%",
+            minWidth: 0,
+            minHeight: 138,
+            boxSizing: "border-box",
+            padding: "14px 12px",
+            borderRadius: "var(--radius-md)",
+            border: "1px solid var(--border)",
+            background: "var(--bg-elevated)",
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            textAlign: "center",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 11,
+              letterSpacing: "0.06em",
+              textTransform: "uppercase",
+              color: "var(--muted)",
+              fontWeight: 700,
+              lineHeight: 1.2,
+              marginBottom: 6,
+            }}
+          >
+            Win rate
+            <br />
+            <span style={{ fontSize: 10, letterSpacing: "0.04em", fontWeight: 600, opacity: 0.92 }}>this bot run</span>
+          </div>
+          <div
+            style={{
+              fontSize: 26,
+              fontWeight: 800,
+              fontVariantNumeric: "tabular-nums",
+              lineHeight: 1.1,
+              color:
+                stratCfg?.mode === "off" || winRateExits === 0
+                  ? "var(--muted)"
+                  : winRateHot
+                    ? "#fbbf24"
+                    : winRatePct != null && winRatePct >= 50
+                      ? "var(--up)"
+                      : "var(--down)",
+            }}
+          >
+            {stratCfg?.mode === "off"
               ? "—"
               : winRateExits === 0 || winRatePct == null
-                ? "No closed trades yet"
-                : `${winRatePct.toFixed(1)}%`
-          }
-          sub={
-            stratCfg?.mode !== "off" && winRateExits > 0 && winRatePct != null
-              ? `${winRateWins} / ${winRateExits} winning exits (realized)`
-              : stratCfg?.mode !== "off"
-                ? "TP / settle / expire — same rules as Stats tab"
-                : undefined
-          }
-          large
-          valueColor={
-            stratCfg?.mode === "off" || winRateExits === 0
-              ? "var(--muted)"
-              : winRateHot
-                ? "#fbbf24"
-                : winRatePct != null && winRatePct >= 50
-                  ? "var(--up)"
-                  : "var(--down)"
-          }
-          pulseGold={!!winRateHot}
-        />
+                ? "—"
+                : `${winRatePct.toFixed(1)}%`}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6, lineHeight: 1.3, maxWidth: 200 }}>
+            {stratCfg?.mode === "off"
+              ? "Bot off"
+              : winRateExits === 0
+                ? "No exits yet"
+                : winRatePct != null
+                  ? `${winRateWins} / ${winRateExits} winning exits`
+                  : "—"}
+          </div>
+        </div>
       </div>
 
       <div
