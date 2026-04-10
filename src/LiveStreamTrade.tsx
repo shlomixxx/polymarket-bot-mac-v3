@@ -1,5 +1,16 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import type { ReactNode, RefObject } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  Area,
+  CartesianGrid,
+  ComposedChart,
+  Line,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { api } from "./api";
 
 async function safeApi<T>(path: string): Promise<T | null> {
@@ -101,6 +112,28 @@ function formatBotUptime(sec: number): string {
   if (h > 0) return `${h}h ${m}m ${String(s).padStart(2, "0")}s`;
   if (m > 0) return `${m}m ${String(s).padStart(2, "0")}s`;
   return `${s}s`;
+}
+
+type PnlRow = { t: number; pct: number };
+
+function pnlSessionExtremes(rows: PnlRow[]): { maxPct: number; minPct: number; maxIdx: number; minIdx: number } | null {
+  if (!rows.length) return null;
+  let maxIdx = 0;
+  let minIdx = 0;
+  let maxPct = rows[0].pct;
+  let minPct = rows[0].pct;
+  for (let i = 1; i < rows.length; i++) {
+    const p = rows[i].pct;
+    if (p > maxPct) {
+      maxPct = p;
+      maxIdx = i;
+    }
+    if (p < minPct) {
+      minPct = p;
+      minIdx = i;
+    }
+  }
+  return { maxPct, minPct, maxIdx, minIdx };
 }
 
 type ChartIdleCopy = { headline: string; sub: string; showSpinner: boolean };
@@ -270,6 +303,231 @@ function toFiniteNumber(v: unknown): number | null {
   return null;
 }
 
+/** הודעת שידור קצרה לפי עסקת היציאה האחרונה (לפי ts). */
+function describeStreamExit(trades: DemoState["trades"]): string {
+  if (!trades?.length) return "✅ Position closed — flat until next entry.";
+  const sorted = [...trades].sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
+  const t = String(sorted[0]?.type ?? "");
+  if (t === "SELL_TP") return "🎯 Take profit hit — bot exited. Flat until next entry.";
+  if (t === "SETTLE_WIN") return "🏆 Settlement (win) — position closed. Waiting for next setup.";
+  if (t === "SETTLE_LOSS") return "📉 Settlement (loss) — position closed. Waiting for next setup.";
+  if (t === "SETTLE_UNKNOWN") return "🧾 Market settled — position closed. Waiting for next setup.";
+  if (t === "EXPIRE_0" || t.includes("EXPIRE")) return "⏱️ Position expired — flat until next entry.";
+  if (t.startsWith("SELL")) return "💨 Sell exit — flat until next entry.";
+  return "✅ Position closed — flat until next entry.";
+}
+
+/** הקשר אודיו יחיד — דפדפנים דורשים לרוב אינטראקציה לפני resume(). */
+let streamAudioCtx: AudioContext | null = null;
+
+function getStreamAudioContext(): AudioContext | null {
+  try {
+    const AC = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return null;
+    if (!streamAudioCtx || streamAudioCtx.state === "closed") {
+      streamAudioCtx = new AC();
+    }
+    return streamAudioCtx;
+  } catch {
+    return null;
+  }
+}
+
+/** קרא אחרי לחיצה/מגע (או מכפתור בדיקה) כדי לאפשר השמעה. */
+async function resumeStreamAudio(): Promise<boolean> {
+  const ctx = getStreamAudioContext();
+  if (!ctx) return false;
+  try {
+    await ctx.resume();
+    return ctx.state === "running";
+  } catch {
+    return false;
+  }
+}
+
+/** צליל קצר בכניסה לעסקה — רץ רק אחרי ש־AudioContext ב־running. */
+function playEntryChime(): void {
+  const ctx = getStreamAudioContext();
+  if (!ctx) return;
+  const run = () => {
+    if (ctx.state !== "running") return;
+    try {
+      const now = ctx.currentTime;
+      const notes: [number, number, number][] = [
+        [523.25, 0, 0.14],
+        [659.25, 0.11, 0.16],
+        [783.99, 0.24, 0.2],
+      ];
+      for (const [freq, delay, dur] of notes) {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = "sine";
+        o.frequency.value = freq;
+        o.connect(g);
+        g.connect(ctx.destination);
+        const t0 = now + delay;
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.2, t0 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        o.start(t0);
+        o.stop(t0 + dur + 0.02);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+  void ctx.resume().then(() => {
+    run();
+  });
+}
+
+/** צליל יציאה מהעסקה — ארפג׳ יורד (שונה מכניסה) כדי שזה יהיה מזוהה בקלות. */
+function playExitChime(): void {
+  const ctx = getStreamAudioContext();
+  if (!ctx) return;
+  const run = () => {
+    if (ctx.state !== "running") return;
+    try {
+      const now = ctx.currentTime;
+      const notes: [number, number, number][] = [
+        [783.99, 0, 0.12],
+        [659.25, 0.09, 0.13],
+        [523.25, 0.2, 0.15],
+        [392.0, 0.34, 0.18],
+      ];
+      for (const [freq, delay, dur] of notes) {
+        const o = ctx.createOscillator();
+        const g = ctx.createGain();
+        o.type = "triangle";
+        o.frequency.value = freq;
+        o.connect(g);
+        g.connect(ctx.destination);
+        const t0 = now + delay;
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.14, t0 + 0.025);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        o.start(t0);
+        o.stop(t0 + dur + 0.02);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+  void ctx.resume().then(() => {
+    run();
+  });
+}
+
+type StreamMood = {
+  label: string;
+  hint: string;
+  variant: "hunt" | "trade" | "cool" | "gold" | "freeze" | "standby";
+};
+
+/** מצב גדול לשידור — מסונכן עם לוגיקת idle של הגרף. */
+function resolveStreamMood(p: {
+  mode?: string;
+  open: boolean;
+  pending: { action?: string } | null;
+  statusKey: string;
+  secondsLeft: number | undefined;
+  minMinutesForEntry: number;
+  freezeLastMinutes: number;
+  intermediateBlock: boolean;
+  sidePreference?: string;
+}): StreamMood {
+  if (p.mode === "off") {
+    return { label: "STANDBY", hint: "Bot off — enable semi/auto to run", variant: "standby" };
+  }
+  if (p.open) {
+    return { label: "IN TRADE", hint: "Live position — risk on", variant: "trade" };
+  }
+  if (p.pending?.action === "buy") {
+    return { label: "YOUR MOVE", hint: "Entry ready — approve to go live", variant: "gold" };
+  }
+  if (p.pending?.action === "hedge") {
+    return { label: "HEDGE READY", hint: "Approve to balance the book", variant: "gold" };
+  }
+  const key = p.statusKey || "";
+  const sl = p.secondsLeft;
+  const minLeft = typeof sl === "number" && Number.isFinite(sl) ? sl / 60 : null;
+  const fr = p.freezeLastMinutes;
+  const mm = p.minMinutesForEntry;
+
+  if (key === "freeze" || (minLeft != null && minLeft <= fr + 1e-6)) {
+    return { label: "FINAL STRETCH", hint: "Last minutes of this window", variant: "freeze" };
+  }
+  if (key === "intermediate" || (p.intermediateBlock && minLeft != null && minLeft < mm && minLeft > fr)) {
+    return { label: "HUNTING", hint: "A+ setups only — no junk entries", variant: "hunt" };
+  }
+  if (key === "reenter_cooldown") {
+    return { label: "BREATHING", hint: "Cooldown after a win", variant: "cool" };
+  }
+  if (key === "reenter_disabled") {
+    return { label: "RESET", hint: "Waiting for a fresh window", variant: "cool" };
+  }
+  if (key.startsWith("book_missing")) {
+    return { label: "SYNCING", hint: "Order book loading", variant: "cool" };
+  }
+  if (key.startsWith("limit_")) {
+    return { label: "PAUSED", hint: "Safety guardrail tripped", variant: "freeze" };
+  }
+  if (key === "hedge_book_missing" || key === "hedge_exchange_min") {
+    return { label: "HEDGE SETUP", hint: "Lining up the hedge", variant: "gold" };
+  }
+  if (p.sidePreference === "signal") {
+    return { label: "HUNTING", hint: "Signal mode — stalking Up vs Down", variant: "hunt" };
+  }
+  return { label: "HUNTING", hint: "Scanning for the next edge", variant: "hunt" };
+}
+
+function streamMoodAccent(v: StreamMood["variant"]): { border: string; color: string; bg: string; shadow: string } {
+  switch (v) {
+    case "trade":
+      return {
+        border: "rgba(52, 211, 153, 0.55)",
+        color: "#6ee7b7",
+        bg: "linear-gradient(145deg, rgba(52, 211, 153, 0.14), rgba(15, 23, 42, 0.92))",
+        shadow: "0 0 44px rgba(52, 211, 153, 0.28)",
+      };
+    case "hunt":
+      return {
+        border: "rgba(129, 140, 248, 0.5)",
+        color: "#a5b4fc",
+        bg: "linear-gradient(145deg, rgba(99, 102, 241, 0.14), rgba(15, 23, 42, 0.92))",
+        shadow: "0 0 36px rgba(129, 140, 248, 0.22)",
+      };
+    case "gold":
+      return {
+        border: "rgba(251, 191, 36, 0.55)",
+        color: "#fbbf24",
+        bg: "linear-gradient(145deg, rgba(251, 191, 36, 0.12), rgba(15, 23, 42, 0.92))",
+        shadow: "0 0 40px rgba(251, 191, 36, 0.3)",
+      };
+    case "freeze":
+      return {
+        border: "rgba(251, 146, 60, 0.5)",
+        color: "#fb923c",
+        bg: "linear-gradient(145deg, rgba(251, 146, 60, 0.12), rgba(15, 23, 42, 0.92))",
+        shadow: "0 0 32px rgba(251, 146, 60, 0.22)",
+      };
+    case "standby":
+      return {
+        border: "rgba(148, 163, 184, 0.4)",
+        color: "var(--muted)",
+        bg: "var(--bg-elevated)",
+        shadow: "none",
+      };
+    default:
+      return {
+        border: "rgba(148, 163, 184, 0.45)",
+        color: "var(--text-secondary)",
+        bg: "linear-gradient(145deg, rgba(52, 211, 153, 0.06), rgba(15, 23, 42, 0.9))",
+        shadow: "0 0 24px rgba(52, 211, 153, 0.12)",
+      };
+  }
+}
+
 /** Baseline equity ל-PnL בשידור: קודם bot_run, אחרת ui_runtime (מצב לא off). */
 function pickBotRunEquityBaseline(cfg: StrategyConfigSlice | null, demo: DemoState | null): number | null {
   const br = toFiniteNumber(cfg?.bot_run_equity_baseline_usd ?? demo?.bot_run_equity_baseline_usd);
@@ -295,7 +553,33 @@ function aggregateEntry(positions: NonNullable<DemoState["positions"]>) {
   };
 }
 
-export default function LiveStreamTrade() {
+export type StreamViewerLayout = "classic" | "showcase";
+
+/** עטיפה לשידור: התוכן מוקטן ב־scale כדי להיכנס ל־100dvh בלי גלילה (מופעל עם ?fit=1). */
+function BroadcastFit(props: {
+  enabled: boolean;
+  parentRef: RefObject<HTMLDivElement>;
+  contentRef: RefObject<HTMLDivElement>;
+  children: ReactNode;
+}) {
+  const { enabled, parentRef, contentRef, children } = props;
+  if (!enabled) return <>{children}</>;
+  return (
+    <div
+      ref={parentRef}
+      style={{ flex: 1, minHeight: 0, overflow: "hidden", position: "relative", width: "100%" }}
+    >
+      <div
+        ref={contentRef}
+        style={{ position: "absolute", top: 0, left: 0, right: 0, width: "100%", transformOrigin: "top center" }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+export default function LiveStreamTrade({ layout = "classic" }: { layout?: StreamViewerLayout }) {
   const [market, setMarket] = useState<Market | null>(null);
   const [demo, setDemo] = useState<DemoState | null>(null);
   const [stratCfg, setStratCfg] = useState<StrategyConfigSlice | null>(null);
@@ -303,11 +587,40 @@ export default function LiveStreamTrade() {
   const [orderbook, setOrderbook] = useState<OrderbookSummary | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [clock, setClock] = useState(0);
+  const [exitBanner, setExitBanner] = useState<string | null>(null);
   const [showUsd, setShowUsd] = useState(() =>
     typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("usd") !== "0" : true
   );
+  const [entrySoundOn, setEntrySoundOn] = useState(() =>
+    typeof window !== "undefined" ? localStorage.getItem("streamEntrySound") !== "0" : true
+  );
+  const [pnlTickDelta, setPnlTickDelta] = useState(0);
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
+  const prevLivePctRef = useRef<number | null>(null);
+
+  /** ניסיון ראשון (למשל Electron עם autoplayPolicy) — אחרת נדרשת מחווה. */
+  useEffect(() => {
+    void resumeStreamAudio().then((ok) => {
+      if (ok) setAudioUnlocked(true);
+    });
+  }, []);
+
+  /** דפדפנים רגילים חוסמים אודיו עד מחוות — פותחים את AudioContext בלחיצה ראשונה. */
+  useEffect(() => {
+    const unlock = () => {
+      void resumeStreamAudio().then((ok) => {
+        if (ok) setAudioUnlocked(true);
+      });
+    };
+    window.addEventListener("pointerdown", unlock, { once: true, capture: true });
+    return () => window.removeEventListener("pointerdown", unlock, { capture: true });
+  }, []);
+
+  /** מונע יישום snapshot ישן כש־refresh נקרא שוב לפני שהבקשה הקודמת הסתיימה (גורם לקפיצות PnL / equity). */
+  const refreshGeneration = useRef(0);
 
   const refresh = useCallback(async () => {
+    const gen = ++refreshGeneration.current;
     try {
       setErr(null);
       const [m, st, cfg, pend, ob] = await Promise.all([
@@ -317,25 +630,95 @@ export default function LiveStreamTrade() {
         api<{ pending: { action?: string } | null }>("/api/strategy/pending"),
         safeApi<OrderbookSummary>("/api/market/orderbook-summary"),
       ]);
+      if (gen !== refreshGeneration.current) return;
       setMarket(m);
       setDemo(st);
       setStratCfg(cfg);
       setPendingApproval(pend?.pending ?? null);
       setOrderbook(ob);
     } catch (e) {
+      if (gen !== refreshGeneration.current) return;
       setErr(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
+  const fitBroadcast = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    const q = new URLSearchParams(window.location.search);
+    return q.get("fit") === "1" || q.get("broadcast") === "1";
+  }, []);
+
+  const broadcastParentRef = useRef<HTMLDivElement>(null);
+  const broadcastContentRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!fitBroadcast) return;
+    const html = document.documentElement;
+    const body = document.body;
+    const root = document.getElementById("root");
+    const prev = {
+      htmlOverflow: html.style.overflow,
+      bodyOverflow: body.style.overflow,
+      htmlHeight: html.style.height,
+      bodyMinHeight: body.style.minHeight,
+      rootHeight: root?.style.height ?? "",
+      rootOverflow: root?.style.overflow ?? "",
+    };
+    html.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+    html.style.height = "100%";
+    body.style.minHeight = "100%";
+    if (root) {
+      root.style.height = "100%";
+      root.style.overflow = "hidden";
+    }
+    return () => {
+      html.style.overflow = prev.htmlOverflow;
+      body.style.overflow = prev.bodyOverflow;
+      html.style.height = prev.htmlHeight;
+      body.style.minHeight = prev.bodyMinHeight;
+      if (root) {
+        root.style.height = prev.rootHeight;
+        root.style.overflow = prev.rootOverflow;
+      }
+    };
+  }, [fitBroadcast]);
+
+  useLayoutEffect(() => {
+    if (!fitBroadcast) return;
+    const parent = broadcastParentRef.current;
+    const content = broadcastContentRef.current;
+    if (!parent || !content) return;
+    const update = () => {
+      const ph = parent.clientHeight;
+      if (ph < 4) return;
+      const ch = content.scrollHeight;
+      if (ch < 1) return;
+      const s = Math.min(1, (ph * 0.992) / ch);
+      content.style.transform = s >= 0.998 ? "none" : `scale(${s})`;
+      content.style.transformOrigin = "top center";
+    };
+    update();
+    const ro = new ResizeObserver(() => requestAnimationFrame(update));
+    ro.observe(parent);
+    ro.observe(content);
+    window.addEventListener("resize", update);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", update);
+    };
+  }, [fitBroadcast]);
+
   useEffect(() => {
     document.documentElement.lang = "en";
     document.documentElement.dir = "ltr";
-    document.title = "Live trade — stream";
+    const base = layout === "showcase" ? "Live trade — viewer showcase" : "Live trade — stream";
+    document.title = fitBroadcast ? `${base} (fit)` : base;
     return () => {
       document.documentElement.lang = "he";
       document.documentElement.dir = "rtl";
     };
-  }, []);
+  }, [layout, fitBroadcast]);
 
   useEffect(() => {
     refresh();
@@ -350,6 +733,44 @@ export default function LiveStreamTrade() {
 
   const positions = demo?.positions ?? [];
   const open = positions.length > 0;
+
+  const demoTradesRef = useRef(demo?.trades);
+  demoTradesRef.current = demo?.trades;
+  const exitBannerTimerRef = useRef<number | null>(null);
+  const prevOpenRef = useRef<boolean | null>(null);
+
+  useEffect(() => {
+    const clearBannerTimer = () => {
+      if (exitBannerTimerRef.current != null) {
+        window.clearTimeout(exitBannerTimerRef.current);
+        exitBannerTimerRef.current = null;
+      }
+    };
+    if (prevOpenRef.current === null) {
+      prevOpenRef.current = open;
+      return;
+    }
+    if (open && !prevOpenRef.current) {
+      clearBannerTimer();
+      setExitBanner(null);
+      if (entrySoundOn) playEntryChime();
+      prevOpenRef.current = open;
+      return;
+    }
+    if (prevOpenRef.current && !open) {
+      clearBannerTimer();
+      setExitBanner(describeStreamExit(demoTradesRef.current));
+      if (entrySoundOn) playExitChime();
+      exitBannerTimerRef.current = window.setTimeout(() => {
+        exitBannerTimerRef.current = null;
+        setExitBanner(null);
+      }, 10_000);
+      prevOpenRef.current = open;
+      return;
+    }
+    prevOpenRef.current = open;
+  }, [open, entrySoundOn]);
+
   const agg = open ? aggregateEntry(positions) : null;
 
   const leg = useMemo(() => {
@@ -380,6 +801,17 @@ export default function LiveStreamTrade() {
   }, [open, positions.length, leg, demo?.last_mark?.unrealized_usd, totalCostUsd]);
 
   const liveUsd = open && typeof demo?.last_mark?.unrealized_usd === "number" ? demo.last_mark.unrealized_usd : null;
+
+  useEffect(() => {
+    if (livePct == null) {
+      prevLivePctRef.current = null;
+      return;
+    }
+    const prev = prevLivePctRef.current;
+    prevLivePctRef.current = livePct;
+    if (prev == null) return;
+    setPnlTickDelta(Math.abs(livePct - prev));
+  }, [livePct]);
 
   const equityNow = useMemo(() => {
     const eq = demo?.last_mark?.equity;
@@ -412,21 +844,104 @@ export default function LiveStreamTrade() {
   const winRateWins = stratCfg?.bot_run_wins_n ?? demo?.bot_run_wins_n ?? 0;
   const winRateHot = winRatePct != null && winRatePct > 90;
 
+  const streamMood = useMemo(
+    () =>
+      resolveStreamMood({
+        mode: stratCfg?.mode,
+        open,
+        pending: pendingApproval,
+        statusKey: stratCfg?.strategy_status_key ?? "",
+        secondsLeft: market?.seconds_left,
+        minMinutesForEntry: Number(stratCfg?.min_minutes_for_entry ?? 3),
+        freezeLastMinutes: Number(stratCfg?.freeze_last_minutes ?? 1),
+        intermediateBlock: !!stratCfg?.intermediate_block_new_entries,
+        sidePreference: stratCfg?.side_preference,
+      }),
+    [
+      stratCfg?.mode,
+      stratCfg?.strategy_status_key,
+      stratCfg?.min_minutes_for_entry,
+      stratCfg?.freeze_last_minutes,
+      stratCfg?.intermediate_block_new_entries,
+      stratCfg?.side_preference,
+      open,
+      pendingApproval,
+      market?.seconds_left,
+    ]
+  );
+
+  const windowTotalSec = useMemo(() => {
+    if (!market) return 300;
+    if (typeof market.window_sec === "number" && market.window_sec > 0) return market.window_sec;
+    if (market.btc_window === "15m") return 900;
+    return 300;
+  }, [market]);
+
+  const windowProgressPct = useMemo(() => {
+    void clock;
+    if (!market) return 0;
+    const s = Math.max(0, market.seconds_left);
+    return windowTotalSec > 0 ? Math.min(100, (s / windowTotalSec) * 100) : 0;
+  }, [market, windowTotalSec, clock]);
+
+  const streamPulseSec = useMemo(() => {
+    if (!open || livePct == null) return 3.15;
+    return Math.max(0.72, 3.55 - Math.min(pnlTickDelta * 6.5, 2.88));
+  }, [open, livePct, pnlTickDelta]);
+
+  const pulseRingRgb =
+    livePct == null ? "148, 163, 184" : livePct >= 0 ? "52, 211, 153" : "251, 113, 133";
+
+  const showHotStreak = stratCfg?.mode !== "off" && winRateExits >= 5 && winRatePct != null && winRatePct >= 72;
+
+  const moodStyle = useMemo(() => streamMoodAccent(streamMood.variant), [streamMood.variant]);
+
   const runPnlColor =
     runPnlUsd == null ? "var(--muted)" : runPnlUsd >= 0 ? "var(--up)" : "var(--down)";
 
-  const chartRows = useMemo(() => {
-    const path = leg?.pnl_path;
+  const [stablePnlPath, setStablePnlPath] = useState<{ ts: number; upnl_pct: number }[] | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setStablePnlPath(null);
+      return;
+    }
+    const next = leg?.pnl_path;
+    if (!next?.length) return;
+
+    setStablePnlPath((prev) => {
+      if (!prev?.length) return next;
+      const prevLast = prev[prev.length - 1];
+      const nextLast = next[next.length - 1];
+      if (prev.length === next.length && prevLast?.ts === nextLast?.ts) return prev;
+      return next;
+    });
+  }, [open, leg?.pnl_path]);
+
+  const chartRows: PnlRow[] = useMemo(() => {
+    const livePath = leg?.pnl_path;
+    const path = livePath?.length ? livePath : open ? stablePnlPath : null;
     if (!path?.length) return [];
     return path.map((p) => ({
       t: p.ts,
       pct: p.upnl_pct,
     }));
-  }, [leg?.pnl_path]);
+  }, [leg?.pnl_path, open, stablePnlPath]);
+
+  const chartExtremes = useMemo(() => pnlSessionExtremes(chartRows), [chartRows]);
+  const pnlYDomain = useMemo((): [number, number] => {
+    if (!chartRows.length || !chartExtremes) return [0, 1];
+    const { maxPct, minPct } = chartExtremes;
+    const span = Math.max(1e-6, maxPct - minPct);
+    const pad = Math.max(1, span * 0.1, 0.6);
+    return [minPct - pad, maxPct + pad];
+  }, [chartRows, chartExtremes]);
 
   const pnlColor =
     livePct == null ? "var(--muted)" : livePct >= 0 ? "var(--up)" : "var(--down)";
   const lineColor = chartRows.length ? pnlColor : "var(--muted)";
+  const chartTintHex =
+    chartRows.length === 0 ? "#64748b" : livePct != null && livePct >= 0 ? "#34d399" : "#fb7185";
 
   const chartIdleCopy = useMemo(() => {
     if (open) return null;
@@ -442,18 +957,85 @@ export default function LiveStreamTrade() {
     });
   }, [open, stratCfg, market?.seconds_left, pendingApproval]);
 
+  /** Recharts passes `key: "dot-N"` on props; custom dot functions must put it on the returned node. */
+  const renderPnlDot = useCallback(
+    (props: { cx?: number; cy?: number; index?: number; key?: string | number }) => {
+      const { cx = 0, cy = 0, index = -1, key: rechartsKey } = props;
+      const dotKey = rechartsKey != null ? String(rechartsKey) : `pnl-dot-${index}-${cx}-${cy}`;
+      const n = chartRows.length;
+      if (!chartExtremes || n < 1) return <g key={dotKey} />;
+      const { maxIdx, minIdx } = chartExtremes;
+      const last = n - 1;
+      const isLast = index === last;
+      const samePoint = maxIdx === minIdx;
+      const showPeak = !samePoint && index === maxIdx;
+      const showTrough = !samePoint && index === minIdx;
+      if (isLast) {
+        return (
+          <g key={dotKey}>
+            <circle key={`${dotKey}-ring`} cx={cx} cy={cy} r={11} fill="none" stroke={lineColor} strokeWidth={2} opacity={0.9} />
+            <circle key={`${dotKey}-core`} cx={cx} cy={cy} r={5} fill="#f8fafc" stroke={lineColor} strokeWidth={2} />
+          </g>
+        );
+      }
+      if (showPeak) {
+        const s = 7;
+        return (
+          <polygon
+            key={dotKey}
+            points={`${cx},${cy - s} ${cx - s},${cy + s * 0.55} ${cx + s},${cy + s * 0.55}`}
+            fill="#fbbf24"
+            stroke="#fffbeb"
+            strokeWidth={1.2}
+          />
+        );
+      }
+      if (showTrough) {
+        const s = 7;
+        return (
+          <polygon
+            key={dotKey}
+            points={`${cx},${cy + s} ${cx - s},${cy - s * 0.55} ${cx + s},${cy - s * 0.55}`}
+            fill="#f87171"
+            stroke="#fef2f2"
+            strokeWidth={1.2}
+          />
+        );
+      }
+      return <g key={dotKey} />;
+    },
+    [chartExtremes, chartRows.length, lineColor]
+  );
+
+  const isShowcase = layout === "showcase";
+
   return (
     <div
-      className="stream-trade-root"
+      className={`stream-trade-root ${isShowcase ? "stream-trade-root--showcase" : "stream-trade-root--classic"}${fitBroadcast ? " stream-broadcast-fit" : ""}`}
       style={{
-        minHeight: "100vh",
         boxSizing: "border-box",
-        padding: "28px 36px",
-        background: "var(--bg)",
+        ...(fitBroadcast
+          ? {
+              height: "100dvh",
+              maxHeight: "100dvh",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              padding: isShowcase ? "10px 18px 12px" : "8px 16px 10px",
+            }
+          : {
+              minHeight: "100vh",
+              padding: isShowcase ? "28px 36px 40px" : "22px 24px 36px",
+            }),
+        background: isShowcase
+          ? "radial-gradient(ellipse 900px 420px at 50% -15%, rgba(52, 211, 153, 0.09), transparent 52%), radial-gradient(ellipse 600px 380px at 100% 40%, rgba(129, 140, 248, 0.06), transparent 45%), var(--bg)"
+          : "var(--bg)",
         color: "var(--text)",
         fontFamily: "var(--font-display)",
-        maxWidth: 920,
+        maxWidth: isShowcase ? 1000 : 860,
         margin: "0 auto",
+        borderLeft: isShowcase ? "1px solid rgba(52, 211, 153, 0.18)" : "none",
+        borderRight: isShowcase ? "1px solid rgba(52, 211, 153, 0.18)" : "none",
       }}
     >
       <style>
@@ -505,9 +1087,56 @@ export default function LiveStreamTrade() {
             height: 34px;
             border-width: 2px;
           }
+          @keyframes streamPulseRing {
+            0%, 100% { transform: scale(1); opacity: 0.38; }
+            50% { transform: scale(1.07); opacity: 0.92; }
+          }
+          .stream-pulse-orb {
+            position: relative;
+            width: 138px;
+            height: 138px;
+            border-radius: 50%;
+            display: grid;
+            place-items: center;
+            flex-shrink: 0;
+          }
+          .stream-pulse-orb::before {
+            content: "";
+            position: absolute;
+            inset: -14px;
+            border-radius: 50%;
+            border: 2px solid rgba(var(--pulse-rgb), 0.52);
+            animation: streamPulseRing var(--pulse-sec, 2.8s) ease-in-out infinite;
+            pointer-events: none;
+          }
+          .stream-window-bar {
+            height: 8px;
+            border-radius: 999px;
+            background: rgba(148, 163, 184, 0.2);
+            overflow: hidden;
+            margin-top: 10px;
+          }
+          .stream-window-bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, rgba(52, 211, 153, 0.35), #34d399);
+            transition: width 0.6s ease-out;
+          }
+          .stream-broadcast-fit footer {
+            display: none;
+          }
         `}
       </style>
-      <header style={{ marginBottom: 28, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
+      <header
+        style={{
+          marginBottom: fitBroadcast ? 10 : 28,
+          flexShrink: 0,
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          gap: 16,
+        }}
+      >
         <div>
           <div
             role="status"
@@ -539,31 +1168,304 @@ export default function LiveStreamTrade() {
             >
               LIVE
             </span>
+            {!isShowcase ? (
+              <span
+                style={{
+                  fontSize: 10,
+                  fontWeight: 800,
+                  letterSpacing: "0.14em",
+                  color: "var(--muted)",
+                  padding: "4px 9px",
+                  borderRadius: 999,
+                  border: "1px solid rgba(148, 163, 184, 0.45)",
+                  background: "rgba(15, 23, 42, 0.85)",
+                }}
+              >
+                COMPACT
+              </span>
+            ) : null}
+            {isShowcase ? (
+              <span
+                title="Experimental viewer layout — compare with ?stream=1"
+                style={{
+                  fontSize: 10,
+                  fontWeight: 800,
+                  letterSpacing: "0.12em",
+                  color: "#fbbf24",
+                  padding: "4px 9px",
+                  borderRadius: 999,
+                  border: "1px solid rgba(251, 191, 36, 0.5)",
+                  background: "linear-gradient(135deg, rgba(251, 191, 36, 0.12), rgba(15, 23, 42, 0.9))",
+                  boxShadow: "0 0 14px rgba(251, 191, 36, 0.2)",
+                }}
+              >
+                VIEWER SHOWCASE
+              </span>
+            ) : null}
           </div>
-          <h1 style={{ margin: "8px 0 0", fontSize: 22, fontWeight: 600, lineHeight: 1.25 }}>{market?.title ?? "Loading…"}</h1>
+          <h1 style={{ margin: "8px 0 0", fontSize: isShowcase ? 23 : 20, fontWeight: 600, lineHeight: 1.25 }}>
+            {market?.title ?? "Loading…"}
+          </h1>
+          <p
+            style={{
+              margin: "8px 0 0",
+              fontSize: 13,
+              color: "var(--muted)",
+              fontWeight: 500,
+              maxWidth: 52 * 16,
+              lineHeight: 1.45,
+              display: fitBroadcast ? "none" : undefined,
+            }}
+          >
+            {isShowcase
+              ? "Full viewer layout — bot mood, pulse ring & market window bar."
+              : "Compact layout for OBS — stat grid, prices & chart (no hero strip)."}
+          </p>
         </div>
-        <label style={{ fontSize: 13, color: "var(--muted)", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none" }}>
-          <input type="checkbox" checked={showUsd} onChange={(e) => setShowUsd(e.target.checked)} />
-          PnL $
-        </label>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8 }}>
+          <label style={{ fontSize: 13, color: "var(--muted)", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none" }}>
+            <input type="checkbox" checked={showUsd} onChange={(e) => setShowUsd(e.target.checked)} />
+            PnL $
+          </label>
+          <label style={{ fontSize: 13, color: "var(--muted)", display: "flex", alignItems: "center", gap: 8, cursor: "pointer", userSelect: "none" }}>
+            <input
+              type="checkbox"
+              checked={entrySoundOn}
+              onChange={(e) => {
+                const on = e.target.checked;
+                setEntrySoundOn(on);
+                try {
+                  localStorage.setItem("streamEntrySound", on ? "1" : "0");
+                } catch {
+                  /* private mode */
+                }
+                if (on) {
+                  void resumeStreamAudio().then((ok) => {
+                    if (ok) setAudioUnlocked(true);
+                  });
+                }
+              }}
+            />
+            🔊 Entry & exit sounds
+          </label>
+          {entrySoundOn ? (
+            <div style={{ textAlign: "right", maxWidth: 300 }}>
+              {!audioUnlocked ? (
+                <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6, lineHeight: 1.35 }}>
+                  Click or tap anywhere on this page once — browsers block audio until you do.
+                </div>
+              ) : null}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, justifyContent: "flex-end" }}>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const ok = await resumeStreamAudio();
+                    if (ok) setAudioUnlocked(true);
+                    playEntryChime();
+                  }}
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 600,
+                    padding: "6px 12px",
+                    borderRadius: 8,
+                    background: "var(--bg-elevated)",
+                    border: "1px solid rgba(52, 211, 153, 0.5)",
+                    color: "var(--text)",
+                    cursor: "pointer",
+                  }}
+                >
+                  Test entry ▲
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const ok = await resumeStreamAudio();
+                    if (ok) setAudioUnlocked(true);
+                    playExitChime();
+                  }}
+                  style={{
+                    fontSize: 12,
+                    fontWeight: 600,
+                    padding: "6px 12px",
+                    borderRadius: 8,
+                    background: "var(--bg-elevated)",
+                    border: "1px solid rgba(251, 146, 60, 0.45)",
+                    color: "var(--text)",
+                    cursor: "pointer",
+                  }}
+                >
+                  Test exit ▼
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </div>
       </header>
 
+      <BroadcastFit enabled={fitBroadcast} parentRef={broadcastParentRef} contentRef={broadcastContentRef}>
       {err && (
         <div style={{ padding: 12, borderRadius: 8, background: "var(--down-muted)", color: "var(--text)", marginBottom: 20 }}>
           {err}
         </div>
       )}
 
+      {exitBanner ? (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            marginBottom: 20,
+            padding: "14px 18px",
+            borderRadius: 12,
+            border: "1px solid rgba(52, 211, 153, 0.55)",
+            background: "linear-gradient(135deg, rgba(52, 211, 153, 0.14), rgba(15, 23, 42, 0.96))",
+            fontSize: 16,
+            fontWeight: 650,
+            color: "var(--text)",
+            lineHeight: 1.45,
+            boxShadow: "0 0 28px rgba(52, 211, 153, 0.22), inset 0 1px 0 rgba(255,255,255,0.06)",
+          }}
+        >
+          {exitBanner}
+        </div>
+      ) : null}
+
+      {isShowcase ? (
+        <section
+          aria-label="Stream mood and session clock"
+          style={{
+            marginBottom: fitBroadcast ? 12 : 26,
+            display: "flex",
+            flexWrap: "wrap",
+            gap: fitBroadcast ? 12 : 18,
+            alignItems: "stretch",
+            justifyContent: "space-between",
+          }}
+        >
+          <div style={{ flex: "2 1 280px", minWidth: 0 }}>
+            <div
+              style={{
+                padding: "18px 20px",
+                borderRadius: 14,
+                border: `1px solid ${moodStyle.border}`,
+                background: moodStyle.bg,
+                boxShadow: moodStyle.shadow,
+              }}
+            >
+              <div style={{ fontSize: 11, letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--muted)", marginBottom: 8 }}>
+                Bot mode
+              </div>
+              <div
+                style={{
+                  fontSize: "clamp(26px, 4.5vw, 34px)",
+                  fontWeight: 900,
+                  letterSpacing: "0.08em",
+                  lineHeight: 1.1,
+                  color: moodStyle.color,
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              >
+                {streamMood.label}
+              </div>
+              <div style={{ fontSize: 14, color: "var(--text-secondary)", marginTop: 10, lineHeight: 1.45 }}>{streamMood.hint}</div>
+              {showHotStreak ? (
+                <div
+                  style={{
+                    marginTop: 12,
+                    fontSize: 13,
+                    fontWeight: 700,
+                    color: "#fbbf24",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                  }}
+                >
+                  <span aria-hidden>🔥</span>
+                  Hot streak — {winRatePct != null ? `${winRatePct.toFixed(0)}%` : "—"} win rate ({winRateWins}/{winRateExits} exits)
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div style={{ flex: "1.4 1 240px", minWidth: 0 }}>
+            <div
+              style={{
+                height: "100%",
+                minHeight: 120,
+                padding: "16px 18px",
+                borderRadius: 14,
+                border: "1px solid rgba(52, 211, 153, 0.35)",
+                background: "linear-gradient(160deg, rgba(15, 23, 42, 0.95), rgba(30, 41, 59, 0.35))",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--muted)", fontWeight: 700 }}>
+                  Market window
+                </span>
+                <span style={{ fontSize: 22, fontWeight: 800, fontVariantNumeric: "tabular-nums", color: "#6ee7b7" }}>
+                  {market ? formatTimeLeft(market.seconds_left) : "—"}
+                </span>
+              </div>
+              <div style={{ fontSize: 13, color: "var(--text-secondary)", marginTop: 6 }}>Time left until this round resets</div>
+              <div className="stream-window-bar" aria-hidden>
+                <div className="stream-window-bar-fill" style={{ width: `${windowProgressPct}%` }} />
+              </div>
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 8 }}>{windowLabel(market)} · bar = time remaining in window</div>
+            </div>
+          </div>
+
+          <div style={{ flex: "0 0 auto", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            <div
+              className="stream-pulse-orb"
+              style={
+                {
+                  "--pulse-rgb": pulseRingRgb,
+                  "--pulse-sec": `${streamPulseSec}s`,
+                } as React.CSSProperties
+              }
+            >
+              <div style={{ position: "relative", zIndex: 1, textAlign: "center", padding: 8 }}>
+                <div style={{ fontSize: 11, letterSpacing: "0.08em", textTransform: "uppercase", color: "var(--muted)", marginBottom: 4 }}>Live PnL %</div>
+                <div
+                  style={{
+                    fontSize: 28,
+                    fontWeight: 900,
+                    fontVariantNumeric: "tabular-nums",
+                    color: livePct == null ? "var(--muted)" : livePct >= 0 ? "var(--up)" : "var(--down)",
+                    lineHeight: 1.1,
+                  }}
+                >
+                  {livePct != null ? `${livePct >= 0 ? "+" : ""}${livePct.toFixed(2)}%` : "—"}
+                </div>
+              </div>
+            </div>
+            <span style={{ fontSize: 11, color: "var(--muted)", textAlign: "center", maxWidth: 140 }}>
+              Pulse speed ↑ when PnL ticks fast
+            </span>
+          </div>
+        </section>
+      ) : null}
+
       <div
         style={{
           display: "grid",
           gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))",
-          gap: 20,
-          marginBottom: 28,
+          gap: fitBroadcast ? 12 : 20,
+          marginBottom: fitBroadcast ? 14 : 28,
         }}
       >
-        <StreamBlock label="Trade status" value={open ? "Open" : "Exited"} highlight={open} />
-        <StreamBlock label="Direction" value={open ? agg!.side : "—"} dirUp={open && agg!.side === "Up"} />
+        <StreamBlock
+          label="Trade status"
+          value={open ? "In trade" : "Flat"}
+          sub={open ? `${agg!.side} — live position (TP not hit yet)` : "No open position — between trades"}
+          highlight={open}
+        />
+        <StreamBlock
+          label="Direction"
+          value={open ? agg!.side : "—"}
+          sub={open ? "Contract side" : "No side (flat)"}
+          dirUp={open && agg!.side === "Up"}
+        />
         <StreamBlock
           label="Bot runtime"
           value={
@@ -610,7 +1512,7 @@ export default function LiveStreamTrade() {
         />
       </div>
 
-      <div style={{ marginBottom: 24 }}>
+      <div style={{ marginBottom: fitBroadcast ? 12 : 24 }}>
         <StreamBlock
           label="Win rate (this bot run)"
           value={
@@ -642,24 +1544,82 @@ export default function LiveStreamTrade() {
       </div>
 
       <div
+        role="group"
+        aria-label={open ? "Market mid prices (in trade)" : "Market mid prices — no position"}
         style={{
           display: "flex",
           flexWrap: "wrap",
-          gap: 16,
-          marginBottom: 28,
+          gap: fitBroadcast ? 10 : 16,
+          marginBottom: fitBroadcast ? 12 : 28,
           justifyContent: "center",
           alignItems: "stretch",
         }}
       >
-        <LiveCentsPill label="Up" mid={orderbook?.up?.mid ?? null} accent="up" />
-        <LiveCentsPill label="Down" mid={orderbook?.down?.mid ?? null} accent="down" />
+        <LiveCentsPill label="Up" mid={orderbook?.up?.mid ?? null} accent="up" flatMarket={!open} />
+        <LiveCentsPill label="Down" mid={orderbook?.down?.mid ?? null} accent="down" flatMarket={!open} />
       </div>
 
       <section>
-        <div style={{ fontSize: 13, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--muted)", marginBottom: 12 }}>
-          PnL % vs. cost (session)
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            alignItems: "flex-end",
+            justifyContent: "space-between",
+            gap: 12,
+            marginBottom: 10,
+          }}
+        >
+          <div style={{ fontSize: 13, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--muted)" }}>
+            PnL % vs. cost (session)
+          </div>
+          {open && chartExtremes && chartRows.length > 0 ? (
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: 12,
+                fontSize: 13,
+                fontVariantNumeric: "tabular-nums",
+                color: "var(--text-secondary)",
+                justifyContent: "flex-end",
+              }}
+            >
+              <span>
+                <span style={{ color: "#fbbf24", fontWeight: 800, marginRight: 6 }}>▲ Peak</span>
+                {chartExtremes.maxPct.toFixed(2)}%
+              </span>
+              <span aria-hidden style={{ color: "var(--border)", userSelect: "none" }}>
+                ·
+              </span>
+              <span>
+                <span style={{ color: "#f87171", fontWeight: 800, marginRight: 6 }}>▼ Trough</span>
+                {chartExtremes.minPct.toFixed(2)}%
+              </span>
+              <span aria-hidden style={{ color: "var(--border)", userSelect: "none" }}>
+                ·
+              </span>
+              <span>
+                <span style={{ color: lineColor, fontWeight: 800, marginRight: 6 }}>● Now</span>
+                {chartRows[chartRows.length - 1].pct.toFixed(2)}%
+              </span>
+              {chartRows.length > 1 ? (
+                <span style={{ color: "var(--muted)", fontSize: 12 }}>
+                  swing {Math.abs(chartExtremes.maxPct - chartExtremes.minPct).toFixed(2)}%
+                </span>
+              ) : null}
+            </div>
+          ) : null}
         </div>
-        <div style={{ width: "100%", height: 260, background: "var(--card)", borderRadius: "var(--radius-md)", border: "1px solid var(--border)" }}>
+        <div
+          style={{
+            width: "100%",
+            height: fitBroadcast ? (isShowcase ? 240 : 200) : isShowcase ? 320 : 260,
+            background: "var(--card)",
+            borderRadius: "var(--radius-md)",
+            border: `1px solid ${isShowcase ? "rgba(52, 211, 153, 0.22)" : "var(--border)"}`,
+          }}
+        >
           {!open ? (
             <div style={{ height: "100%", color: "var(--text-secondary)" }}>
               {chartIdleCopy ? <ChartIdlePanel copy={chartIdleCopy} /> : null}
@@ -682,7 +1642,15 @@ export default function LiveStreamTrade() {
             </div>
           ) : (
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={chartRows} margin={{ top: 16, right: 16, bottom: 8, left: 8 }}>
+              <ComposedChart data={chartRows} margin={{ top: 10, right: 8, bottom: 6, left: 4 }}>
+                <defs>
+                  <linearGradient id="pnlGradientStream" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor={chartTintHex} stopOpacity={0.55} />
+                    <stop offset="50%" stopColor={chartTintHex} stopOpacity={0.14} />
+                    <stop offset="100%" stopColor={chartTintHex} stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="var(--border)" strokeOpacity={0.5} strokeDasharray="3 6" vertical={false} />
                 <XAxis
                   dataKey="t"
                   type="number"
@@ -699,10 +1667,11 @@ export default function LiveStreamTrade() {
                 />
                 <YAxis
                   dataKey="pct"
-                  domain={["auto", "auto"]}
+                  domain={pnlYDomain}
                   tick={{ fill: "var(--muted)", fontSize: 11 }}
-                  tickFormatter={(v) => `${v}%`}
-                  width={52}
+                  tickFormatter={(v) => `${Number(v).toFixed(1)}%`}
+                  width={56}
+                  tickCount={7}
                 />
                 <Tooltip
                   contentStyle={{
@@ -711,6 +1680,7 @@ export default function LiveStreamTrade() {
                     borderRadius: 8,
                     fontSize: 13,
                   }}
+                  cursor={{ stroke: "rgba(248, 250, 252, 0.35)", strokeWidth: 1 }}
                   labelFormatter={(v) =>
                     new Date(Number(v) * 1000).toLocaleString("en-US", {
                       hour: "2-digit",
@@ -722,23 +1692,51 @@ export default function LiveStreamTrade() {
                   formatter={(value: number) => [`${Number(value).toFixed(2)}%`, "PnL %"]}
                 />
                 <ReferenceLine y={0} stroke="var(--border-strong)" strokeDasharray="4 4" />
-                <Line type="monotone" dataKey="pct" stroke={lineColor} strokeWidth={2} dot={false} isAnimationActive={false} />
-              </LineChart>
+                {chartExtremes && chartRows.length > 1 && chartExtremes.maxPct !== chartExtremes.minPct ? (
+                  <>
+                    <ReferenceLine
+                      y={chartExtremes.maxPct}
+                      stroke="#fbbf24"
+                      strokeDasharray="5 5"
+                      strokeOpacity={0.6}
+                    />
+                    <ReferenceLine
+                      y={chartExtremes.minPct}
+                      stroke="#f87171"
+                      strokeDasharray="5 5"
+                      strokeOpacity={0.6}
+                    />
+                  </>
+                ) : null}
+                <Area type="monotone" dataKey="pct" stroke="none" fill="url(#pnlGradientStream)" isAnimationActive={false} />
+                <Line
+                  type="monotone"
+                  dataKey="pct"
+                  stroke={lineColor}
+                  strokeWidth={2.5}
+                  dot={renderPnlDot}
+                  isAnimationActive={false}
+                  activeDot={{ r: 5, strokeWidth: 0, fill: lineColor }}
+                />
+              </ComposedChart>
             </ResponsiveContainer>
           )}
         </div>
       </section>
 
       <footer style={{ marginTop: 24, fontSize: 12, color: "var(--muted)" }}>
-        Add <code style={{ color: "var(--accent-bright)" }}>?stream=1</code> to this app URL for OBS. Hide dollar PnL with{" "}
+        <strong style={{ color: "var(--text-secondary)" }}>Compact</strong> (<code style={{ color: "var(--accent-bright)" }}>?stream=1</code>): stat grid + prices + chart — no mood/pulse strip.{" "}
+        <strong style={{ color: "var(--text-secondary)" }}>Showcase</strong> (<code style={{ color: "var(--accent-bright)" }}>?stream=2</code>,{" "}
+        <code style={{ color: "var(--accent-bright)" }}>&layout=showcase</code>, <code style={{ color: "var(--accent-bright)" }}>/stream/showcase</code>): full hero (mood, pulse, window bar). Hide $:{" "}
         <code style={{ color: "var(--accent-bright)" }}>&usd=0</code>.
       </footer>
+      </BroadcastFit>
     </div>
   );
 }
 
-function LiveCentsPill(props: { label: string; mid: number | null; accent: "up" | "down" }) {
-  const { label, mid, accent } = props;
+function LiveCentsPill(props: { label: string; mid: number | null; accent: "up" | "down"; flatMarket?: boolean }) {
+  const { label, mid, accent, flatMarket } = props;
   const isUp = accent === "up";
   const glow = isUp
     ? "0 0 32px rgba(52, 211, 153, 0.65), 0 0 64px rgba(16, 185, 129, 0.28)"
@@ -759,19 +1757,34 @@ function LiveCentsPill(props: { label: string; mid: number | null; accent: "up" 
         border,
         boxShadow: `${glow}, inset 0 1px 0 rgba(255,255,255,0.06)`,
         textAlign: "center",
+        opacity: flatMarket ? 0.52 : 1,
+        filter: flatMarket ? "grayscale(0.25)" : undefined,
+        transition: "opacity 0.35s ease, filter 0.35s ease",
       }}
     >
-      <div
-        style={{
-          fontSize: 13,
-          letterSpacing: "0.12em",
-          textTransform: "uppercase",
-          color: isUp ? "rgba(167, 243, 208, 0.95)" : "rgba(254, 202, 202, 0.95)",
-          marginBottom: 10,
-          fontWeight: 600,
-        }}
-      >
-        {label} · mid
+      <div style={{ marginBottom: 10 }}>
+        <div
+          style={{
+            fontSize: 14,
+            letterSpacing: "0.1em",
+            textTransform: "uppercase",
+            color: isUp ? "rgba(167, 243, 208, 0.98)" : "rgba(254, 202, 202, 0.98)",
+            fontWeight: 800,
+          }}
+        >
+          {label}
+        </div>
+        <div
+          style={{
+            fontSize: 11,
+            marginTop: 5,
+            fontWeight: 500,
+            letterSpacing: "0.04em",
+            color: isUp ? "rgba(167, 243, 208, 0.75)" : "rgba(254, 202, 202, 0.75)",
+          }}
+        >
+          Live mid (¢)
+        </div>
       </div>
       <div
         style={{
@@ -785,6 +1798,11 @@ function LiveCentsPill(props: { label: string; mid: number | null; accent: "up" 
       >
         {display}
       </div>
+      {flatMarket ? (
+        <div style={{ fontSize: 10, marginTop: 10, color: "var(--muted)", fontWeight: 600, letterSpacing: "0.04em" }}>
+          Market only — no open position
+        </div>
+      ) : null}
     </div>
   );
 }

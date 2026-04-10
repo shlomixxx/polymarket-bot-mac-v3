@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>סקיצה — מצב צופים (לפני מימוש)</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,800;1,9..40,400&family=Unbounded:wght@500;700;900&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --bg: #0b1020;
+        --card: #121a2f;
+        --border: rgba(148, 163, 184, 0.22);
+        --muted: #94a3b8;
+        --text: #e2e8f0;
+        --up: #4ade80;
+        --down: #fb7185;
+        --gold: #fbbf24;
+        --pulse: rgba(52, 211, 153, 0.45);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: radial-gradient(1200px 800px at 20% -10%, rgba(52, 211, 153, 0.08), transparent 55%),
+          radial-gradient(900px 600px at 100% 30%, rgba(251, 113, 133, 0.06), transparent 50%), var(--bg);
+        color: var(--text);
+        font-family: "DM Sans", system-ui, sans-serif;
+        padding: 28px 20px 48px;
+        line-height: 1.5;
+      }
+      .wrap {
+        max-width: 880px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-family: Unbounded, sans-serif;
+        font-weight: 900;
+        font-size: clamp(1.35rem, 3vw, 1.75rem);
+        letter-spacing: -0.03em;
+        margin: 0 0 8px;
+      }
+      .tag {
+        display: inline-block;
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--gold);
+        border: 1px solid rgba(251, 191, 36, 0.45);
+        padding: 4px 10px;
+        border-radius: 999px;
+        margin-bottom: 20px;
+      }
+      p.lead {
+        color: var(--muted);
+        font-size: 15px;
+        max-width: 62ch;
+        margin: 0 0 28px;
+      }
+      .grid {
+        display: grid;
+        gap: 20px;
+        grid-template-columns: 1fr;
+      }
+      @media (min-width: 720px) {
+        .grid-2 {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+      .panel {
+        background: linear-gradient(160deg, rgba(30, 41, 59, 0.65), rgba(15, 23, 42, 0.92));
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 20px 22px;
+      }
+      .panel h2 {
+        font-family: Unbounded, sans-serif;
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin: 0 0 14px;
+        font-weight: 700;
+      }
+      /* Mood chips — static examples */
+      .moods {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+      .mood {
+        font-family: Unbounded, sans-serif;
+        font-weight: 800;
+        font-size: 14px;
+        letter-spacing: 0.06em;
+        padding: 10px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+      }
+      .mood.hunt {
+        color: #a5b4fc;
+        border-color: rgba(129, 140, 248, 0.5);
+        background: rgba(99, 102, 241, 0.12);
+      }
+      .mood.trade {
+        color: var(--up);
+        border-color: rgba(52, 211, 153, 0.45);
+        background: rgba(52, 211, 153, 0.1);
+        box-shadow: 0 0 28px rgba(52, 211, 153, 0.2);
+      }
+      .mood.cool {
+        color: var(--muted);
+        border-color: rgba(148, 163, 184, 0.35);
+      }
+      /* Pulse ring — demo tied to fake volatility slider */
+      .pulse-demo {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+        padding: 8px 0 4px;
+      }
+      .pulse-ring {
+        position: relative;
+        width: 160px;
+        height: 160px;
+        border-radius: 50%;
+        display: grid;
+        place-items: center;
+        --speed: 2.8s;
+        --spread: 18px;
+      }
+      .pulse-ring::before {
+        content: "";
+        position: absolute;
+        inset: calc(-1 * var(--spread));
+        border-radius: 50%;
+        border: 2px solid var(--pulse);
+        animation: pulse-ring var(--speed) ease-in-out infinite;
+        opacity: 0.85;
+      }
+      @keyframes pulse-ring {
+        0%,
+        100% {
+          transform: scale(1);
+          opacity: 0.35;
+        }
+        50% {
+          transform: scale(1.06);
+          opacity: 0.95;
+        }
+      }
+      .pulse-inner {
+        position: relative;
+        z-index: 1;
+        text-align: center;
+      }
+      .pulse-inner .big {
+        font-family: Unbounded, sans-serif;
+        font-size: 28px;
+        font-weight: 900;
+        color: var(--up);
+        font-variant-numeric: tabular-nums;
+      }
+      .pulse-inner .small {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 4px;
+      }
+      label.vol {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        width: 100%;
+        max-width: 280px;
+      }
+      input[type="range"] {
+        flex: 1;
+        accent-color: var(--up);
+      }
+      /* Window strip */
+      .window-strip {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 16px;
+        border-radius: 12px;
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(52, 211, 153, 0.25);
+        font-size: 14px;
+      }
+      .window-strip strong {
+        font-family: Unbounded, sans-serif;
+        font-weight: 800;
+        color: #6ee7b7;
+        letter-spacing: 0.04em;
+      }
+      .window-strip .time {
+        font-variant-numeric: tabular-nums;
+        font-weight: 700;
+        font-size: 18px;
+      }
+      .notes {
+        margin-top: 32px;
+        padding-top: 24px;
+        border-top: 1px solid var(--border);
+        font-size: 14px;
+        color: var(--muted);
+      }
+      .notes ul {
+        margin: 10px 0 0;
+        padding-right: 1.2em;
+      }
+      .notes li {
+        margin-bottom: 8px;
+      }
+      code {
+        font-size: 12px;
+        background: rgba(15, 23, 42, 0.9);
+        padding: 2px 6px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <span class="tag">Wireframe — לא מחובר לדאטה אמיתי</span>
+      <h1>סקיצה: “מצב צופים” ל־Live stream</h1>
+      <p class="lead">
+        שלוש שכבות שאפשר לממש בהמשך: מילת מצב גדולה (HUNTING / IN TRADE), טבעת פעימה סביב PnL חי (מהירות לפי תנודה), ופס חלון שמסביר כמה נשאר עד סיבוב
+        השוק. גרור את הסליידר כדי לדמות “עצבנות” את הפעימה.
+      </p>
+
+      <div class="grid grid-2">
+        <div class="panel">
+          <h2>מצב מילולי (דוגמאות סטטיות)</h2>
+          <div class="moods">
+            <span class="mood hunt">HUNTING</span>
+            <span class="mood trade">IN TRADE</span>
+            <span class="mood cool">BREATHING</span>
+          </div>
+          <p style="margin: 14px 0 0; font-size: 13px; color: var(--muted)">
+            ביישום: מצב אחד בולט מתחת לכותרת השוק — מתחלף לפי פוזיציה / סטטוס אסטרטגיה.
+          </p>
+        </div>
+
+        <div class="panel">
+          <h2>פס חלון (טיימר)</h2>
+          <div class="window-strip">
+            <span><strong>WINDOW</strong> · 5m BTC</span>
+            <span class="time">2:56</span>
+          </div>
+          <p style="margin: 12px 0 0; font-size: 13px; color: var(--muted)">אפשר להוסיף משפט קצר מתחת: “עד סיבוב המחיר”.</p>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top: 20px">
+        <h2>פעימה סביב PnL (דמו)</h2>
+        <div class="pulse-demo">
+          <div class="pulse-ring" id="ring" style="--speed: 2.8s">
+            <div class="pulse-inner">
+              <div class="big" id="pnlFake">+12.4%</div>
+              <div class="small">Live PnL % (מדומה)</div>
+            </div>
+          </div>
+          <label class="vol">
+            עצבנות מחיר (דמו)
+            <input type="range" id="vol" min="1" max="10" value="4" />
+          </label>
+        </div>
+        <p style="margin: 0; font-size: 13px; color: var(--muted)">
+          ביישום: המהירות יגיע מ־|Δ PnL| בזמן אמת או מטיקים אחרונים — כאן רק אנימציה.
+        </p>
+      </div>
+
+      <div class="notes">
+        <strong style="color: var(--text)">מה הלאה?</strong>
+        <ul>
+          <li>אם הסקיצה עוברת — נבחר שילוב (למשל: מצב + פעימה בלי עומס).</li>
+          <li>קבצים: <code>public/stream-concept-sketch.html</code> — פתיחה ישירה בדפדפן או דרך dev server: <code>/stream-concept-sketch.html</code></li>
+          <li>הפרדה מומלצת: שכבת “show” מעל הדשבורד הקיים, עם מתג <code>?effects=1</code> כשתרצה.</li>
+        </ul>
+      </div>
+    </div>
+    <script>
+      const vol = document.getElementById("vol");
+      const ring = document.getElementById("ring");
+      const pnl = document.getElementById("pnlFake");
+      function apply() {
+        const v = Number(vol.value);
+        const speed = Math.max(0.6, 3.6 - v * 0.28) + "s";
+        ring.style.setProperty("--speed", speed);
+        const jitter = (Math.sin(Date.now() / 400) * 0.4 + (v - 5) * 0.15).toFixed(1);
+        pnl.textContent = (Number(jitter) >= 0 ? "+" : "") + jitter + "%";
+      }
+      vol.addEventListener("input", apply);
+      setInterval(apply, 700);
+      apply();
+    </script>
+  </body>
+</html>

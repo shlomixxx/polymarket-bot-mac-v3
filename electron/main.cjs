@@ -26,6 +26,8 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
+      // מאפשר Web Audio / צלילי שידור בלי לחיצה ראשונה (בדפדפן עדיין נדרש unlock)
+      autoplayPolicy: "no-user-gesture-required",
     },
     title: "Polymarket BTC — גרסה 3",
   });
