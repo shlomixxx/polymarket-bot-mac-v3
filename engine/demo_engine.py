@@ -46,6 +46,8 @@ class DemoState:
     # שחזור אחרי הפסד (StrategyRunner) — נשמר בדמו
     loss_recovery_streak: int = 0
     loss_recovery_multiplier: float = 1.0
+    # מסמן «סשן» אחרי איפוס לוח/סטטיסטיקה — רק עסקאות מ-ts זה והלאה נכללות בתצוגה ובמיזוג חי ל-v3
+    stats_epoch_ts: Optional[float] = None
 
     def next_trade_num(self) -> int:
         """מחזיר מספר מחזור הבא (מונוטוני, לא מתאפס)."""
@@ -62,10 +64,18 @@ class DemoState:
             "trade_seq": self.trade_seq,
             "loss_recovery_streak": self.loss_recovery_streak,
             "loss_recovery_multiplier": self.loss_recovery_multiplier,
+            "stats_epoch_ts": self.stats_epoch_ts,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "DemoState":
+        _raw_se = d.get("stats_epoch_ts")
+        _se: Optional[float] = None
+        if _raw_se is not None and _raw_se != "":
+            try:
+                _se = float(_raw_se)
+            except (TypeError, ValueError):
+                _se = None
         st = cls(
             balance_usd=float(d.get("balance_usd", 10_000)),
             trades=list(d.get("trades") or []),
@@ -73,6 +83,7 @@ class DemoState:
             trade_seq=int(d.get("trade_seq", 0)),
             loss_recovery_streak=int(d.get("loss_recovery_streak", 0) or 0),
             loss_recovery_multiplier=float(d.get("loss_recovery_multiplier", 1.0) or 1.0),
+            stats_epoch_ts=_se,
         )
         # שחזור trade_seq מה-trades עצמם אם חסר (תאימות אחורה)
         if st.trade_seq == 0 and st.trades:
@@ -187,27 +198,38 @@ class DemoEngine:
         self.state_path.write_text(json.dumps(self.state.to_dict(), indent=2))
 
     def reset(self, balance: float = 10_000.0) -> None:
-        self.state = DemoState(balance_usd=balance)
+        """איפוס חשבון: יתרה חדשה, בלי פוזיציות, בלי סימוני מחיר — עסקאות ישנות נשמרות לדיסק (ניתוח v3)."""
+        preserved_trades = list(self.state.trades)
+        preserved_seq = int(self.state.trade_seq)
+        now = time.time()
+        self.state = DemoState(
+            balance_usd=balance,
+            positions=[],
+            trades=preserved_trades,
+            equity_history=[],
+            last_mark={},
+            trade_seq=preserved_seq,
+            loss_recovery_streak=0,
+            loss_recovery_multiplier=1.0,
+            stats_epoch_ts=now,
+        )
         self._position_tracking.clear()
         self._post_exit_tracking.clear()
         self._session_by_token.clear()
+        self._backfill_session_ids()
         self.save()
 
     def clear_stats(self) -> None:
-        """איפוס סטטיסטיקה: מוחק היסטוריה ועסקאות, בלי לשנות יתרה/פוזיציות."""
+        """איפוס תצוגת סטטיסטיקה בלבד — לא מוחק עסקאות (נשמרות ל-v3)."""
         self._post_exit_tracking.clear()
-        self.state.trades = []
+        self.state.stats_epoch_ts = time.time()
         self.state.equity_history = []
         self.state.last_mark = {}
         self.save()
 
     async def reset_stats_and_flatten_positions(self) -> None:
-        """איפוס סטטיסטיקה + סגירת פוזיציות פתוחות בלי ליצור עסקאות.
-        
-        המטרה: אחרי איפוס, לא תהיה תנועה של מדדים/גרף בגלל פוזיציות שנשארו פתוחות.
-        """
-        # 1) נקה היסטוריית סטטיסטיקה
-        self.state.trades = []
+        """סגירת פוזיציות פתוחות + התחלת «סשן» סטטיסטיקה חדש בלי למחוק עסקאות מהיסטוריה."""
+        # 1) נקה גרף equity בזיכרון; עסקאות נשארות ב-state לדיסק / ניתוח v3
         self.state.equity_history = []
 
         # 2) Flatten פוזיציות: נמיר אותן ליתרה לפי best bid (עם עמלה בקירוב)
@@ -239,6 +261,7 @@ class DemoEngine:
         self._position_tracking.clear()
         self._post_exit_tracking.clear()
         self._session_by_token.clear()
+        self.state.stats_epoch_ts = time.time()
         self.state.last_mark = {
             "equity": self.state.balance_usd,
             "unrealized_usd": 0.0,

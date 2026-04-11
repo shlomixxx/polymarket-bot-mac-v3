@@ -43,12 +43,22 @@ from signal_engine import CONFIDENCE_THRESHOLD, compute_signals
 from history_tracker import record_window_result, get_recent_windows, get_hourly_breakdown
 from trigger_engine import TriggerEngine, TriggerConfig
 from strategy_runner import StrategyConfig, StrategyRunner
-from tips_v2 import generate_tips_v2
+from tips_v2 import delete_run_folder_by_key, generate_tips_v2, list_run_folders_detailed
 
 demo = DemoEngine()
 runner = StrategyRunner(demo)
 trigger = TriggerEngine()
 trigger.inject(demo)
+
+
+def _live_trades_for_tips_v2() -> list[dict[str, Any]]:
+    """עסקאות חיות למיזוג בניתוח v3 — רק מהסשן הנוכחי אחרי איפוס (לא שובר היסטוריה בדיסק)."""
+    raw = list(demo.state.trades) if demo.state.trades else []
+    ts0 = getattr(demo.state, "stats_epoch_ts", None)
+    if ts0 is None:
+        return raw
+    t0 = float(ts0)
+    return [t for t in raw if float(t.get("ts") or 0) >= t0]
 
 # ── UI runtime timer (uptime) ────────────────────────────────────────────────
 # זהו "זמן ריצה" ל-UI: מהרגע שהמנוע עלה או מהאיפוס האחרון שבוצע דרך ה-API.
@@ -374,10 +384,36 @@ def _ensure_log_run_dir() -> None:
     (run_dir / "combined.log").touch()
 
 
+def _count_strategy_run_dirs() -> int:
+    """כמה תיקיות ריצה עם snapshot יש תחת DATA_ROOT (קלט ל־ניתוח v3)."""
+    root = DATA_ROOT / "logs" / "runs"
+    if not root.is_dir():
+        return 0
+    n = 0
+    try:
+        for day_dir in root.iterdir():
+            if not day_dir.is_dir():
+                continue
+            for run_dir in day_dir.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                if (run_dir / "strategy_snapshot.json").is_file():
+                    n += 1
+    except OSError:
+        return 0
+    return n
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _snapshot_task, _history_recorder_task
     _ensure_log_run_dir()
+    n_snap = _count_strategy_run_dirs()
+    print(
+        f"[polymarket-bot] DATA_ROOT={DATA_ROOT} | ריצות עם snapshot לניתוח v3: {n_snap} "
+        f"(ב-Railway: Volume בנתיב /data או DATA_ROOT זהה — אחרת הנתונים נמחקים בכל deploy)",
+        flush=True,
+    )
     _load_persisted_config()
     _load_trigger_config()
     _reset_ui_runtime("lifespan_start")
@@ -855,15 +891,20 @@ async def strategy_tips_v2(max_runs: int = 50, min_samples: int = 50, use_guardr
         min_samples_i = 50
 
     try:
-        n_demo_trades = len(demo.state.trades or [])
+        n_demo_trades = len(_live_trades_for_tips_v2())
     except Exception:
         n_demo_trades = 0
+    try:
+        sepoch = getattr(demo.state, "stats_epoch_ts", None)
+    except Exception:
+        sepoch = None
     cache_key = {
         "max_runs": max_runs_i,
         "min_samples": min_samples_i,
         "use_guardrails": bool(use_guardrails),
-        "v": 2,
+        "v": 3,
         "demo_trades_n": n_demo_trades,
+        "stats_epoch_ts": sepoch,
     }
     now = time.time()
     if TIPS_V2_CACHE_PATH.exists():
@@ -877,7 +918,7 @@ async def strategy_tips_v2(max_runs: int = 50, min_samples: int = 50, use_guardr
     from dataclasses import asdict
 
     current_cfg = asdict(runner.rt.config)
-    live_trades = list(demo.state.trades) if demo.state.trades else []
+    live_trades = _live_trades_for_tips_v2()
     data = generate_tips_v2(
         max_runs=max_runs_i,
         min_samples=min_samples_i,
@@ -893,6 +934,33 @@ async def strategy_tips_v2(max_runs: int = 50, min_samples: int = 50, use_guardr
     except Exception:
         pass
     return JSONResponse(content=data, media_type="application/json; charset=utf-8")
+
+
+class TipsV2DeleteRunBody(BaseModel):
+    run_key: str
+
+
+@app.get("/api/strategy/tips-v2/runs")
+async def strategy_tips_v2_runs(limit: int = 3000):
+    """רשימת תיקיות ריצה + קבצים — לניהול נתוני ניתוח v3 (כל הריצות עד תקרת limit)."""
+    try:
+        lim = max(1, min(int(limit), 10000))
+    except Exception:
+        lim = 3000
+    return list_run_folders_detailed(max_folders=lim)
+
+
+@app.post("/api/strategy/tips-v2/delete-run")
+async def strategy_tips_v2_delete_run(body: TipsV2DeleteRunBody):
+    """מחיקת תיקיית ריצה שלמה (תאריך/שעה) מתחת ל־DATA_ROOT/logs/runs."""
+    ok, msg = delete_run_folder_by_key(body.run_key)
+    if not ok:
+        raise HTTPException(400, msg)
+    try:
+        TIPS_V2_CACHE_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return {"ok": True, "detail": msg}
 
 
 @app.get("/api/strategy/pending")

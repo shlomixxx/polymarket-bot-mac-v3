@@ -235,7 +235,12 @@ class PriceHistoryBuffer:
 
     def add(self, price: float) -> None:
         t = time.time()
-        self.points.append((t, price))
+        # עיגול לסנטים — מפחית רעש float וקפיצות מזויפות בגרף הדשבורד
+        try:
+            p = round(float(price), 2)
+        except (TypeError, ValueError):
+            return
+        self.points.append((t, p))
         if len(self.points) > self.max_points:
             self.points = self.points[-self.max_points :]
 

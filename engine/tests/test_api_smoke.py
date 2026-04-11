@@ -76,6 +76,7 @@ def test_demo_reset_and_clear_stats(client: TestClient):
     assert r.status_code == 200
     st = client.get("/api/demo/state").json()
     assert float(st["balance_usd"]) == 123.0
+    assert isinstance(st.get("stats_epoch_ts"), (int, float))
     assert engine_main.runner.rt.dca_done_slices == 0
     assert engine_main.runner.rt.dca_last_fill_price is None
     assert engine_main.runner.rt.tp_happened_this_window is False
@@ -83,14 +84,17 @@ def test_demo_reset_and_clear_stats(client: TestClient):
     engine_main.runner.rt.dca_done_slices = 5
     engine_main.demo.state.loss_recovery_streak = 3
     engine_main.demo.state.loss_recovery_multiplier = 2.0
+    engine_main.demo.state.trades = [{"id": "keep-me", "ts": 100.0, "type": "BUY", "token_id": "tok"}]
     engine_main.demo.save()
+    n_trades_before = len(engine_main.demo.state.trades)
     r = client.post("/api/demo/clear-stats", json={})
     assert r.status_code == 200
     assert engine_main.runner.rt.dca_done_slices == 0
     assert engine_main.demo.state.loss_recovery_streak == 0
     assert engine_main.demo.state.loss_recovery_multiplier == pytest.approx(1.0)
     st2 = client.get("/api/demo/state").json()
-    assert st2["trades"] == []
+    assert len(st2["trades"]) == n_trades_before
+    assert isinstance(st2.get("stats_epoch_ts"), (int, float))
 
 
 def test_tips_v2_endpoint_shape(client: TestClient):

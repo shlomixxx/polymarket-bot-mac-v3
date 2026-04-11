@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -590,6 +591,98 @@ def list_run_dirs(max_runs: int) -> list[Path]:
             runs.append((mt, run_dir))
     runs.sort(key=lambda x: x[0], reverse=True)
     return [p for _, p in runs[: max_runs]]
+
+
+def list_run_folders_detailed(max_folders: int = 200) -> dict[str, Any]:
+    """
+    כל תיקיות הריצה תחת RUNS_ROOT (יום/שעה) עם רשימת קבצים — לניהול ומחיקה מה-UI.
+    """
+    root = RUNS_ROOT.resolve()
+    if not root.is_dir():
+        return {
+            "runs_root": str(root),
+            "runs": [],
+            "total_runs": 0,
+            "limit_applied": max(1, max_folders),
+            "truncated": False,
+        }
+    rows: list[tuple[float, dict[str, Any]]] = []
+    for day_dir in root.iterdir():
+        if not day_dir.is_dir():
+            continue
+        day = day_dir.name
+        for run_dir in day_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            tim = run_dir.name
+            run_key = f"{day}/{tim}"
+            mt = run_dir.stat().st_mtime
+            file_rows: list[dict[str, Any]] = []
+            for fp in sorted(run_dir.iterdir()):
+                if fp.is_file():
+                    try:
+                        sz = int(fp.stat().st_size)
+                    except OSError:
+                        sz = None
+                    file_rows.append({"name": fp.name, "size_bytes": sz})
+            snap = run_dir / "strategy_snapshot.json"
+            trades_p = run_dir / "trades.json"
+            counts = snap.is_file() and trades_p.is_file()
+            trade_rows: int | None = None
+            if trades_p.is_file():
+                td = _load_json(trades_p)
+                if isinstance(td, dict) and isinstance(td.get("trades"), list):
+                    trade_rows = len(td["trades"])
+            rows.append(
+                (
+                    mt,
+                    {
+                        "run_key": run_key,
+                        "counts_toward_v3": counts,
+                        "mtime": mt,
+                        "files": file_rows,
+                        "trade_rows": trade_rows,
+                    },
+                )
+            )
+    rows.sort(key=lambda x: x[0], reverse=True)
+    lim = max(1, max_folders)
+    total_runs = len(rows)
+    truncated = total_runs > lim
+    sliced = rows[:lim]
+    return {
+        "runs_root": str(root),
+        "total_runs": total_runs,
+        "limit_applied": lim,
+        "truncated": truncated,
+        "runs": [r[1] for r in sliced],
+    }
+
+
+def delete_run_folder_by_key(run_key: str) -> tuple[bool, str]:
+    """מוחק תיקיית ריצה אחת (יום/שעה) — רק מתחת ל-RUNS_ROOT."""
+    raw = (run_key or "").strip().replace("\\", "/")
+    parts = [p for p in raw.split("/") if p]
+    if len(parts) != 2:
+        return False, "מפתח ריצה חייב להיות בצורה YYYY-MM-DD/HH-MM-SS"
+    day, tim = parts[0], parts[1]
+    if ".." in day or ".." in tim or day.startswith("/") or tim.startswith("/"):
+        return False, "נתיב לא חוקי"
+    root = RUNS_ROOT.resolve()
+    if not root.is_dir():
+        return False, "אין תיקיית ריצות"
+    target = (root / day / tim).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return False, "נתיב מחוץ לתיקיית הריצות"
+    if not target.is_dir():
+        return False, "תיקיית הריצה לא נמצאה"
+    try:
+        shutil.rmtree(target)
+    except OSError as e:
+        return False, f"שגיאה במחיקה: {e}"
+    return True, "הריצה נמחקה"
 
 
 def analyze_runs(max_runs: int) -> list[RunStats]:

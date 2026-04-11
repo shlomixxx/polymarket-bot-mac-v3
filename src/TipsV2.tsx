@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
 
 type TipsV2Metrics = {
@@ -138,6 +138,22 @@ type TipsV2Response = {
   note?: string;
 };
 
+type TipsV2RunFile = { name: string; size_bytes: number | null };
+type TipsV2RunRow = {
+  run_key: string;
+  counts_toward_v3: boolean;
+  mtime: number;
+  files: TipsV2RunFile[];
+  trade_rows: number | null;
+};
+type TipsV2RunsResponse = {
+  runs_root: string;
+  runs: TipsV2RunRow[];
+  total_runs?: number;
+  limit_applied?: number;
+  truncated?: boolean;
+};
+
 function fmtPct01(x: number): string {
   if (!Number.isFinite(x)) return "—";
   return `${(x * 100).toFixed(1)}%`;
@@ -177,6 +193,303 @@ function fmtBinValue(v: unknown): string {
 function fmtProfitFactor(v: number | null | undefined): string {
   if (v == null || !Number.isFinite(v)) return "—";
   return v.toFixed(2);
+}
+
+function formatBytes(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function TipsV2RunsPanel({ onRunsChanged }: { onRunsChanged: () => void }) {
+  const [rdata, setRdata] = useState<TipsV2RunsResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [selectedRunKey, setSelectedRunKey] = useState<string | null>(null);
+  const [filterQuery, setFilterQuery] = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setErr("");
+    try {
+      const res = await api<TipsV2RunsResponse>("/api/strategy/tips-v2/runs?limit=5000");
+      setRdata(res);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "שגיאה בטעינת רשימת ריצות");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const filteredRuns = useMemo(() => {
+    if (!rdata?.runs?.length) return [];
+    const q = filterQuery.trim().toLowerCase();
+    if (!q) return rdata.runs;
+    return rdata.runs.filter((r) => r.run_key.toLowerCase().includes(q));
+  }, [rdata, filterQuery]);
+
+  useEffect(() => {
+    if (selectedRunKey && !filteredRuns.some((r) => r.run_key === selectedRunKey)) {
+      setSelectedRunKey(null);
+    }
+  }, [filteredRuns, selectedRunKey]);
+
+  const handleDelete = async (run_key: string) => {
+    if (
+      !window.confirm(
+        `למחוק את כל תיקיית הריצה "${run_key}"?\nיימחקו כל הקבצים בתיקייה והנתונים לא ייכנסו יותר לסטטיסטיקת ניתוח v3. לא ניתן לבטל.`,
+      )
+    ) {
+      return;
+    }
+    setDeleting(run_key);
+    setErr("");
+    try {
+      await api<{ ok: boolean }>("/api/strategy/tips-v2/delete-run", {
+        method: "POST",
+        body: JSON.stringify({ run_key }),
+      });
+      if (selectedRunKey === run_key) setSelectedRunKey(null);
+      await load();
+      onRunsChanged();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "מחיקה נכשלה");
+    } finally {
+      setDeleting(null);
+    }
+  };
+
+  const totalOnDisk = rdata?.total_runs ?? rdata?.runs?.length ?? 0;
+  const truncated = Boolean(rdata?.truncated);
+
+  return (
+    <div
+      style={{
+        marginBottom: 20,
+        padding: 14,
+        borderRadius: 12,
+        border: "1px solid #334155",
+        background: "#0f172a",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          flexWrap: "wrap",
+          gap: 10,
+          marginBottom: 10,
+        }}
+      >
+        <div>
+          <h3 style={{ margin: "0 0 6px 0", color: "#e2e8f0", fontSize: 16 }}>
+            כל הריצות — בחירה ומחיקה (מסירה מסטטיסטיקת v3)
+          </h3>
+          <p style={{ margin: 0, fontSize: 12, color: "var(--muted)", lineHeight: 1.55, maxWidth: 720 }}>
+            אם ריצה אחת נפגעה מבאג או נתונים שגויים, בחר אותה ברשימה ומחק — הניתוח יתעדכן בלי אותה ריצה. ריצות עם{" "}
+            <strong style={{ color: "#94a3b8" }}>«כן»</strong> בניתוח v3 הן אלה שנכנסות לחישוב ההמלצות.
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <button
+            type="button"
+            onClick={() => void load()}
+            disabled={loading}
+            style={{
+              padding: "6px 12px",
+              borderRadius: 8,
+              border: "1px solid #475569",
+              background: loading ? "#1e293b" : "#334155",
+              color: "#e2e8f0",
+              cursor: loading ? "default" : "pointer",
+              fontSize: 12,
+            }}
+          >
+            רענון רשימה
+          </button>
+          <button
+            type="button"
+            disabled={!selectedRunKey || deleting !== null}
+            onClick={() => selectedRunKey && void handleDelete(selectedRunKey)}
+            style={{
+              padding: "6px 14px",
+              borderRadius: 8,
+              border: "1px solid #7f1d1d",
+              background: !selectedRunKey || deleting ? "#450a0a" : "#b91c1c",
+              color: "#fecaca",
+              cursor: !selectedRunKey || deleting ? "not-allowed" : "pointer",
+              fontSize: 12,
+              fontWeight: 700,
+            }}
+          >
+            מחק את הריצה הנבחרת
+          </button>
+        </div>
+      </div>
+
+      <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10, lineHeight: 1.5 }}>
+        נתיב בשרת: <code style={{ fontSize: 11, color: "#94a3b8" }}>{rdata?.runs_root ?? "…"}</code>
+        {" · "}
+        {loading ? (
+          "טוען…"
+        ) : (
+          <>
+            <strong style={{ color: "#cbd5e1" }}>{totalOnDisk}</strong> ריצות בדיסק
+            {truncated && rdata?.limit_applied != null && (
+              <span style={{ color: "#fbbf24" }}>
+                {" "}
+                (מוצגות {rdata.runs.length} ראשונות מתוך {totalOnDisk} — הגדל limit ב-API אם צריך)
+              </span>
+            )}
+          </>
+        )}
+      </div>
+
+      <div style={{ marginBottom: 12, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+        <label style={{ fontSize: 12, color: "#94a3b8", display: "flex", alignItems: "center", gap: 6 }}>
+          חיפוש לפי תאריך/שעה:
+          <input
+            type="search"
+            value={filterQuery}
+            onChange={(e) => setFilterQuery(e.target.value)}
+            placeholder="למשל 2026-04 או 14-30"
+            style={{
+              minWidth: 200,
+              padding: "6px 10px",
+              borderRadius: 8,
+              border: "1px solid #475569",
+              background: "#1e293b",
+              color: "#e2e8f0",
+              fontSize: 12,
+            }}
+          />
+        </label>
+        {selectedRunKey && (
+          <span style={{ fontSize: 12, color: "#7dd3fc" }}>
+            נבחר: <code style={{ fontSize: 12 }}>{selectedRunKey}</code>
+          </span>
+        )}
+      </div>
+
+      {loading && <div style={{ color: "var(--muted)", fontSize: 13 }}>טוען את כל הריצות…</div>}
+      {err && (
+        <div style={{ color: "#f87171", marginBottom: 8, padding: 8, background: "#3f1f1f", fontSize: 12 }}>{err}</div>
+      )}
+      {rdata && rdata.runs.length === 0 && !loading && (
+        <div style={{ color: "var(--muted)", fontSize: 13 }}>אין תיקיות ריצה תחת logs/runs.</div>
+      )}
+      {rdata && rdata.runs.length > 0 && !loading && (
+        <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6 }}>
+          מציג {filteredRuns.length} שורות
+          {filterQuery.trim() ? ` (סינון מתוך ${rdata.runs.length})` : ""}
+        </div>
+      )}
+      {rdata && rdata.runs.length > 0 && (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", fontSize: 12, borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ textAlign: "right", color: "#94a3b8" }}>
+                <th style={{ padding: 6, borderBottom: "1px solid #334155", width: 36 }}>בחירה</th>
+                <th style={{ padding: 6, borderBottom: "1px solid #334155" }}>ריצה (יום / שעה)</th>
+                <th style={{ padding: 6, borderBottom: "1px solid #334155" }}>בניתוח v3</th>
+                <th style={{ padding: 6, borderBottom: "1px solid #334155" }}>שורות ב־trades.json</th>
+                <th style={{ padding: 6, borderBottom: "1px solid #334155" }}>עדכון</th>
+                <th style={{ padding: 6, borderBottom: "1px solid #334155" }}>קבצים</th>
+                <th style={{ padding: 6, borderBottom: "1px solid #334155" }}>מחיקה מהירה</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredRuns.length === 0 && filterQuery.trim() !== "" && (
+                <tr>
+                  <td colSpan={7} style={{ padding: 12, color: "#94a3b8", textAlign: "center" }}>
+                    אין תוצאות לחיפוש — נסה טקסט אחר או נקה את השדה
+                  </td>
+                </tr>
+              )}
+              {filteredRuns.map((row) => {
+                const sel = selectedRunKey === row.run_key;
+                return (
+                  <tr
+                    key={row.run_key}
+                    onClick={() => setSelectedRunKey(row.run_key)}
+                    style={{
+                      color: "#e2e8f0",
+                      verticalAlign: "top",
+                      cursor: "pointer",
+                      background: sel ? "rgba(30, 58, 95, 0.55)" : "transparent",
+                    }}
+                  >
+                    <td style={{ padding: 6, borderBottom: "1px solid #1e293b" }} onClick={(e) => e.stopPropagation()}>
+                      <input
+                        type="radio"
+                        name="tips-v2-run-pick"
+                        checked={sel}
+                        onChange={() => setSelectedRunKey(row.run_key)}
+                        aria-label={`בחר ריצה ${row.run_key}`}
+                      />
+                    </td>
+                    <td style={{ padding: 6, borderBottom: "1px solid #1e293b", fontFamily: "ui-monospace, monospace" }}>
+                      {row.run_key}
+                    </td>
+                    <td style={{ padding: 6, borderBottom: "1px solid #1e293b" }}>
+                      {row.counts_toward_v3 ? (
+                        <span style={{ color: "#4ade80" }}>כן — משפיע</span>
+                      ) : (
+                        <span style={{ color: "#fbbf24" }}>לא</span>
+                      )}
+                    </td>
+                    <td style={{ padding: 6, borderBottom: "1px solid #1e293b" }}>{fmtMaybe(row.trade_rows)}</td>
+                    <td style={{ padding: 6, borderBottom: "1px solid #1e293b", whiteSpace: "nowrap" }}>
+                      {new Date(row.mtime * 1000).toLocaleString("he-IL")}
+                    </td>
+                    <td style={{ padding: 6, borderBottom: "1px solid #1e293b", maxWidth: 280 }} onClick={(e) => e.stopPropagation()}>
+                      <details style={{ fontSize: 11 }}>
+                        <summary style={{ cursor: "pointer", color: "#94a3b8" }}>
+                          {row.files.length} קבצים
+                        </summary>
+                        <ul style={{ margin: "6px 0 0 0", paddingInlineStart: 18, color: "#cbd5e1" }}>
+                          {row.files.map((f) => (
+                            <li key={f.name}>
+                              {f.name} <span style={{ color: "#64748b" }}>({formatBytes(f.size_bytes)})</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    </td>
+                    <td style={{ padding: 6, borderBottom: "1px solid #1e293b" }} onClick={(e) => e.stopPropagation()}>
+                      <button
+                        type="button"
+                        disabled={deleting === row.run_key}
+                        onClick={() => void handleDelete(row.run_key)}
+                        style={{
+                          padding: "4px 10px",
+                          borderRadius: 6,
+                          border: "1px solid #7f1d1d",
+                          background: deleting === row.run_key ? "#450a0a" : "#991b1b",
+                          color: "#fecaca",
+                          cursor: deleting === row.run_key ? "wait" : "pointer",
+                          fontSize: 11,
+                        }}
+                      >
+                        {deleting === row.run_key ? "…" : "מחק"}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function fmtSec(v: number | null | undefined): string {
@@ -710,25 +1023,22 @@ export default function TipsV2() {
   /** לשונית פעילה כשיש גם 5m וגם 15m */
   const [windowTab, setWindowTab] = useState<BtcWindowKey>("5m");
 
-  useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      setLoading(true);
-      setErr("");
-      try {
-        const res = await api<TipsV2Response>("/api/strategy/tips-v2");
-        if (!cancelled) setData(res);
-      } catch (e: unknown) {
-        if (!cancelled) setErr(e instanceof Error ? e.message : "שגיאה לא ידועה");
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    run();
-    return () => {
-      cancelled = true;
-    };
+  const refreshTips = useCallback(async () => {
+    setLoading(true);
+    setErr("");
+    try {
+      const res = await api<TipsV2Response>("/api/strategy/tips-v2");
+      setData(res);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "שגיאה לא ידועה");
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshTips();
+  }, [refreshTips]);
 
   const gm = data?.global_metrics;
   const byWin = data?.by_btc_window;
@@ -746,6 +1056,7 @@ export default function TipsV2() {
   return (
     <div style={{ background: "var(--card)", padding: 20, borderRadius: 12 }}>
       <h2 style={{ marginTop: 0 }}>ניתוח מתקדם v3 (מקסימום תוחלת)</h2>
+      <TipsV2RunsPanel onRunsChanged={refreshTips} />
       {loading && <div style={{ color: "var(--muted)" }}>טוען נתונים…</div>}
       {err && (
         <div style={{ color: "#f87171", marginBottom: 12, padding: 8, background: "#3f1f1f" }}>{err}</div>

@@ -1,0 +1,5 @@
+# Railway: attach a persistent Volume to the service and set mount path to /data
+# (must match ENV DATA_ROOT=/data in Dockerfile). Otherwise logs + v3 analysis reset on each deploy.
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"

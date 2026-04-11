@@ -6,7 +6,7 @@ import {
   chartTooltipStyle,
   chartStroke,
   smoothCurveType,
-  btcPriceLineCurveType,
+  computeBtcPriceChartYDomain,
 } from "./chartConstants";
 import { formatPnlAxisTime, formatPctAxisTick } from "./pnlChartFormatters";
 import { useChartAnimationGate } from "./hooks/useChartAnimationGate";
@@ -152,6 +152,14 @@ function bidFromHypotheticalPct(legCost: number, contracts: number, pct: number)
 function pctVsExitPrice(exitUsd: number, bidUsd: number): number | null {
   if (!Number.isFinite(exitUsd) || exitUsd <= 0 || !Number.isFinite(bidUsd)) return null;
   return ((bidUsd - exitUsd) / exitUsd) * 100;
+}
+
+/** אחרי איפוס לוח/סטטיסטיקה — רק עסקאות מהסשן הנוכחי בתצוגה; ההיסטוריה המלאה נשמרת בקובץ (ניתוח v3). */
+function tradesForSessionStats(trades: Trade[], demoState: Record<string, unknown> | null | undefined): Trade[] {
+  if (!trades?.length) return [];
+  const ts0 = demoState?.stats_epoch_ts;
+  if (typeof ts0 !== "number" || !Number.isFinite(ts0)) return trades;
+  return trades.filter((t) => Number(t.ts || 0) >= ts0);
 }
 
 type SessionGroup = { sessionId: string; trades: Trade[] };
@@ -1834,8 +1842,17 @@ export default function App() {
     });
   }, [btc.history]);
 
+  const btcChartYDomain = useMemo(
+    () => computeBtcPriceChartYDomain(
+      chartData.map((d) => Number(d.p)),
+      market?.price_to_beat ?? null,
+    ),
+    [chartData, market?.price_to_beat],
+  );
+
   const cumPnlChartData = useMemo(() => {
-    const trades = ((demoState as any).trades as Trade[]) || [];
+    const rawTrades = ((demoState as any).trades as Trade[]) || [];
+    const trades = tradesForSessionStats(rawTrades, demoState as Record<string, unknown> | null);
     const realizedTrades = trades.filter(
       (t) => t.realized_pnl != null && !Number.isNaN(Number(t.realized_pnl)),
     );
@@ -2115,7 +2132,16 @@ export default function App() {
                     tickFormatter={(v) => formatPnlAxisTime(Number(v))}
                     allowDecimals
                   />
-                  <YAxis domain={["auto", "auto"]} tick={{ ...chartAxisTick, fontSize: 10 }} width={72} />
+                  <YAxis
+                    domain={btcChartYDomain ?? (["auto", "auto"] as const)}
+                    tick={{ ...chartAxisTick, fontSize: 10 }}
+                    width={72}
+                    tickFormatter={(v) =>
+                      typeof v === "number" && Number.isFinite(v)
+                        ? v.toLocaleString(undefined, { maximumFractionDigits: 0 })
+                        : ""
+                    }
+                  />
                   <Tooltip
                     contentStyle={chartTooltipStyle}
                     labelStyle={{ color: "var(--text-secondary)" }}
@@ -2123,6 +2149,12 @@ export default function App() {
                     labelFormatter={(label) =>
                       Number.isFinite(Number(label)) ? formatPnlAxisTime(Number(label)) : String(label)
                     }
+                    formatter={(value) => [
+                      typeof value === "number" && Number.isFinite(value)
+                        ? `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : String(value),
+                      "מחיר",
+                    ]}
                   />
                   {market?.price_to_beat != null && (
                     <ReferenceLine
@@ -2134,7 +2166,7 @@ export default function App() {
                     />
                   )}
                   <Line
-                    type={btcPriceLineCurveType}
+                    type="linear"
                     dataKey="p"
                     stroke="var(--chart-line-primary)"
                     dot={false}
@@ -2167,6 +2199,14 @@ export default function App() {
               type="button"
               disabled={actionLoading === "reset"}
               onClick={async () => {
+                if (
+                  !confirm(
+                    "לאפס את חשבון הסימולציה ל־10,000$ — בלי פוזיציות פתוחות וללא סימוני מחיר?\n" +
+                      "היסטוריית העסקאות נשמרת בקובץ (לא נמחקת) — ניתוח v3 ממשיך להשתמש בנתונים מהדיסק; במסך יוצג סשן חדש בלבד.",
+                  )
+                ) {
+                  return;
+                }
                 setActionLoading("reset");
                 try {
                   await api("/api/demo/reset", { method: "POST", body: "{}" });
@@ -2853,7 +2893,8 @@ export default function App() {
         <Card padding="lg">
           <SectionTitle as="h2">סטטיסטיקות סימולציה</SectionTitle>
           {(() => {
-            const trades = ((demoState as any).trades as any[]) || [];
+            const allTradesRaw = ((demoState as any).trades as any[]) || [];
+            const trades = tradesForSessionStats(allTradesRaw as Trade[], demoState as Record<string, unknown> | null);
             const sessions = groupTradesBySession(trades);
             const tradesCount = sessions.length;
             const balance = Number((demoState as any).balance_usd || 0);
@@ -2966,7 +3007,8 @@ export default function App() {
                     onClick={async () => {
                       if (
                         !confirm(
-                          "לאפס את נתוני הסטטיסטיקה ולסגור פוזיציות פתוחות בחשבון הסימולציה? פעולה זו תמחק היסטוריה ועסקאות ותמיר פוזיציות ליתרה."
+                          "לסגור פוזיציות פתוחות (ליתרה לפי bid) ולהתחיל סשן סטטיסטיקה חדש?\n" +
+                            "לא נמחקות עסקאות מהקובץ — ניתוח v3 לא נפגע; במסך יוצגו מהסשן החדש בלבד.",
                         )
                       )
                         return;
@@ -2996,7 +3038,7 @@ export default function App() {
 
                 <ChartCard
                   title="רווח והפסד מצטברים"
-                  subtitle="רווח או הפסד ממומשים בלבד; הקו מתקדם עם סגירת עסקאות. מוצג רווח והפסד מצטברים מהאפס, ולא יתרת החשבון המלאה."
+                  subtitle="רווח או הפסד ממומשים בלבד; הקו מתקדם עם סגירת עסקאות. אחרי איפוס — רק מהסשן הנוכחי (היסטוריה מלאה נשמרת לניתוח v3)."
                 >
                   <div style={{ width: "100%", height: 300 }}>
                     <ResponsiveContainer width="100%" height="100%">
@@ -3044,9 +3086,9 @@ export default function App() {
                   </div>
                 </ChartCard>
 
-                <h3 style={{ marginTop: 18 }}>היסטוריית עסקאות</h3>
+                <h3 style={{ marginTop: 18 }}>היסטוריית עסקאות (בסשן הנוכחי)</h3>
                 <p style={{ fontSize: 13, color: "var(--muted)", marginBottom: 8 }}>
-                  עמודת «תחילת חלון» מבוססת על שדה אורך החלון בכל עסקה (5 דק׳ / 15 דק׳). «עלות הכניסה» = מחיר ליחידה × חוזים בכניסה (ברוטו; העמלה בעמודה נפרדת).
+                  עמודת «תחילת חלון» מבוססת על שדה אורך החלון בכל עסקה (5 דק׳ / 15 דק׳). «עלות הכניסה» = מחיר ליחידה × חוזים בכניסה (ברוטו; העמלה בעמודה נפרדת). אחרי איפוס לוח או איפוס סטטיסטיקה מוצגות כאן רק עסקאות מההתחלה החדשה; הרשומות הישנות נשארות בקובץ לניתוח v3.
                 </p>
                 <TradesBySession
                   trades={trades}
