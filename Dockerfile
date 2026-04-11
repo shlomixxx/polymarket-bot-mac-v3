@@ -13,7 +13,7 @@ ENV PYTHONUNBUFFERED=1
 # App state: logs/runs (ניתוח v3), history.db, demo_state, config — persist via Railway Volume at this path
 ENV DATA_ROOT=/data
 RUN mkdir -p /data
-VOLUME ["/data"]
+# Railway: attach a Volume in the service UI — Mount path /data (do not use Dockerfile VOLUME; it is banned on Railway)
 
 COPY engine/requirements.txt /app/engine/requirements.txt
 RUN pip install --no-cache-dir -r /app/engine/requirements.txt
