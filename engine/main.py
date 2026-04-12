@@ -36,7 +36,13 @@ from run_logging import (
     write_strategy_journal_header,
     write_strategy_snapshot,
 )
-from live_clob import place_limit_order as live_place_limit_order
+from live_clob import (
+    fetch_live_portfolio,
+    fetch_polymarket_clob_account,
+    place_limit_order as live_place_limit_order,
+    reset_portfolio_cache,
+)
+import secret_store
 from order_validation import validate_contracts_for_market
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
 from signal_engine import CONFIDENCE_THRESHOLD, compute_signals
@@ -44,6 +50,24 @@ from history_tracker import record_window_result, get_recent_windows, get_hourly
 from trigger_engine import TriggerEngine, TriggerConfig
 from strategy_runner import StrategyConfig, StrategyRunner
 from tips_v2 import delete_run_folder_by_key, generate_tips_v2, list_run_folders_detailed
+
+def _autoload_private_key_from_store() -> None:
+    """טוען מפתח שמור (Keychain / Secret Service / Credential Manager) אל os.environ
+    אם אין עדיין מפתח בסביבה. קורה ברגע import של המודול כך ש-run-bot/npm run dev
+    אף פעם לא דורשים להקליד את המפתח מחדש אחרי שמירה חד־פעמית."""
+    try:
+        existing = (os.environ.get("POLYMARKET_PRIVATE_KEY") or "").strip()
+        if existing:
+            return
+        stored = secret_store.load_key()
+        if stored:
+            os.environ["POLYMARKET_PRIVATE_KEY"] = stored
+    except Exception:
+        # אף פעם לא מפילים את המנוע בגלל אחסון מקומי
+        pass
+
+
+_autoload_private_key_from_store()
 
 demo = DemoEngine()
 runner = StrategyRunner(demo)
@@ -209,8 +233,17 @@ def _load_persisted_config() -> None:
             # עד שהמשתמש מפעיל ידנית (חצי־אוטומטי / אוטומטי מלא). mode עדיין נשמר לקובץ לעיון.
             if k == "mode":
                 continue
+            # live_trading נשמר ב-runtime, לא ב-config — נטפל בנפרד למטה.
+            if k == "live_trading":
+                continue
             if hasattr(c, k):
                 setattr(c, k, v)
+        # שחזור מצב "כסף אמיתי" מהממשק (אם נשמר). לא תלוי ב-POLYMARKET_LIVE env.
+        if "live_trading" in data:
+            try:
+                runner.rt.live_trading = bool(data.get("live_trading"))
+            except Exception:
+                runner.rt.live_trading = False
     except Exception as e:
         print(f"[polymarket-bot] אזהרה: לא ניתן לטעון config שמור — {e}", flush=True)
 
@@ -250,6 +283,8 @@ def _save_persisted_config() -> None:
             "loss_recovery_every_n_losses": getattr(c, "loss_recovery_every_n_losses", 1),
             "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 10.0),
             "mode": runner.rt.mode,
+            # מצב "כסף אמיתי" נשלט מהממשק — נשמר בין הפעלות אבל נגדר ע"י POLYMARKET_LIVE env בפריסה.
+            "live_trading": bool(getattr(runner.rt, "live_trading", False)),
         }
         CONFIG_PERSISTED_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
@@ -343,7 +378,7 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
 TIPS_V2_CACHE_PATH = DATA_ROOT / "tips_v2_cache.json"
 TIPS_V2_CACHE_TTL_SEC = 300.0  # cache for 5 minutes
 WEB_DIST_DIR = Path(os.environ.get("WEB_DIST_DIR", str(Path(__file__).resolve().parent.parent / "dist"))).resolve()
-ORDERBOOK_SUMMARY_CACHE_TTL_SEC = 1.5
+ORDERBOOK_SUMMARY_CACHE_TTL_SEC = 0.32
 last_orderbook_summary: Optional[dict[str, Any]] = None
 last_orderbook_summary_ts: float = 0.0
 # Lock למניעת race condition: מונע שני threads מלעדכן את ה-cache בו-זמנית
@@ -687,7 +722,11 @@ async def api_runtime():
 async def demo_export_csv():
     """CSV של עסקאות + snapshot mark-to-market (נוח לאקסל)."""
     await demo.mark_to_market()
-    return PlainTextResponse(demo.export_csv(), media_type="text/csv; charset=utf-8")
+    return PlainTextResponse(
+        demo.export_csv(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="demo-trades.csv"'},
+    )
 
 
 class TradeBody(BaseModel):
@@ -969,12 +1008,13 @@ async def strategy_pending():
 
 
 class ApproveBody(BaseModel):
-    live: bool = False
+    # None = השתמש במצב הזמן־אמת של המנוע (מופעל מהממשק). True/False — כפייה לבקשה בודדת.
+    live: Optional[bool] = None
 
 
 @app.post("/api/strategy/approve")
 async def strategy_approve(body: ApproveBody = Body(default=ApproveBody())):
-    return await runner.approve_pending(live=bool(body.live))
+    return await runner.approve_pending(live=body.live)
 
 
 @app.post("/api/strategy/reject")
@@ -985,12 +1025,117 @@ async def strategy_reject():
 
 @app.post("/api/live/private-key")
 async def set_private_key(body: dict[str, Any]):
-    """שמירת מפתח בסשן זיכרון בלבד (מקומי)."""
-    import os
-
+    """שומר מפתח פרטי ל-Polymarket CLOB.
+    persist=false (ברירת מחדל): סשן זיכרון בלבד — חייבים להקליד מחדש בכל הרצה.
+    persist=true: נשמר גם ב-Keychain/Secret Service/Credential Manager של המחשב
+    המקומי כך שהרצות הבאות יטענו אוטומטית בלי הקלדה חוזרת."""
     k = (body.get("key") or "").strip()
+    persist = bool(body.get("persist") or False)
+
     os.environ["POLYMARKET_PRIVATE_KEY"] = k
-    return {"ok": True, "set": bool(k)}
+    reset_portfolio_cache()
+
+    persisted_ok = False
+    if persist:
+        if k:
+            persisted_ok = secret_store.save_key(k)
+        else:
+            # "שמירה ריקה לצמיתות" = מחיקה מפורשת של מפתח שמור
+            secret_store.delete_key()
+
+    clob_ok = False
+    try:
+        import py_clob_client.client  # noqa: F401
+
+        clob_ok = True
+    except ImportError:
+        pass
+    return {
+        "ok": True,
+        "set": bool(k),
+        "persist_requested": persist,
+        "persisted": persisted_ok,
+        "persisted_in_keychain": secret_store.has_persisted_key(),
+        "py_clob_client_installed": clob_ok,
+    }
+
+
+@app.delete("/api/live/private-key")
+async def delete_private_key():
+    """מוחק מפתח מהסשן ומה-Keychain. אחרי זה צריך להקליד שוב כדי לסחור לייב."""
+    os.environ["POLYMARKET_PRIVATE_KEY"] = ""
+    removed = secret_store.delete_key()
+    reset_portfolio_cache()
+    return {"ok": True, "removed_from_keychain": removed, **_live_mode_state()}
+
+
+def _live_mode_state() -> dict[str, Any]:
+    """מחזיר את מצב "כסף אמיתי" הכולל — דגל ממשק + kill-switch פריסה + מפתח."""
+    env_kill = os.environ.get("POLYMARKET_LIVE", "").strip().lower() in (
+        "0", "false", "no", "off",
+    )
+    has_key = bool((os.environ.get("POLYMARKET_PRIVATE_KEY") or "").strip())
+    enabled = bool(getattr(runner.rt, "live_trading", False))
+    # effective = בפועל ישלח פקודות לייב
+    effective = enabled and (not env_kill) and has_key
+    reason = None
+    if enabled and env_kill:
+        reason = "POLYMARKET_LIVE=0 (kill-switch בפריסה)"
+    elif enabled and not has_key:
+        reason = "חסר POLYMARKET_PRIVATE_KEY"
+    persisted = False
+    try:
+        persisted = secret_store.has_persisted_key()
+    except Exception:
+        persisted = False
+    return {
+        "enabled": enabled,
+        "effective": effective,
+        "env_kill_switch": env_kill,
+        "has_private_key": has_key,
+        "persisted_in_keychain": persisted,
+        "reason_blocked": reason,
+    }
+
+
+@app.get("/api/live/mode")
+async def live_mode_get():
+    """קורא מצב "כסף אמיתי" מהמנוע (נשלט מהממשק)."""
+    return _live_mode_state()
+
+
+class LiveModeBody(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/live/mode")
+async def live_mode_set(body: LiveModeBody):
+    """מחליף מצב "כסף אמיתי" מהממשק — זה התחליף היחיד לעריכת .env.
+    הערה: POLYMARKET_LIVE env נשאר kill-switch בלבד בפריסה ולא משמש כדי להפעיל לייב.
+    """
+    runner.rt.live_trading = bool(body.enabled)
+    runner.rt.log(
+        "מצב כסף אמיתי הופעל (מהממשק)" if runner.rt.live_trading else "מצב כסף אמיתי כובה (מהממשק)"
+    )
+    try:
+        _save_persisted_config()
+    except Exception:
+        pass
+    return {"ok": True, **_live_mode_state()}
+
+
+@app.get("/api/live/polymarket-clob-account")
+async def polymarket_clob_account():
+    """יתרת collateral (USDC) ב-CLOB לפי המפתח הנוכחי — לא כל תיק Polymarket באתר."""
+    return fetch_polymarket_clob_account()
+
+
+@app.get("/api/live/portfolio")
+async def live_portfolio(force: bool = False):
+    """snapshot חי: יתרת USDC אמיתית + פוזיציות פתוחות של Polymarket + שווי נטו.
+    זה מה שה-UI מציג במצב לייב במקום הספר הצללי של הסימולציה.
+    """
+    return await fetch_live_portfolio(force=force)
 
 
 @app.post("/api/live/order")

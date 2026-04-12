@@ -398,6 +398,96 @@ class DemoEngine:
         self.save()
         return created
 
+    def reconcile_live_state(
+        self,
+        real_balance_usd: Optional[float],
+        real_positions: list[dict[str, Any]],
+        *,
+        context: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """מסנכרן את הספר הפנימי (ששימש כ-shadow ledger במצב לייב) ליתרה
+        ולפוזיציות האמיתיות של Polymarket. נקרא אחרי epoch rollover ובקצב קבוע.
+
+        מחזיר רשומת trade מסוג RECONCILE אם היה דלתא בכיס ($0.01+), אחרת None.
+        תמיד מחליף את state.positions לרשימת הפוזיציות האמיתיות (מטא־דאטה של
+        _position_tracking נשמר לטוקנים שממשיכים להתקיים, נמחק לטוקנים שנעלמו).
+        """
+        ctx = dict(context or {})
+        reconcile_trade: Optional[dict[str, Any]] = None
+
+        if isinstance(real_balance_usd, (int, float)) and math.isfinite(float(real_balance_usd)):
+            real_bal = float(real_balance_usd)
+            shadow_bal = float(self.state.balance_usd)
+            delta = real_bal - shadow_bal
+            if abs(delta) >= 0.01:
+                tr: dict[str, Any] = {
+                    "id": str(uuid.uuid4())[:8],
+                    "ts": time.time(),
+                    "type": "RECONCILE",
+                    "shadow_balance_usd": shadow_bal,
+                    "real_balance_usd": real_bal,
+                    "realized_pnl": delta,
+                    "price": 0.0,
+                    "fee_est": 0.0,
+                    "contracts": 0,
+                    "execution": "live",
+                }
+                tr.update(ctx)
+                self.state.trades.append(tr)
+                reconcile_trade = tr
+            self.state.balance_usd = real_bal
+
+        # בנה רשימת פוזיציות חדשה מהמציאות; שמור avg_cost מהצל אם יש, אחרת avg_price אמיתי.
+        shadow_by_token = {p.token_id: p for p in self.state.positions}
+        new_positions: list[Position] = []
+        real_token_ids: set[str] = set()
+        for rp in real_positions or []:
+            tid = str(rp.get("token_id") or "").strip()
+            if not tid:
+                continue
+            size = rp.get("size")
+            try:
+                size_f = float(size)
+            except (TypeError, ValueError):
+                continue
+            if size_f <= 0:
+                continue
+            real_token_ids.add(tid)
+            side_raw = str(rp.get("side") or "Up")
+            side: Side = "Down" if side_raw == "Down" else "Up"
+            # עדיף avg_cost שכבר היה לנו (שלנו כולל עמלה), אחרת ניקח avg_price מה-API
+            if tid in shadow_by_token:
+                sp = shadow_by_token[tid]
+                avg_cost = float(sp.avg_cost)
+                window_epoch = sp.window_epoch
+                window_sec = sp.window_sec
+            else:
+                avg_cost = float(rp.get("avg_price") or rp.get("mark_price") or 0.0)
+                window_epoch = None
+                window_sec = None
+            new_positions.append(
+                Position(
+                    side=side,
+                    contracts=size_f,
+                    avg_cost=avg_cost,
+                    token_id=tid,
+                    window_epoch=window_epoch,
+                    window_sec=window_sec,
+                )
+            )
+
+        # נקה _position_tracking / _session_by_token לטוקנים שנעלמו מהמציאות
+        removed_tokens = [tid for tid in list(shadow_by_token.keys()) if tid not in real_token_ids]
+        for tid in removed_tokens:
+            self._position_tracking.pop(tid, None)
+            self._session_by_token.pop(tid, None)
+
+        self.state.positions = new_positions
+        eq = self.state.balance_usd + sum(x.contracts * x.avg_cost for x in self.state.positions)
+        self.state.equity_history.append((time.time(), eq))
+        self.save()
+        return reconcile_trade
+
     def export_csv(self) -> str:
         """מייצר CSV: עסקאות + שדות מרכזיים."""
         out = io.StringIO()
@@ -959,6 +1049,8 @@ class DemoEngine:
                 if not self.state.positions and self.state.last_mark:
                     self.state.last_mark["unrealized_usd"] = 0.0
                     self.state.last_mark["legs"] = []
+                    # חייבים ליישר equity ליתרה — אחרת נשאר equity ישן עם מימוש פתוח ונוצרת קפיצה ב־P&L / שידור
+                    self.state.last_mark["equity"] = float(self.state.balance_usd)
                 return self.state.last_mark
         except Exception:
             pass

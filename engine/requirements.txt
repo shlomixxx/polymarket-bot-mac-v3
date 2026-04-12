@@ -7,3 +7,6 @@ websockets==14.1
 
 # מסחר לייב ב-Polymarket CLOB
 py-clob-client>=0.34.0
+
+# אחסון קבוע למפתח הפרטי דרך macOS Keychain / Secret Service / Windows Credential Manager
+keyring>=24

@@ -1,7 +1,8 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
-import LiveStreamTrade, { type StreamViewerLayout } from "./LiveStreamTrade";
+import LiveStreamTrade from "./LiveStreamTrade";
+import type { StreamViewerLayout } from "./streamViewerTypes";
 import "./index.css";
 
 function resolveStreamEntry(): { stream: boolean; layout: StreamViewerLayout } {
@@ -12,21 +13,32 @@ function resolveStreamEntry(): { stream: boolean; layout: StreamViewerLayout } {
   const search = new URLSearchParams(window.location.search);
   const streamParam = search.get("stream");
 
+  const layoutSpectator =
+    streamParam === "3" ||
+    streamParam === "spectator" ||
+    search.get("layout") === "spectator" ||
+    path === "/stream/spectator" ||
+    path.endsWith("/stream/spectator");
+
   const layoutShowcase =
-    streamParam === "2" ||
-    streamParam === "showcase" ||
-    search.get("layout") === "showcase" ||
-    path === "/stream/showcase" ||
-    path.endsWith("/stream/showcase");
+    !layoutSpectator &&
+    (streamParam === "2" ||
+      streamParam === "showcase" ||
+      search.get("layout") === "showcase" ||
+      path === "/stream/showcase" ||
+      path.endsWith("/stream/showcase"));
 
   const stream =
     streamParam === "1" ||
     streamParam === "2" ||
+    streamParam === "3" ||
     streamParam === "showcase" ||
+    streamParam === "spectator" ||
     path === "/stream" ||
     path.startsWith("/stream/");
 
-  return { stream, layout: layoutShowcase ? "showcase" : "classic" };
+  const layout: StreamViewerLayout = layoutSpectator ? "spectator" : layoutShowcase ? "showcase" : "classic";
+  return { stream, layout };
 }
 
 const { stream, layout } = resolveStreamEntry();

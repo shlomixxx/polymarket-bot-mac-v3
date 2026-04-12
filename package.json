@@ -9,7 +9,8 @@
     "dev:vite": "vite --host 127.0.0.1 --port 5175",
     "dev:electron": "wait-on -v -t 3m http://127.0.0.1:5175 http://127.0.0.1:8767/api/health && node_modules/.bin/electron .",
     "build:web": "vite build",
-    "start": "electron ."
+    "start": "electron .",
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -24,6 +25,7 @@
     "electron": "^33.2.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.11",
+    "vitest": "^2.1.9",
     "wait-on": "^8.0.1"
   }
 }

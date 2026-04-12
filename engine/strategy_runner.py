@@ -106,6 +106,11 @@ class StrategyRuntime:
     _last_book_log_ts: float = 0.0
     # לשידור/סטטיסטיקה: מתחילים למדוד זמן מהכניסה הראשונה של לולאת האסטרטגיה (לא טריגר/גידור רגל 2).
     strategy_first_buy_ts: Optional[float] = None
+    # מצב "כסף אמיתי" נשלט מהממשק (לחיצה על "מעבר למסחר חי") ונשמר לדיסק.
+    # POLYMARKET_LIVE env הוא kill-switch בלבד להגדרת שרת/פריסה — לא משמש כדי להפעיל לייב.
+    live_trading: bool = False
+    # Reconcile של הספר הפנימי מול היתרה/פוזיציות האמיתיות של Polymarket.
+    _last_live_reconcile_ts: float = 0.0
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -320,14 +325,95 @@ class StrategyRunner:
         return float(cfg.investment_usd) * m
 
     def _live_trading_ok(self) -> bool:
+        # kill-switch לשרת/פריסה בלבד — POLYMARKET_LIVE=0 חוסם לחלוטין שליחת לייב
         if os.environ.get("POLYMARKET_LIVE", "").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        # מצב "כסף אמיתי" נשלט מהממשק (לחיצה על "מעבר למסחר חי")
+        if not bool(self.rt.live_trading):
             return False
         return bool(os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip())
 
-    async def approve_pending(self, live: bool = False) -> dict[str, Any]:
+    async def _live_close_outside_tokens(
+        self,
+        valid_tokens: tuple[str, str],
+        *,
+        context: dict[str, Any],
+    ) -> list[str]:
+        """במצב לייב, לפני פירוק החלון: שלח SELL אמיתי ב-best bid לכל פוזיציה שאינה
+        בטוקנים הפעילים הנוכחיים. מצליח חלקית זה בסדר — את מה שלא נמכר אקטיבית יתפוס
+        expire_all_outside_tokens כגיבוי חישובי, ולאחר מכן reconcile_live_state יסנכרן
+        מול המציאות האמיתית.
+        מחזיר רשימת token_id שנסגרו בהצלחה.
+        """
+        closed: list[str] = []
+        positions_snapshot = [p for p in self.demo.state.positions if p.token_id not in valid_tokens]
+        for p in positions_snapshot:
+            bid, _ = await fetch_best_bid_ask(p.token_id)
+            if bid is None or bid <= 0:
+                self.rt.log(f"סגירה אקטיבית: אין bid לטוקן {p.token_id[:12]}… — גיבוי יפעל")
+                continue
+            lo = await live_clob.place_limit_order(p.token_id, float(bid), float(p.contracts), "SELL")
+            if not lo.get("ok"):
+                self.rt.log(f"סגירה אקטיבית נכשלה: {lo.get('error', 'כשל')} — גיבוי יפעל")
+                continue
+            fill_sell = float(lo.get("price") or bid)
+            close_ctx = dict(context)
+            close_ctx["reason"] = "EXPIRE_ACTIVE_CLOSE"
+            close_ctx["execution"] = "live"
+            try:
+                await self.demo.record_live_sell(p.token_id, fill_sell, context=close_ctx)
+            except Exception as e:
+                self.rt.log(f"record_live_sell כשל אחרי מילוי אמיתי: {e}")
+                continue
+            closed.append(p.token_id)
+            self.rt.log(f"סגירה אקטיבית ({p.side}): {p.contracts:.2f} @ {fill_sell:.3f}")
+        return closed
+
+    async def _live_reconcile_if_enabled(
+        self,
+        *,
+        context: Optional[dict[str, Any]] = None,
+        force: bool = False,
+    ) -> None:
+        """מושך יתרה + פוזיציות אמיתיות של Polymarket ומסנכרן את demo.state.
+        קורה אחרי rollover ובקצב קבוע (כל ~2 דק׳) כסדר־גב נגד drift.
+        """
+        if not self._live_trading_ok():
+            return
+        now = time.time()
+        if not force and (now - float(self.rt._last_live_reconcile_ts or 0) < 120.0):
+            return
+        try:
+            portfolio = await live_clob.fetch_live_portfolio(force=True)
+        except Exception as e:
+            self.rt.log(f"reconcile לייב: שגיאת fetch — {e}")
+            return
+        if not portfolio.get("ok"):
+            return
+        ctx = dict(context or {})
+        ctx.setdefault("reason", "LIVE_RECONCILE")
+        tr = self.demo.reconcile_live_state(
+            portfolio.get("balance_usd"),
+            list(portfolio.get("positions") or []),
+            context=ctx,
+        )
+        self.rt._last_live_reconcile_ts = now
+        if tr is not None:
+            delta = float(tr.get("realized_pnl") or 0.0)
+            self.rt.log_event(f"reconcile לייב: דלתא יתרה {delta:+.2f}$")
+
+    async def approve_pending(self, live: Optional[bool] = None) -> dict[str, Any]:
+        """מאשר פקודה ממתינה.
+
+        מצב "כסף אמיתי" נקבע לפי `self.rt.live_trading` (מופעל מהממשק).
+        הפרמטר `live` נשמר לתאימות אחורה: אם הועבר במפורש כ-False מהצד שני,
+        הוא עדיין יוביל לסימולציה (ניתן לכפות סימולציה לבקשה בודדת).
+        """
         p = self.rt.pending_approval
         if not p:
             return {"ok": False, "error": "אין המתנה לאישור"}
+        # אם הצד השני לא העביר במפורש, קוראים את מצב הזמן־אמת מהמנוע.
+        live_request = bool(self.rt.live_trading) if live is None else bool(live)
         if p["action"] == "buy":
             ctx = dict(p.get("context") or {})
             cfg0 = self.rt.config
@@ -340,7 +426,7 @@ class StrategyRunner:
             if not ok_sz:
                 self.rt.log(f"נכשל: {verr}")
                 return {"ok": False, "error": verr or "גודל לא תקין"}
-            use_live = bool(live) and self._live_trading_ok()
+            use_live = live_request and self._live_trading_ok()
             if use_live:
                 lim = float(p.get("limit") or 1.0)
                 lo = await live_clob.place_limit_order(
@@ -427,7 +513,7 @@ class StrategyRunner:
             if not ok_sz:
                 self.rt.log(f"גידור נכשל: {verr}")
                 return {"ok": False, "error": verr or "גודל לא תקין"}
-            use_live = bool(live) and self._live_trading_ok()
+            use_live = live_request and self._live_trading_ok()
             if use_live:
                 _, ask = await fetch_best_bid_ask(str(p["token"]))
                 if ask is None:
@@ -551,6 +637,12 @@ class StrategyRunner:
             pass
         # Heartbeat שמראה שהמנוע ממשיך לרוץ גם אם בינתיים אין status מפורש.
         self.rt.last_tick_ts = time.time()
+        # Reconcile קבוע (לא יותר מ-1 ל-120 שניות) כדי לתפוס drift בין הספר הפנימי
+        # ליתרה/פוזיציות האמיתיות של Polymarket — רץ רק במצב לייב.
+        try:
+            await self._live_reconcile_if_enabled()
+        except Exception:
+            pass
         m = await discover_active_btc_window(self.rt.config.btc_window)
         if not m:
             self.rt.log(f"לא נמצא שוק BTC Up/Down חלון {self.rt.config.btc_window} פעיל")
@@ -561,16 +653,29 @@ class StrategyRunner:
             if self.rt.current_epoch != 0:
                 from market_discovery import window_step_sec
 
+                rollover_ctx = {
+                    "settled_epoch": self.rt.current_epoch,
+                    "settled_window_sec": window_step_sec(self.rt.config.btc_window),
+                    "epoch": m.epoch,
+                    "slug": m.slug,
+                    "reason": "EXPIRE_0 rollover",
+                }
+                # לייב: לפני שאנחנו מסתמכים על פירוק BTC-פרוקסי, ננסה לסגור אקטיבית
+                # את הפוזיציות האמיתיות ב-CLOB. מה שנכשל נופל לגיבוי של expire_all_outside_tokens.
+                if self._live_trading_ok():
+                    try:
+                        await self._live_close_outside_tokens(
+                            (m.token_up, m.token_down), context=rollover_ctx
+                        )
+                    except Exception as e:
+                        self.rt.log(f"סגירה אקטיבית: כשל כללי — {e}")
                 settlement_trades = await self.demo.expire_all_outside_tokens(
                     (m.token_up, m.token_down),
-                    context={
-                        "settled_epoch": self.rt.current_epoch,
-                        "settled_window_sec": window_step_sec(self.rt.config.btc_window),
-                        "epoch": m.epoch,
-                        "slug": m.slug,
-                        "reason": "EXPIRE_0 rollover",
-                    },
+                    context=rollover_ctx,
                 )
+                # לייב: אחרי פירוק — reconcile מלא מול המציאות כדי לטפל בכל drift שנשאר.
+                if self._live_trading_ok():
+                    await self._live_reconcile_if_enabled(context=rollover_ctx, force=True)
                 cfg_lr = self.rt.config
                 if settlement_trades:
                     has_loss = any(float(t.get("realized_pnl") or 0) < 0 for t in settlement_trades)

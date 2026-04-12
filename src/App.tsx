@@ -1567,6 +1567,13 @@ export default function App() {
     () => typeof localStorage !== "undefined" && !localStorage.getItem("pm_onboard_done")
   );
   const [liveMode, setLiveMode] = useState(false);
+  /** מצב "כסף אמיתי" בפועל מצד המנוע (לאחר kill-switch/מפתח) — לצגת חסימה אם יש */
+  const [liveModeEffective, setLiveModeEffective] = useState(false);
+  const [liveModeBlockedReason, setLiveModeBlockedReason] = useState<string | null>(null);
+  /** האם המפתח הנוכחי נשמר ל-Keychain (כלומר נטען אוטומטית בהרצות הבאות) */
+  const [pkPersistedInKeychain, setPkPersistedInKeychain] = useState(false);
+  /** Checkbox ב-UI: האם לשמור את המפתח לצמיתות כשלוחצים "שמור" */
+  const [pkPersistChecked, setPkPersistChecked] = useState(true);
   const [tab, setTab] = useState<Tab>("dash");
   const [market, setMarket] = useState<Market | null>(null);
   const [btc, setBtc] = useState<{ price: number; history: { t: number; p: number }[] }>({
@@ -1574,6 +1581,32 @@ export default function App() {
     history: [],
   });
   const [demoState, setDemoState] = useState<Record<string, unknown>>({});
+  /** יתרת USDC ב-CLOB (Polymarket) לפי המפתח הנוכחי — לא יתרת הסימולציה */
+  const [pmClobAccount, setPmClobAccount] = useState<{
+    ok: boolean;
+    balance_usd: number | null;
+    allowance_usd: number | null;
+    address: string | null;
+    error?: string;
+  } | null>(null);
+  /** snapshot חי מלא: יתרה + פוזיציות אמיתיות + שווי נטו — נקרא רק כשליב פעיל */
+  const [livePortfolio, setLivePortfolio] = useState<{
+    ok: boolean;
+    balance_usd: number | null;
+    allowance_usd: number | null;
+    equity_usd: number | null;
+    address: string | null;
+    positions: {
+      token_id: string;
+      side: string;
+      size: number;
+      avg_price: number | null;
+      mark_price: number | null;
+      value_usd: number | null;
+    }[];
+    ts: number | null;
+    error?: string;
+  } | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [logEntries, setLogEntries] = useState<{ ts: number; msg: string; type: string; session_id?: string }[]>([]);
   const [pending, setPending] = useState<Record<string, unknown> | null>(null);
@@ -1667,7 +1700,7 @@ export default function App() {
     refreshInFlight.current = true;
     try {
       setErr("");
-      const [m, b, st, lg, pe, cfg, obSummary, logEnt] = await Promise.all([
+      const [m, b, st, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw] = await Promise.all([
         api<Market>("/api/market/current"),
         api<{ price: number; history: { t: number; p: number }[] }>("/api/btc/live"),
         api<Record<string, unknown>>("/api/demo/state"),
@@ -1676,7 +1709,32 @@ export default function App() {
         api<Record<string, unknown>>("/api/strategy/config"),
         api<OrderbookSummary>("/api/market/orderbook-summary"),
         api<{ entries: { ts: number; msg: string; type: string; session_id?: string }[] }>("/api/strategy/log-entries").catch(() => ({ entries: [] })),
+        api<{ enabled: boolean; effective: boolean; reason_blocked: string | null; persisted_in_keychain?: boolean }>("/api/live/mode").catch(() => null),
+        api<{
+          ok?: boolean;
+          error?: string;
+          balance_usd?: number | null;
+          allowance_usd?: number | null;
+          address?: string | null;
+        }>("/api/live/polymarket-clob-account").catch(() => ({ ok: false, error: "לא ניתן לטעון" })),
       ]);
+      if (lm) {
+        setLiveMode(Boolean(lm.enabled));
+        setLiveModeEffective(Boolean(lm.effective));
+        setLiveModeBlockedReason(lm.reason_blocked ?? null);
+        setPkPersistedInKeychain(Boolean(lm.persisted_in_keychain));
+      }
+      {
+        const p = pmClobRaw as Record<string, unknown>;
+        setPmClobAccount({
+          ok: Boolean(p.ok),
+          balance_usd: typeof p.balance_usd === "number" && Number.isFinite(p.balance_usd) ? p.balance_usd : null,
+          allowance_usd:
+            typeof p.allowance_usd === "number" && Number.isFinite(p.allowance_usd) ? p.allowance_usd : null,
+          address: typeof p.address === "string" ? p.address : null,
+          error: typeof p.error === "string" ? p.error : undefined,
+        });
+      }
       setMarket(m);
       setBtc(b);
       setDemoState(st);
@@ -1779,6 +1837,31 @@ export default function App() {
       cancelled = true;
     };
   }, [refresh]);
+
+  /** Polling נפרד לתיק חי מ-Polymarket: רק כשמצב לייב "effective" (מפתח, דגל ו-kill-switch).
+   *  קצב 3 שניות — מספיק לעיניים, ולא חונק את ה-CLOB (שרת מבצע cache פנימי של ~2 שניות).
+   */
+  useEffect(() => {
+    if (!liveModeEffective) {
+      setLivePortfolio(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const p = await api<typeof livePortfolio>("/api/live/portfolio");
+        if (!cancelled) setLivePortfolio(p);
+      } catch {
+        // rate-limited / offline — נשאיר את הקודם
+      }
+    };
+    void poll();
+    const id = window.setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [liveModeEffective]);
 
   const pushConfig = async () => {
     await api("/api/strategy/config", {
@@ -1945,19 +2028,41 @@ export default function App() {
         <h1 className="app-title">Polymarket BTC — מסחר Up/Down · גרסה 3</h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <span className={`badge-mode ${liveMode ? "badge-mode--live" : "badge-mode--demo"}`}>
-            {liveMode ? "מסחר חי" : "סימולציה"}
+            {liveMode ? (liveModeEffective ? "מסחר חי" : "מסחר חי (חסום)") : "סימולציה"}
           </span>
           <Button
             variant="primary"
             className="header-mode-btn"
             data-live={liveMode ? "true" : "false"}
-            onClick={() => {
+            onClick={async () => {
+              const next = !liveMode;
               if (
-                !liveMode &&
+                next &&
                 !confirm("האם לעבור למסחר חי? פעולה זו כרוכה בסיכון כספי ודורשת אחריות.")
               )
                 return;
-              setLiveMode(!liveMode);
+              // עדכון אופטימיסטי כדי שהכפתור יגיב מיד; הערך הסופי מגיע מ-refresh הבא.
+              setLiveMode(next);
+              try {
+                const r = await api<{
+                  ok?: boolean;
+                  enabled?: boolean;
+                  effective?: boolean;
+                  reason_blocked?: string | null;
+                }>("/api/live/mode", {
+                  method: "POST",
+                  body: JSON.stringify({ enabled: next }),
+                });
+                if (r) {
+                  if (typeof r.enabled === "boolean") setLiveMode(r.enabled);
+                  if (typeof r.effective === "boolean") setLiveModeEffective(r.effective);
+                  setLiveModeBlockedReason(r.reason_blocked ?? null);
+                }
+              } catch (e) {
+                // במקרה של כשל, חוזרים למצב קודם
+                setLiveMode(!next);
+                alert(e instanceof Error ? e.message : "כשל בעדכון מצב כסף אמיתי");
+              }
             }}
           >
             {liveMode ? "חזרה לסימולציה" : "מעבר למסחר חי"}
@@ -1968,10 +2073,30 @@ export default function App() {
       {liveMode && (
         <div className="live-banner">
           <div style={{ fontSize: 12, color: "var(--text-secondary)", marginBottom: 8 }}>
-            יתרת הסימולציה אינה משקפת יתרה אמיתית. פקודות נשלחות ל־Polymarket בעת קיום מפתח תקף. לכיבוי שליחה:{" "}
-            <code>POLYMARKET_LIVE=0</code>
+            מצב "כסף אמיתי" נשלט מהכפתור בראש המסך — אין צורך לערוך <code>.env</code>.{" "}
+            <code>POLYMARKET_LIVE=0</code> משמש רק כ-kill-switch ברמת שרת/פריסה ולא מפעיל לייב.
+            {liveModeBlockedReason && (
+              <div style={{ color: "var(--down, #e24)", marginTop: 4 }}>
+                ⚠ לייב חסום כרגע: {liveModeBlockedReason}
+              </div>
+            )}
           </div>
-          <strong>מפתח פרטי (אחסון מקומי בלבד):</strong>
+          <strong>מפתח פרטי:</strong>
+          {pkPersistedInKeychain && (
+            <span
+              style={{
+                marginInlineStart: 8,
+                padding: "2px 8px",
+                borderRadius: 10,
+                fontSize: 11,
+                background: "rgba(34,197,94,0.18)",
+                color: "#4ade80",
+                border: "1px solid rgba(34,197,94,0.35)",
+              }}
+            >
+              נטען אוטומטית מ-Keychain
+            </span>
+          )}
           <input
             type="password"
             style={{
@@ -1984,23 +2109,87 @@ export default function App() {
               background: "#1a1a1a",
               color: "#fff",
             }}
-            placeholder="0x..."
+            placeholder={pkPersistedInKeychain ? "(מפתח כבר שמור — השאר ריק אם אין שינוי)" : "0x..."}
             value={pk}
             onChange={(e) => setPk(e.target.value)}
           />
-          <button
-            type="button"
-            style={{ marginTop: 8, marginRight: 8, padding: "6px 12px" }}
-            onClick={async () => {
-              await api("/api/live/private-key", {
-                method: "POST",
-                body: JSON.stringify({ key: pk }),
-              });
-              alert("המפתח נשמר לסשן הנוכחי. יש להתקין את החבילה: pip install py-clob-client");
-            }}
-          >
-            שמור מפתח לסשן
-          </button>
+          <label style={{ display: "inline-flex", alignItems: "center", gap: 6, marginTop: 8, fontSize: 12 }}>
+            <input
+              type="checkbox"
+              checked={pkPersistChecked}
+              onChange={(e) => setPkPersistChecked(e.target.checked)}
+            />
+            שמור לצמיתות ב-Keychain של המחשב הזה
+          </label>
+          <div style={{ marginTop: 8 }}>
+            <button
+              type="button"
+              style={{ marginInlineEnd: 8, padding: "6px 12px" }}
+              onClick={async () => {
+                try {
+                  const r = await api<{
+                    py_clob_client_installed?: boolean;
+                    persisted?: boolean;
+                    persist_requested?: boolean;
+                  }>("/api/live/private-key", {
+                    method: "POST",
+                    body: JSON.stringify({ key: pk, persist: pkPersistChecked }),
+                  });
+                  if (r?.py_clob_client_installed === false) {
+                    alert(
+                      "המפתח נשמר.\n\nחבילת המסחר (py-clob-client) לא נמצאה בפייתון שמריץ את המנוע.\nבטרמינל: cd engine && python3 -m pip install -r requirements.txt\nואז הפעל מחדש את המנוע (npm run engine).",
+                    );
+                  } else if (pkPersistChecked && r?.persisted) {
+                    alert(
+                      "המפתח נשמר ל-Keychain של המחשב הזה. אין צורך להקליד אותו שוב בהרצות הבאות.\nשים לב: אבדן המחשב = סיכון לכסף.",
+                    );
+                  } else if (pkPersistChecked && !r?.persisted) {
+                    alert(
+                      "המפתח נשמר לסשן בלבד — שמירה קבועה ל-Keychain נכשלה.\nהתקן את ספריית keyring בפייתון של המנוע (pip install -r engine/requirements.txt) והפעל מחדש.",
+                    );
+                  } else {
+                    alert(
+                      "המפתח נשמר לסשן הנוכחי. אפשר להפעיל מסחר חי מהכפתור למעלה (אם אינו חסום).",
+                    );
+                  }
+                  setPk("");
+                  await refresh();
+                } catch (e) {
+                  alert(`שמירת המפתח נכשלה: ${e instanceof Error ? e.message : String(e)}`);
+                }
+              }}
+            >
+              שמור מפתח
+            </button>
+            {pkPersistedInKeychain && (
+              <button
+                type="button"
+                style={{ padding: "6px 12px" }}
+                onClick={async () => {
+                  if (
+                    !confirm(
+                      "למחוק את המפתח השמור ב-Keychain? לאחר מכן תצטרך להקליד מפתח שוב כדי לסחור חי.",
+                    )
+                  ) {
+                    return;
+                  }
+                  try {
+                    await api("/api/live/private-key", { method: "DELETE" });
+                    setPk("");
+                    await refresh();
+                  } catch (e) {
+                    alert(`מחיקת המפתח נכשלה: ${e instanceof Error ? e.message : String(e)}`);
+                  }
+                }}
+              >
+                מחק מפתח שמור
+              </button>
+            )}
+          </div>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.45 }}>
+            המפתח נשמר רק במחשב המקומי דרך Keychain/Secret Service/Credential Manager של מערכת ההפעלה —{" "}
+            לא נשלח לשום שרת ולא נכתב ללוגים. אבדן המחשב = סיכון לכסף.
+          </div>
         </div>
       )}
 
@@ -2185,14 +2374,131 @@ export default function App() {
 
           <div style={{ marginTop: 16, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "stretch" }}>
             <Card padding="md" style={{ flex: 1, minWidth: 200 }}>
-              יתרה במזומן:{" "}
-              <strong className="tabular-nums">${Number((demoState as any).balance_usd || 0).toFixed(2)}</strong>
-              <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 12 }}>
-                שווי נטו (כולל פוזיציות):{" "}
-                <strong className="tabular-nums" style={{ color: "var(--text)" }}>
-                  ${Number(((demoState as any).last_mark || {}).equity || (demoState as any).balance_usd || 0).toFixed(2)}
-                </strong>
-              </div>
+              {liveModeEffective && livePortfolio?.ok ? (
+                <>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
+                    Polymarket — נתונים חיים{" "}
+                    <span
+                      style={{
+                        marginInlineStart: 6,
+                        padding: "1px 6px",
+                        borderRadius: 8,
+                        fontSize: 10,
+                        background: "rgba(34,197,94,0.18)",
+                        color: "#4ade80",
+                        border: "1px solid rgba(34,197,94,0.35)",
+                      }}
+                    >
+                      LIVE
+                    </span>
+                  </div>
+                  יתרת USDC ב-CLOB:{" "}
+                  <strong className="tabular-nums">
+                    ${Number(livePortfolio.balance_usd ?? 0).toFixed(2)}
+                  </strong>
+                  <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 12 }}>
+                    שווי נטו (כולל פוזיציות פתוחות ב-Polymarket):{" "}
+                    <strong className="tabular-nums" style={{ color: "var(--text)" }}>
+                      ${Number(livePortfolio.equity_usd ?? livePortfolio.balance_usd ?? 0).toFixed(2)}
+                    </strong>
+                  </div>
+                  <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 12 }}>
+                    פוזיציות פתוחות:{" "}
+                    <strong className="tabular-nums" style={{ color: "var(--text)" }}>
+                      {livePortfolio.positions?.length ?? 0}
+                    </strong>
+                  </div>
+                  {livePortfolio.address ? (
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 8, wordBreak: "break-all", lineHeight: 1.35 }}>
+                      כתובת חותם: {livePortfolio.address}
+                    </div>
+                  ) : null}
+                  <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed var(--border)", fontSize: 11, color: "var(--muted)", lineHeight: 1.45 }}>
+                    נתוני היתרה והפוזיציות נמשכים ישירות מ-Polymarket (CLOB + Data API). ספר הסימולציה הפנימי מתסנכרן אוטומטית (reconcile) מדי רוטציה של חלון.
+                  </div>
+                  <details style={{ marginTop: 10 }}>
+                    <summary style={{ cursor: "pointer", fontSize: 12, color: "var(--muted)" }}>
+                      ספר סימולציה (מקומי, לעיון)
+                    </summary>
+                    <div style={{ marginTop: 6, fontSize: 12 }}>
+                      יתרה מקומית:{" "}
+                      <strong className="tabular-nums">
+                        ${Number((demoState as any).balance_usd || 0).toFixed(2)}
+                      </strong>
+                      <span style={{ color: "var(--muted)", margin: "0 6px" }}>·</span>
+                      שווי נטו מקומי:{" "}
+                      <strong className="tabular-nums">
+                        $
+                        {Number(
+                          ((demoState as any).last_mark || {}).equity ||
+                            (demoState as any).balance_usd ||
+                            0,
+                        ).toFixed(2)}
+                      </strong>
+                      <span style={{ color: "var(--muted)", fontSize: 10, marginInlineStart: 6 }}>
+                        (חישוב מקומי)
+                      </span>
+                    </div>
+                  </details>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>סימולציה (מנוע מקומי)</div>
+                  יתרה במזומן:{" "}
+                  <strong className="tabular-nums">${Number((demoState as any).balance_usd || 0).toFixed(2)}</strong>
+                  <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 12 }}>
+                    שווי נטו (כולל פוזיציות):{" "}
+                    <strong className="tabular-nums" style={{ color: "var(--text)" }}>
+                      $
+                      {Number(
+                        ((demoState as any).last_mark || {}).equity || (demoState as any).balance_usd || 0,
+                      ).toFixed(2)}
+                    </strong>
+                  </div>
+                  {pmClobAccount?.ok ? (
+                    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
+                      <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
+                        Polymarket — יתרת USDC ב-CLOB (לפי המפתח ששמרת)
+                      </div>
+                      <div style={{ fontSize: 13 }}>
+                        זמין למסחר:{" "}
+                        <strong className="tabular-nums">
+                          {pmClobAccount.balance_usd != null
+                            ? `$${pmClobAccount.balance_usd.toFixed(2)}`
+                            : "—"}
+                        </strong>
+                        <span style={{ color: "var(--muted)", margin: "0 6px" }}>·</span>
+                        אישור הוצאה:{" "}
+                        <strong className="tabular-nums">
+                          {pmClobAccount.allowance_usd != null
+                            ? `$${pmClobAccount.allowance_usd.toFixed(2)}`
+                            : "—"}
+                        </strong>
+                      </div>
+                      {pmClobAccount.address ? (
+                        <div
+                          style={{
+                            fontSize: 11,
+                            color: "var(--muted)",
+                            marginTop: 8,
+                            wordBreak: "break-all",
+                            lineHeight: 1.35,
+                          }}
+                        >
+                          כתובת חותם: {pmClobAccount.address}
+                        </div>
+                      ) : null}
+                      <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.4 }}>
+                        זה מה שמערכת ה-CLOB מדווחת; זה לא בהכרח זהה ל«Portfolio» המלא באתר Polymarket.
+                      </div>
+                    </div>
+                  ) : pmClobAccount && !pmClobAccount.ok ? (
+                    <div style={{ marginTop: 10, fontSize: 12, color: "var(--muted)", lineHeight: 1.45 }}>
+                      Polymarket CLOB: {pmClobAccount.error ?? "לא זמין"} — שמור מפתח (למעלה) והתקן py-clob-client במנוע.
+                    </div>
+                  ) : null}
+                </>
+              )}
             </Card>
             <Button
               variant="primary"
@@ -2837,9 +3143,10 @@ export default function App() {
                 onClick={async () => {
                   setActionLoading("approve");
                   try {
+                    // מצב "כסף אמיתי" נשלט מראש ע"י כפתור הראש — השרת קורא את הדגל מהמנוע.
                     const r = await api<{ ok?: boolean; error?: string }>("/api/strategy/approve", {
                       method: "POST",
-                      body: JSON.stringify({ live: liveMode }),
+                      body: JSON.stringify({}),
                     });
                     if (r && (r as { ok?: boolean }).ok === false) {
                       alert((r as { error?: string }).error || "כשל באישור");
@@ -3020,6 +3327,7 @@ export default function App() {
                   </button>
                   <a
                     href={engineUrl("/api/demo/export.csv")}
+                    download="demo-trades.csv"
                     style={{
                       display: "inline-flex",
                       alignItems: "center",

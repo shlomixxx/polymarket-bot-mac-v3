@@ -122,3 +122,97 @@ def test_strategy_logs_cleared_on_off_to_auto(client: TestClient):
     lines = client.get("/api/strategy/logs").json().get("lines") or []
     assert lines == []
 
+
+def test_polymarket_clob_account_without_key(client: TestClient):
+    r = client.get("/api/live/polymarket-clob-account")
+    assert r.status_code == 200
+    j = r.json()
+    assert j.get("ok") is False
+    assert "error" in j
+
+
+# ────────────────── Private key persist / delete ──────────────────
+
+
+def test_private_key_persist_and_autoload(client: TestClient, monkeypatch):
+    """POST persist=true שומר ב-keyring, ובעליה חוזרת המפתח נטען אוטומטית."""
+    import os
+    import secret_store
+
+    store: dict[str, str] = {}
+    monkeypatch.setattr(secret_store, "save_key", lambda k: (store.__setitem__("key", k), True)[1])
+    monkeypatch.setattr(secret_store, "load_key", lambda: store.get("key"))
+    monkeypatch.setattr(secret_store, "has_persisted_key", lambda: "key" in store)
+
+    r = client.post("/api/live/private-key", json={"key": "0xABC", "persist": True})
+    assert r.status_code == 200
+    j = r.json()
+    assert j["ok"] is True
+    assert j["set"] is True
+    assert j["persisted"] is True
+    assert j["persisted_in_keychain"] is True
+    assert store["key"] == "0xABC"
+    assert os.environ.get("POLYMARKET_PRIVATE_KEY") == "0xABC"
+
+    # סימולציה של עלייה חדשה: מוחקים את env, טוענים מחדש
+    monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
+    import main as engine_main
+    engine_main._autoload_private_key_from_store()
+    assert os.environ.get("POLYMARKET_PRIVATE_KEY") == "0xABC"
+
+
+def test_private_key_session_only(client: TestClient, monkeypatch):
+    """POST persist=false לא נוגע ב-keyring."""
+    import secret_store
+
+    store: dict[str, str] = {}
+    monkeypatch.setattr(secret_store, "save_key", lambda k: (store.__setitem__("key", k), True)[1])
+    monkeypatch.setattr(secret_store, "load_key", lambda: store.get("key"))
+    monkeypatch.setattr(secret_store, "has_persisted_key", lambda: "key" in store)
+
+    r = client.post("/api/live/private-key", json={"key": "0xTEMP", "persist": False})
+    assert r.status_code == 200
+    j = r.json()
+    assert j["set"] is True
+    assert j["persisted"] is False
+    assert "key" not in store  # keyring not touched
+
+
+def test_private_key_delete(client: TestClient, monkeypatch):
+    """DELETE מנקה env + keyring."""
+    import os
+    import secret_store
+
+    os.environ["POLYMARKET_PRIVATE_KEY"] = "0xDEL"
+    deleted_from = {}
+    monkeypatch.setattr(secret_store, "delete_key", lambda: (deleted_from.__setitem__("called", True), True)[1])
+    monkeypatch.setattr(secret_store, "has_persisted_key", lambda: False)
+
+    r = client.delete("/api/live/private-key")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["ok"] is True
+    assert j["removed_from_keychain"] is True
+    assert os.environ.get("POLYMARKET_PRIVATE_KEY") == ""
+    assert deleted_from.get("called") is True
+
+
+def test_live_mode_state_includes_persisted(client: TestClient, monkeypatch):
+    """GET /api/live/mode includes persisted_in_keychain field."""
+    import secret_store
+    monkeypatch.setattr(secret_store, "has_persisted_key", lambda: True)
+
+    r = client.get("/api/live/mode")
+    assert r.status_code == 200
+    j = r.json()
+    assert "persisted_in_keychain" in j
+    assert j["persisted_in_keychain"] is True
+
+
+def test_live_portfolio_without_key(client: TestClient):
+    """GET /api/live/portfolio returns ok=False when no key."""
+    r = client.get("/api/live/portfolio")
+    assert r.status_code == 200
+    j = r.json()
+    assert j.get("ok") is False
+

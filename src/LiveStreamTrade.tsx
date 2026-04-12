@@ -1,5 +1,9 @@
 import type { ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { StreamSpectatorLayout } from "./StreamSpectatorLayout";
+import { playEntryChime, playExitChime, resumeStreamAudio } from "./streamAudio";
+import type { StreamViewerLayout } from "./streamViewerTypes";
+import { smoothRunPnlForChart } from "./runPnlSmoothing";
 import {
   Area,
   CartesianGrid,
@@ -64,7 +68,16 @@ type DemoState = {
   bot_run_win_rate_pct?: number | null;
   bot_run_exit_trades_n?: number;
   bot_run_wins_n?: number;
-  trades?: { ts?: number; type?: string; token_id?: string }[];
+  trades?: {
+    ts?: number;
+    type?: string;
+    token_id?: string;
+    realized_pnl?: number;
+    settled_epoch?: number;
+    epoch?: number;
+    settled_window_sec?: number;
+    window_sec?: number;
+  }[];
   positions?: {
     side: string;
     contracts: number;
@@ -76,6 +89,8 @@ type DemoState = {
     unrealized_usd?: number;
     legs?: DemoLeg[];
   };
+  /** דגימות (unix sec, equity usd) מהמנוע — נשמר בשרת, מאפשר לשחזר גרף run P&L אחרי רענון דף */
+  equity_history?: [number, number][] | number[][];
 };
 
 type OrderbookSummary = {
@@ -303,6 +318,19 @@ function toFiniteNumber(v: unknown): number | null {
   return null;
 }
 
+/** Min/max after trimming tails — softens a single bad sample so chart scale & ref lines don’t stick on a spike. */
+function trimmedUsdMinMax(usds: number[], trimFraction = 0.06): { lo: number; hi: number } {
+  if (usds.length === 0) return { lo: 0, hi: 1 };
+  if (usds.length < 10) {
+    return { lo: Math.min(...usds), hi: Math.max(...usds) };
+  }
+  const s = [...usds].sort((a, b) => a - b);
+  const trim = Math.max(1, Math.floor(s.length * trimFraction));
+  const slice = s.slice(trim, s.length - trim);
+  if (slice.length === 0) return { lo: s[0], hi: s[s.length - 1] };
+  return { lo: Math.min(...slice), hi: Math.max(...slice) };
+}
+
 /** הודעת שידור קצרה לפי עסקת היציאה האחרונה (לפי ts). */
 function describeStreamExit(trades: DemoState["trades"]): string {
   if (!trades?.length) return "✅ Position closed — flat until next entry.";
@@ -317,105 +345,58 @@ function describeStreamExit(trades: DemoState["trades"]): string {
   return "✅ Position closed — flat until next entry.";
 }
 
-/** הקשר אודיו יחיד — דפדפנים דורשים לרוב אינטראקציה לפני resume(). */
-let streamAudioCtx: AudioContext | null = null;
+type RoundOutcome = { id: string; startLabel: string; endLabel: string; win: boolean };
 
-function getStreamAudioContext(): AudioContext | null {
-  try {
-    const AC = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AC) return null;
-    if (!streamAudioCtx || streamAudioCtx.state === "closed") {
-      streamAudioCtx = new AC();
+/** Per-exit history for spectator overlay — win/loss only, no dollar amounts. Newest first; one row per exit (multiple rows in the same clock minute if multiple trades). */
+function buildRoundOutcomes(
+  trades: DemoState["trades"] | undefined,
+  maxItems: number,
+  /** רק יציאות מאז תחילת ריצת הבוט (epoch sec), כמו win rate בשרת — בלי יציאות ישנות מה־DB */
+  minExitTsSec: number | null,
+): RoundOutcome[] {
+  if (!trades?.length) return [];
+  const exits = trades.filter((t) => {
+    const typ = String(t.type ?? "");
+    if (t.realized_pnl == null || Number.isNaN(Number(t.realized_pnl))) return false;
+    if (
+      !(
+        typ === "EXPIRE_0" ||
+        typ === "SETTLE_WIN" ||
+        typ === "SETTLE_LOSS" ||
+        typ === "SETTLE_UNKNOWN" ||
+        typ === "SELL_TP" ||
+        typ.startsWith("SELL")
+      )
+    ) {
+      return false;
     }
-    return streamAudioCtx;
-  } catch {
-    return null;
-  }
-}
-
-/** קרא אחרי לחיצה/מגע (או מכפתור בדיקה) כדי לאפשר השמעה. */
-async function resumeStreamAudio(): Promise<boolean> {
-  const ctx = getStreamAudioContext();
-  if (!ctx) return false;
-  try {
-    await ctx.resume();
-    return ctx.state === "running";
-  } catch {
-    return false;
-  }
-}
-
-/** צליל קצר בכניסה לעסקה — רץ רק אחרי ש־AudioContext ב־running. */
-function playEntryChime(): void {
-  const ctx = getStreamAudioContext();
-  if (!ctx) return;
-  const run = () => {
-    if (ctx.state !== "running") return;
-    try {
-      const now = ctx.currentTime;
-      const notes: [number, number, number][] = [
-        [523.25, 0, 0.14],
-        [659.25, 0.11, 0.16],
-        [783.99, 0.24, 0.2],
-      ];
-      for (const [freq, delay, dur] of notes) {
-        const o = ctx.createOscillator();
-        const g = ctx.createGain();
-        o.type = "sine";
-        o.frequency.value = freq;
-        o.connect(g);
-        g.connect(ctx.destination);
-        const t0 = now + delay;
-        g.gain.setValueAtTime(0.0001, t0);
-        g.gain.exponentialRampToValueAtTime(0.2, t0 + 0.02);
-        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-        o.start(t0);
-        o.stop(t0 + dur + 0.02);
-      }
-    } catch {
-      /* ignore */
-    }
-  };
-  void ctx.resume().then(() => {
-    run();
+    const tsSec = Number(t.ts);
+    const fallbackEpoch = t.settled_epoch ?? t.epoch;
+    const sec = Number.isFinite(tsSec) ? tsSec : Number(fallbackEpoch);
+    if (!Number.isFinite(sec)) return false;
+    if (minExitTsSec != null && sec < minExitTsSec) return false;
+    return true;
   });
-}
-
-/** צליל יציאה מהעסקה — ארפג׳ יורד (שונה מכניסה) כדי שזה יהיה מזוהה בקלות. */
-function playExitChime(): void {
-  const ctx = getStreamAudioContext();
-  if (!ctx) return;
-  const run = () => {
-    if (ctx.state !== "running") return;
-    try {
-      const now = ctx.currentTime;
-      const notes: [number, number, number][] = [
-        [783.99, 0, 0.12],
-        [659.25, 0.09, 0.13],
-        [523.25, 0.2, 0.15],
-        [392.0, 0.34, 0.18],
-      ];
-      for (const [freq, delay, dur] of notes) {
-        const o = ctx.createOscillator();
-        const g = ctx.createGain();
-        o.type = "triangle";
-        o.frequency.value = freq;
-        o.connect(g);
-        g.connect(ctx.destination);
-        const t0 = now + delay;
-        g.gain.setValueAtTime(0.0001, t0);
-        g.gain.exponentialRampToValueAtTime(0.14, t0 + 0.025);
-        g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-        o.start(t0);
-        o.stop(t0 + dur + 0.02);
-      }
-    } catch {
-      /* ignore */
-    }
-  };
-  void ctx.resume().then(() => {
-    run();
-  });
+  const sorted = [...exits].sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
+  const out: RoundOutcome[] = [];
+  const fmt = (d: Date) =>
+    d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  let idx = 0;
+  for (const t of sorted) {
+    const tsSec = Number(t.ts);
+    const fallbackEpoch = t.settled_epoch ?? t.epoch;
+    const sec = Number.isFinite(tsSec) ? tsSec : Number(fallbackEpoch);
+    if (!Number.isFinite(sec)) continue;
+    const win = Number(t.realized_pnl) > 0;
+    const d = new Date(sec * 1000);
+    const timeLabel = fmt(d);
+    const typ = String(t.type ?? "");
+    const id = `${sec}-${idx}-${typ}`;
+    idx += 1;
+    out.push({ id, startLabel: timeLabel, endLabel: timeLabel, win });
+    if (out.length >= maxItems) break;
+  }
+  return out;
 }
 
 type StreamMood = {
@@ -536,6 +517,54 @@ function pickBotRunEquityBaseline(cfg: StrategyConfigSlice | null, demo: DemoSta
   return toFiniteNumber(cfg?.ui_runtime_equity_baseline_usd ?? demo?.ui_runtime_equity_baseline_usd);
 }
 
+const RUN_PNL_SERIES_MAX_POINTS = 1800;
+
+function downsampleRunPnlPoints(pts: { t: number; usd: number }[], maxN: number): { t: number; usd: number }[] {
+  if (pts.length <= maxN) return pts;
+  const n = pts.length;
+  const out: { t: number; usd: number }[] = [];
+  for (let k = 0; k < maxN; k++) {
+    const idx = Math.min(n - 1, Math.round((k / Math.max(1, maxN - 1)) * (n - 1)));
+    out.push(pts[idx]);
+  }
+  out[out.length - 1] = { ...pts[n - 1] };
+  return out;
+}
+
+/** בונה סדרת run P&L מהיסטוריית equity בשרת — אותה לוגיקה כמו runPnlUsd (baseline מול bot run). */
+function buildRunPnlSeriesFromEquityHistory(
+  cfg: StrategyConfigSlice | null,
+  demo: DemoState | null,
+): { t: number; usd: number }[] {
+  if (cfg?.mode === "off") return [];
+  const base = pickBotRunEquityBaseline(cfg, demo);
+  const t0 = toFiniteNumber(cfg?.bot_run_started_ts ?? demo?.bot_run_started_ts);
+  if (base == null || t0 == null) return [];
+  const hist = demo?.equity_history;
+  if (!hist?.length) return [];
+  const pts: { t: number; usd: number }[] = [];
+  for (const row of hist) {
+    if (!Array.isArray(row) || row.length < 2) continue;
+    const ts = Number(row[0]);
+    const eq = Number(row[1]);
+    if (!Number.isFinite(ts) || !Number.isFinite(eq)) continue;
+    if (ts < t0 - 1e-6) continue;
+    pts.push({ t: ts, usd: eq - base });
+  }
+  if (pts.length === 0) return [];
+  pts.sort((a, b) => a.t - b.t);
+  const deduped: { t: number; usd: number }[] = [];
+  for (const p of pts) {
+    const last = deduped[deduped.length - 1];
+    if (last && Math.abs(last.t - p.t) < 1e-6) {
+      deduped[deduped.length - 1] = p;
+    } else {
+      deduped.push(p);
+    }
+  }
+  return downsampleRunPnlPoints(deduped, RUN_PNL_SERIES_MAX_POINTS);
+}
+
 function aggregateEntry(positions: NonNullable<DemoState["positions"]>) {
   let contracts = 0;
   let costSum = 0;
@@ -553,7 +582,7 @@ function aggregateEntry(positions: NonNullable<DemoState["positions"]>) {
   };
 }
 
-export type StreamViewerLayout = "classic" | "showcase";
+export type { StreamViewerLayout } from "./streamViewerTypes";
 
 /** עטיפה לשידור: התוכן מוקטן ב־scale כדי להיכנס ל־100dvh בלי גלילה (מופעל עם ?fit=1). */
 function BroadcastFit(props: {
@@ -579,6 +608,23 @@ function BroadcastFit(props: {
   );
 }
 
+type LivePortfolio = {
+  ok: boolean;
+  balance_usd: number | null;
+  equity_usd: number | null;
+  positions: {
+    token_id: string;
+    side: string;
+    size: number;
+    avg_price: number | null;
+    mark_price: number | null;
+    value_usd: number | null;
+  }[];
+  address: string | null;
+  ts: number | null;
+  error?: string;
+};
+
 export default function LiveStreamTrade({ layout = "classic" }: { layout?: StreamViewerLayout }) {
   const [market, setMarket] = useState<Market | null>(null);
   const [demo, setDemo] = useState<DemoState | null>(null);
@@ -586,6 +632,8 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   const [pendingApproval, setPendingApproval] = useState<{ action?: string } | null>(null);
   const [orderbook, setOrderbook] = useState<OrderbookSummary | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [liveModeEffective, setLiveModeEffective] = useState(false);
+  const [livePortfolio, setLivePortfolio] = useState<LivePortfolio | null>(null);
   const [clock, setClock] = useState(0);
   const [exitBanner, setExitBanner] = useState<string | null>(null);
   const [showUsd, setShowUsd] = useState(() =>
@@ -595,6 +643,8 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     typeof window !== "undefined" ? localStorage.getItem("streamEntrySound") !== "0" : true
   );
   const [pnlTickDelta, setPnlTickDelta] = useState(0);
+  /** Sampled run P&L ($) — spectator overlay only (client-side series). */
+  const [runPnlSeries, setRunPnlSeries] = useState<{ t: number; usd: number }[]>([]);
   const [audioUnlocked, setAudioUnlocked] = useState(false);
   const prevLivePctRef = useRef<number | null>(null);
 
@@ -623,12 +673,13 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     const gen = ++refreshGeneration.current;
     try {
       setErr(null);
-      const [m, st, cfg, pend, ob] = await Promise.all([
+      const [m, st, cfg, pend, ob, lm] = await Promise.all([
         api<Market>("/api/market/current"),
         api<DemoState>("/api/demo/state"),
         api<StrategyConfigSlice>("/api/strategy/config"),
         api<{ pending: { action?: string } | null }>("/api/strategy/pending"),
         safeApi<OrderbookSummary>("/api/market/orderbook-summary"),
+        safeApi<{ effective?: boolean }>("/api/live/mode"),
       ]);
       if (gen !== refreshGeneration.current) return;
       setMarket(m);
@@ -636,6 +687,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
       setStratCfg(cfg);
       setPendingApproval(pend?.pending ?? null);
       setOrderbook(ob);
+      setLiveModeEffective(Boolean(lm?.effective));
     } catch (e) {
       if (gen !== refreshGeneration.current) return;
       setErr(e instanceof Error ? e.message : String(e));
@@ -712,7 +764,12 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   useEffect(() => {
     document.documentElement.lang = "en";
     document.documentElement.dir = "ltr";
-    const base = layout === "showcase" ? "Live trade — viewer showcase" : "Live trade — stream";
+    const base =
+      layout === "spectator"
+        ? "Live trade — spectator overlay"
+        : layout === "showcase"
+          ? "Live trade — viewer showcase"
+          : "Live trade — stream";
     document.title = fitBroadcast ? `${base} (fit)` : base;
     return () => {
       document.documentElement.lang = "he";
@@ -731,7 +788,55 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     return () => window.clearInterval(id);
   }, []);
 
-  const positions = demo?.positions ?? [];
+  /** Mid prices (¢) — faster than full refresh so stream view tracks Polymarket closer. */
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      const ob = await safeApi<OrderbookSummary>("/api/market/orderbook-summary");
+      if (!cancelled && ob) setOrderbook(ob);
+    };
+    void poll();
+    const id = window.setInterval(poll, 400);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  /** Polling תיק חי מ-Polymarket: רק כש-live mode effective */
+  useEffect(() => {
+    if (!liveModeEffective) {
+      setLivePortfolio(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      const p = await safeApi<LivePortfolio>("/api/live/portfolio");
+      if (!cancelled && p) setLivePortfolio(p);
+    };
+    void poll();
+    const id = window.setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [liveModeEffective]);
+
+  /** סלקטור: בלייב — פוזיציות אמיתיות; בדמו — פוזיציות הספר הפנימי. */
+  const isLive = liveModeEffective && livePortfolio?.ok === true;
+
+  const positions = useMemo(() => {
+    if (isLive && livePortfolio?.positions?.length) {
+      return livePortfolio.positions.map((p) => ({
+        side: p.side,
+        contracts: p.size,
+        avg_cost: p.avg_price ?? 0,
+        token_id: p.token_id,
+      }));
+    }
+    return demo?.positions ?? [];
+  }, [isLive, livePortfolio?.positions, demo?.positions]);
+
   const open = positions.length > 0;
 
   /** חתימת פוזיציה — לא מסתמך רק על open: אם יש סגירה+כניסה באותו tick, open נשאר true ואז אין צלילים. */
@@ -834,7 +939,21 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     return null;
   }, [open, positions.length, leg, demo?.last_mark?.unrealized_usd, totalCostUsd]);
 
-  const liveUsd = open && typeof demo?.last_mark?.unrealized_usd === "number" ? demo.last_mark.unrealized_usd : null;
+  const liveUsd = useMemo(() => {
+    if (!open) return null;
+    if (isLive && livePortfolio?.positions?.length) {
+      // חישוב unrealized מול פוזיציות אמיתיות (value - cost)
+      let total = 0;
+      for (const p of livePortfolio.positions) {
+        const v = p.value_usd ?? 0;
+        const cost = (p.avg_price ?? 0) * p.size;
+        total += v - cost;
+      }
+      return total;
+    }
+    if (typeof demo?.last_mark?.unrealized_usd === "number") return demo.last_mark.unrealized_usd;
+    return null;
+  }, [open, isLive, livePortfolio?.positions, demo?.last_mark?.unrealized_usd]);
 
   useEffect(() => {
     if (livePct == null) {
@@ -847,15 +966,20 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     setPnlTickDelta(Math.abs(livePct - prev));
   }, [livePct]);
 
+  /** מיושר ל־DemoEngine.equity_snapshot_usd — מניעת קפיצות כש־last_mark נשאר עם equity ישן בזמן throttle.
+   *  בלייב: שווי נטו אמיתי מ-Polymarket; בדמו: equity מהספר הפנימי.
+   */
   const equityNow = useMemo(() => {
+    if (isLive) {
+      const liveEq = livePortfolio?.equity_usd ?? livePortfolio?.balance_usd;
+      if (typeof liveEq === "number" && Number.isFinite(liveEq) && liveEq >= 0) return liveEq;
+    }
     const bal = Number(demo?.balance_usd ?? 0);
     const safeBal = Number.isFinite(bal) ? bal : 0;
-    /** בלי פוזיציה — לא משתמשים ב־last_mark.equity (עלול להיות stale/לא עקבי ברגע יציאה ולגרום לבזק ב־P&L since bot on). */
-    if (!open) return safeBal;
     const eq = demo?.last_mark?.equity;
-    if (typeof eq === "number" && Number.isFinite(eq)) return eq;
+    if (typeof eq === "number" && Number.isFinite(eq) && eq >= 0) return eq;
     return safeBal;
-  }, [open, demo?.last_mark?.equity, demo?.balance_usd]);
+  }, [isLive, livePortfolio?.equity_usd, livePortfolio?.balance_usd, demo?.last_mark?.equity, demo?.balance_usd]);
 
   const equityBaselineUsd = useMemo(() => pickBotRunEquityBaseline(stratCfg, demo), [stratCfg, demo]);
 
@@ -921,6 +1045,106 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     const s = Math.max(0, market.seconds_left);
     return windowTotalSec > 0 ? Math.min(100, (s / windowTotalSec) * 100) : 0;
   }, [market, windowTotalSec, clock]);
+
+  /** % of market window elapsed (spectator overlay). */
+  const windowElapsedPct = useMemo(() => {
+    void clock;
+    if (!market || windowTotalSec <= 0) return 0;
+    const left = Math.max(0, market.seconds_left);
+    const elapsed = windowTotalSec - left;
+    return Math.min(100, Math.max(0, (elapsed / windowTotalSec) * 100));
+  }, [market, windowTotalSec, clock]);
+
+  const botRunSessionKey = `${stratCfg?.bot_run_started_ts ?? ""}|${demo?.bot_run_started_ts ?? ""}`;
+  const botRunSessionRef = useRef<string>("");
+  /** סשן בוט השתנה — מאתחלים מהיסטוריה בשרת (לא רק state ריק) כדי שהגרף ישרוד רענון דף */
+  useEffect(() => {
+    if (layout !== "spectator") return;
+    if (botRunSessionKey !== botRunSessionRef.current) {
+      botRunSessionRef.current = botRunSessionKey;
+      setRunPnlSeries(buildRunPnlSeriesFromEquityHistory(stratCfg, demo));
+    }
+  }, [botRunSessionKey, layout, stratCfg, demo]);
+
+  /** אם אחרי רענון עדיין ריק אבל המנוע כבר שלח equity_history — ממלא פעם אחת */
+  useEffect(() => {
+    if (layout !== "spectator") return;
+    if (stratCfg?.mode === "off") return;
+    setRunPnlSeries((prev) => {
+      if (prev.length > 0) return prev;
+      const seeded = buildRunPnlSeriesFromEquityHistory(stratCfg, demo);
+      return seeded.length > 0 ? seeded : prev;
+    });
+  }, [layout, stratCfg?.mode, stratCfg, demo]);
+
+  useEffect(() => {
+    void clock;
+    if (layout !== "spectator") return;
+    if (stratCfg?.mode === "off") {
+      setRunPnlSeries([]);
+      return;
+    }
+    const usd = runPnlUsd;
+    if (usd == null || !Number.isFinite(usd)) return;
+    const now = Date.now() / 1000;
+    setRunPnlSeries((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && Math.abs(last.usd - usd) < 1e-9 && now - last.t < 0.9) return prev;
+      const next = [...prev, { t: now, usd }];
+      return next.length > RUN_PNL_SERIES_MAX_POINTS ? next.slice(-RUN_PNL_SERIES_MAX_POINTS) : next;
+    });
+  }, [runPnlUsd, stratCfg?.mode, clock, layout]);
+
+  /** סדרה לתצוגה בלבד — מסיר ספיקים בודדים שלא משקפים מגמה אמיתית */
+  const runPnlSeriesDisplay = useMemo(() => {
+    if (layout !== "spectator" || !runPnlSeries.length) return runPnlSeries;
+    return smoothRunPnlForChart(runPnlSeries);
+  }, [runPnlSeries, layout]);
+
+  const runUsdYDomain = useMemo((): [number, number] => {
+    if (layout !== "spectator" || !runPnlSeriesDisplay.length) return [0, 1];
+    const vals = runPnlSeriesDisplay.map((x) => x.usd);
+    const { lo, hi } = trimmedUsdMinMax(vals);
+    const mid = (lo + hi) / 2;
+    const span = Math.max(hi - lo, 0);
+    const minSpan = Math.max(6, Math.abs(mid) * 0.025, 1);
+    if (span < minSpan) {
+      const h = minSpan / 2;
+      return [mid - h, mid + h];
+    }
+    const pad = Math.max(span * 0.1, 2);
+    return [lo - pad, hi + pad];
+  }, [runPnlSeriesDisplay, layout]);
+
+  /** Ref lines only — trimmed extrema so one glitch doesn’t keep the yellow/red guides forever. */
+  const runUsdChartRefExtremes = useMemo(() => {
+    if (layout !== "spectator" || !runPnlSeriesDisplay.length) return null;
+    const vals = runPnlSeriesDisplay.map((x) => x.usd);
+    const { lo, hi } = trimmedUsdMinMax(vals);
+    return { minUsd: lo, maxUsd: hi };
+  }, [runPnlSeriesDisplay, layout]);
+
+  const roundOutcomes = useMemo(() => {
+    if (layout !== "spectator") return [];
+    if (stratCfg?.mode === "off") return [];
+    const minTs = toFiniteNumber(stratCfg?.bot_run_started_ts ?? demo?.bot_run_started_ts);
+    if (minTs == null) return [];
+    return buildRoundOutcomes(demo?.trades, 120, minTs);
+  }, [demo?.trades, layout, stratCfg?.mode, stratCfg?.bot_run_started_ts, demo?.bot_run_started_ts]);
+
+  const runUsdSessionStats = useMemo(() => {
+    if (layout !== "spectator" || !runPnlSeriesDisplay.length) return null;
+    let maxUsd = runPnlSeriesDisplay[0].usd;
+    let minUsd = runPnlSeriesDisplay[0].usd;
+    for (const p of runPnlSeriesDisplay) {
+      if (p.usd > maxUsd) maxUsd = p.usd;
+      if (p.usd < minUsd) minUsd = p.usd;
+    }
+    const lastFromSeries = runPnlSeriesDisplay[runPnlSeriesDisplay.length - 1].usd;
+    const last =
+      runPnlUsd != null && Number.isFinite(runPnlUsd) ? runPnlUsd : lastFromSeries;
+    return { maxUsd, minUsd, last };
+  }, [runPnlSeriesDisplay, layout, runPnlUsd]);
 
   const streamPulseSec = useMemo(() => {
     if (!open || livePct == null) return 3.15;
@@ -1045,7 +1269,49 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     [chartExtremes, chartRows.length, lineColor]
   );
 
+  const isSpectator = layout === "spectator";
   const isShowcase = layout === "showcase";
+
+  if (isSpectator) {
+    return (
+      <StreamSpectatorLayout
+        fitBroadcast={fitBroadcast}
+        broadcastParentRef={broadcastParentRef}
+        broadcastContentRef={broadcastContentRef}
+        err={err}
+        exitBanner={exitBanner}
+        market={market}
+        stratCfg={stratCfg}
+        orderbook={orderbook}
+        open={open}
+        agg={agg}
+        livePct={livePct}
+        pnlColor={pnlColor}
+        entrySoundOn={entrySoundOn}
+        setEntrySoundOn={setEntrySoundOn}
+        audioUnlocked={audioUnlocked}
+        setAudioUnlocked={setAudioUnlocked}
+        streamMood={streamMood}
+        moodStyle={moodStyle}
+        showHotStreak={showHotStreak}
+        winRatePct={winRatePct}
+        winRateExits={winRateExits}
+        winRateWins={winRateWins}
+        winRateHot={winRateHot}
+        runPnlUsd={runPnlUsd}
+        runPnlSeries={runPnlSeriesDisplay}
+        runUsdYDomain={runUsdYDomain}
+        runUsdSessionStats={runUsdSessionStats}
+        runUsdChartRefExtremes={runUsdChartRefExtremes}
+        botRunUptimeSec={botRunUptimeSec}
+        windowElapsedPct={windowElapsedPct}
+        roundOutcomes={roundOutcomes}
+        streamPulseSec={streamPulseSec}
+        pulseRingRgb={pulseRingRgb}
+        chartIdleCopy={chartIdleCopy}
+      />
+    );
+  }
 
   return (
     <div
@@ -1206,6 +1472,24 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
             >
               LIVE
             </span>
+            {isLive ? (
+              <span
+                style={{
+                  fontSize: 10,
+                  fontWeight: 800,
+                  letterSpacing: "0.14em",
+                  color: "#fbbf24",
+                  padding: "4px 9px",
+                  borderRadius: 999,
+                  border: "1px solid rgba(251, 191, 36, 0.5)",
+                  background: "linear-gradient(135deg, rgba(251, 191, 36, 0.12), rgba(15, 23, 42, 0.9))",
+                  boxShadow: "0 0 10px rgba(251, 191, 36, 0.15)",
+                }}
+                title="Balance, positions & equity from Polymarket (real money)"
+              >
+                REAL MONEY
+              </span>
+            ) : null}
             {!isShowcase ? (
               <span
                 style={{
