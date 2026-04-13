@@ -51,6 +51,18 @@ def test_clob_account_eoa_not_proxy():
     assert result["is_proxy"] is False
 
 
+def test_clob_account_sub_dollar_micro_balance():
+    """יתרה < 1$ ב-micro-USDC (למשל 500_000 = 0.50$) — לא להציג מספר גולמי מנופח."""
+    client = _make_mock_client(signer="0xAAA", funder="0xAAA")
+    client.get_balance_allowance.return_value = {"balance": "500000", "allowance": "1000000"}
+    with patch.object(live_clob, "build_trading_client", return_value=(client, None)):
+        result = live_clob.fetch_polymarket_clob_account()
+
+    assert result["ok"] is True
+    assert result["balance_usd"] == 0.5
+    assert result["allowance_usd"] == 1.0
+
+
 def test_clob_account_case_insensitive_proxy():
     """השוואת כתובות case-insensitive — 0xaaa == 0xAAA."""
     client = _make_mock_client(signer="0xaaa", funder="0xAAA")

@@ -488,8 +488,8 @@ class DemoEngine:
         self.save()
         return reconcile_trade
 
-    def export_csv(self) -> str:
-        """מייצר CSV: עסקאות + שדות מרכזיים."""
+    def export_csv(self, *, live_only: bool = False) -> str:
+        """מייצר CSV: עסקאות + שדות מרכזיים. live_only=True — רק עסקאות מסחר חי (execution=live)."""
         out = io.StringIO()
         w = csv.writer(out)
         w.writerow(
@@ -525,7 +525,10 @@ class DemoEngine:
                 "limit_price",
             ]
         )
-        for t in self.state.trades:
+        rows = list(self.state.trades)
+        if live_only:
+            rows = [t for t in rows if str(t.get("execution") or "") == "live"]
+        for t in rows:
             ts = float(t.get("ts") or 0)
             path = t.get("pnl_path") or []
             w.writerow(
@@ -881,6 +884,8 @@ class DemoEngine:
         token_id: str,
         bid: float,
         context: Optional[dict[str, Any]] = None,
+        *,
+        contracts_sold: Optional[float] = None,
     ) -> dict[str, Any]:
         """שיקוף מכירה לייב — בלי קריאה לספר."""
         idx = self._position_idx(token_id)
@@ -888,47 +893,70 @@ class DemoEngine:
             return {"ok": False, "error": "אין פוזיציה"}
         p = self.state.positions[idx]
         bid = float(bid)
-        proceeds = bid * p.contracts * (1 - FEE_RATE)
+        full = float(p.contracts)
+        sold = float(contracts_sold) if contracts_sold is not None else full
+        sold = min(max(sold, 0.0), full)
+        if sold < 1e-8:
+            return {"ok": False, "error": "גודל מכירה אפס"}
+        remainder = full - sold
+        full_exit = remainder <= 1e-6
+
+        proceeds = bid * sold * (1 - FEE_RATE)
         self.state.balance_usd += proceeds
-        leg_cost = p.avg_cost * p.contracts * (1 + FEE_RATE)
+        leg_cost = p.avg_cost * sold * (1 + FEE_RATE)
         realized = proceeds - leg_cost
-        sid = self._session_by_token.pop(token_id, None)
         trade = {
             "id": str(uuid.uuid4())[:8],
             "ts": time.time(),
             "side": p.side,
-            "contracts": p.contracts,
+            "contracts": sold,
             "price": bid,
-            "fee_est": FEE_RATE * bid * p.contracts,
+            "fee_est": FEE_RATE * bid * sold,
             "type": "SELL_TP",
             "token_id": token_id,
             "realized_pnl": realized,
             "execution": "live",
         }
-        if sid:
-            trade["session_id"] = sid
-        tr = self._position_tracking.pop(token_id, None)
-        if tr:
-            trade["peak_unrealized_pct"] = tr.get("high_watermark_pct")
-            trade["peak_ts"] = tr.get("high_watermark_ts")
-            trade["peak_mark_bid"] = tr.get("high_mark_bid")
-            trade["trough_unrealized_pct"] = tr.get("low_watermark_pct")
-            trade["trough_ts"] = tr.get("low_watermark_ts")
-            trade["trough_mark_bid"] = tr.get("low_mark_bid")
-            trade["pnl_path"] = tr.get("path", [])
+        if full_exit:
+            sid = self._session_by_token.pop(token_id, None)
+            if sid:
+                trade["session_id"] = sid
+            tr = self._position_tracking.pop(token_id, None)
+            if tr:
+                trade["peak_unrealized_pct"] = tr.get("high_watermark_pct")
+                trade["peak_ts"] = tr.get("high_watermark_ts")
+                trade["peak_mark_bid"] = tr.get("high_mark_bid")
+                trade["trough_unrealized_pct"] = tr.get("low_watermark_pct")
+                trade["trough_ts"] = tr.get("low_watermark_ts")
+                trade["trough_mark_bid"] = tr.get("low_mark_bid")
+                trade["pnl_path"] = tr.get("path", [])
+            self.state.positions.pop(idx)
+        else:
+            p.contracts = remainder
+            sid = self._session_by_token.get(token_id)
+            if sid:
+                trade["session_id"] = sid
+            tr = self._position_tracking.get(token_id)
+            if tr:
+                trade["peak_unrealized_pct"] = tr.get("high_watermark_pct")
+                trade["peak_ts"] = tr.get("high_watermark_ts")
+                trade["peak_mark_bid"] = tr.get("high_mark_bid")
+                trade["trough_unrealized_pct"] = tr.get("low_watermark_pct")
+                trade["trough_ts"] = tr.get("low_watermark_ts")
+                trade["trough_mark_bid"] = tr.get("low_mark_bid")
+                trade["pnl_path"] = tr.get("path", [])
         if context:
             trade.update(context)
         await self._attach_window_btc_to_tp_trade(trade, side=p.side)
         self.state.trades.append(trade)
-        self.state.positions.pop(idx)
         epoch = context.get("epoch") if context else None
-        if epoch is not None:
+        if full_exit and epoch is not None:
             ws = float(context.get("window_sec") or 300)
             window_end_ts = float(epoch) + ws
-            leg_cost2 = p.avg_cost * p.contracts * (1 + FEE_RATE)
+            leg_cost2 = p.avg_cost * sold * (1 + FEE_RATE)
             self._post_exit_tracking[token_id] = {
                 "avg_cost": p.avg_cost,
-                "contracts": p.contracts,
+                "contracts": sold,
                 "leg_cost": leg_cost2,
                 "window_end_ts": window_end_ts,
                 "potential_high_pct": None,
@@ -939,7 +967,12 @@ class DemoEngine:
         )
         self.state.equity_history.append((time.time(), eq))
         self.save()
-        return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
+        return {
+            "ok": True,
+            "trade": trade,
+            "balance": self.state.balance_usd,
+            "full_exit": full_exit,
+        }
 
     async def simulate_sell_all(
         self,

@@ -44,7 +44,7 @@ type OrderbookSummary = {
   down: SideSummary;
 };
 
-type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "tips_v2" | "help";
+type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "help";
 
 type Trade = {
   id?: string;
@@ -160,6 +160,31 @@ function tradesForSessionStats(trades: Trade[], demoState: Record<string, unknow
   const ts0 = demoState?.stats_epoch_ts;
   if (typeof ts0 !== "number" || !Number.isFinite(ts0)) return trades;
   return trades.filter((t) => Number(t.ts || 0) >= ts0);
+}
+
+/** רק עסקאות שנרשמו כמסחר חי (CLOB אמיתי) — ללשונית סטטיסטיקה לייב. */
+function tradesLiveOnly(trades: Trade[]): Trade[] {
+  return trades.filter((t) => String(t.execution || "") === "live");
+}
+
+/** סנכרון יומן צל ↔ CLOB — לא «עסקת מסחר»; realized_pnl שם הוא דלתא חשבונאית ומזייף גרף PnL. */
+function isReconcileLedgerEntry(t: Trade): boolean {
+  return t.type === "RECONCILE";
+}
+
+/**
+ * פירוק/סגירה לפי מודל סוף-חלון (יומן צל) — לא בהכרח תנועת CLOB.
+ * בלייב, אחרי rollover עם drift, סכימת SETTLE_* על עשרות «פוזיציות» ישנות + reconcile
+ * יוצרת קפיצות PnL שלא תואמות יתרה — לכן לא נכנסות לגרף/יחס ניצחונות בלייב.
+ */
+function isShadowWindowSettlementTrade(t: Trade): boolean {
+  const ty = String(t.type || "");
+  return (
+    ty === "SETTLE_WIN" ||
+    ty === "SETTLE_LOSS" ||
+    ty === "SETTLE_UNKNOWN" ||
+    ty === "EXPIRE_0"
+  );
 }
 
 type SessionGroup = { sessionId: string; trades: Trade[] };
@@ -1587,6 +1612,9 @@ export default function App() {
     balance_usd: number | null;
     allowance_usd: number | null;
     address: string | null;
+    funder_address?: string | null;
+    is_proxy?: boolean;
+    hint?: string;
     error?: string;
   } | null>(null);
   /** snapshot חי מלא: יתרה + פוזיציות אמיתיות + שווי נטו — נקרא רק כשליב פעיל */
@@ -1611,6 +1639,8 @@ export default function App() {
     hint?: string;
   } | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+  /** משוב קצר אחרי לחיצה על «העתק את כל היומן» */
+  const [logJournalCopied, setLogJournalCopied] = useState(false);
   const [logEntries, setLogEntries] = useState<{ ts: number; msg: string; type: string; session_id?: string }[]>([]);
   const [pending, setPending] = useState<Record<string, unknown> | null>(null);
   const [err, setErr] = useState("");
@@ -1735,6 +1765,9 @@ export default function App() {
           allowance_usd:
             typeof p.allowance_usd === "number" && Number.isFinite(p.allowance_usd) ? p.allowance_usd : null,
           address: typeof p.address === "string" ? p.address : null,
+          funder_address: typeof p.funder_address === "string" ? p.funder_address : null,
+          is_proxy: Boolean(p.is_proxy),
+          hint: typeof p.hint === "string" ? p.hint : undefined,
           error: typeof p.error === "string" ? p.error : undefined,
         });
       }
@@ -1884,7 +1917,7 @@ export default function App() {
       }
     };
     void poll();
-    const id = window.setInterval(poll, 5000);
+    const id = window.setInterval(poll, 3500);
     return () => {
       cancelled = true;
       window.clearInterval(id);
@@ -1965,7 +1998,10 @@ export default function App() {
     const rawTrades = ((demoState as any).trades as Trade[]) || [];
     const trades = tradesForSessionStats(rawTrades, demoState as Record<string, unknown> | null);
     const realizedTrades = trades.filter(
-      (t) => t.realized_pnl != null && !Number.isNaN(Number(t.realized_pnl)),
+      (t) =>
+        !isReconcileLedgerEntry(t) &&
+        t.realized_pnl != null &&
+        !Number.isNaN(Number(t.realized_pnl)),
     );
     // חשוב: חישוב PnL מצטבר חייב להיות כרונולוגי לפי ts.
     // אם לא ממיינים, Recharts תחבר נקודות לפי ts אבל cum יחושב בסדר אחר => גרף "קופץ".
@@ -2003,8 +2039,50 @@ export default function App() {
     return out;
   }, [demoState]);
 
+  const cumPnlChartDataLive = useMemo(() => {
+    const rawTrades = ((demoState as any).trades as Trade[]) || [];
+    const sessionTrades = tradesForSessionStats(rawTrades, demoState as Record<string, unknown> | null);
+    const trades = tradesLiveOnly(sessionTrades);
+    const realizedTrades = trades.filter(
+      (t) =>
+        !isReconcileLedgerEntry(t) &&
+        !isShadowWindowSettlementTrade(t) &&
+        t.realized_pnl != null &&
+        !Number.isNaN(Number(t.realized_pnl)),
+    );
+    const withValidTs = realizedTrades
+      .map((t) => ({ t, tsSec: Number(t.ts) }))
+      .filter((x) => Number.isFinite(x.tsSec) && x.tsSec > 0);
+    withValidTs.sort((a, b) => a.tsSec - b.tsSec);
+    let cum = 0;
+    let lastTs: number | null = null;
+    const out: { i: number; pnl: number; ts: number; t: string }[] = [];
+    for (let i = 0; i < withValidTs.length; i++) {
+      const t = withValidTs[i].t;
+      const tsSec = withValidTs[i].tsSec;
+      cum += Number(t.realized_pnl || 0);
+      if (lastTs != null && Math.abs(lastTs - tsSec) < 1e-9) {
+        out[out.length - 1].pnl = cum;
+        continue;
+      }
+      lastTs = tsSec;
+      out.push({
+        i,
+        pnl: cum,
+        ts: tsSec,
+        t: new Date(tsSec * 1000).toLocaleTimeString("he-IL"),
+      });
+    }
+    return out;
+  }, [demoState]);
+
   const cumPnlLast = cumPnlChartData.length ? cumPnlChartData[cumPnlChartData.length - 1].pnl : undefined;
   const cumPnlAnim = useChartAnimationGate(cumPnlChartData.length, cumPnlLast, { epsilon: 0.005 });
+
+  const cumPnlLastLive = cumPnlChartDataLive.length
+    ? cumPnlChartDataLive[cumPnlChartDataLive.length - 1].pnl
+    : undefined;
+  const cumPnlAnimLive = useChartAnimationGate(cumPnlChartDataLive.length, cumPnlLastLive, { epsilon: 0.005 });
 
   const diff =
     market?.price_to_beat != null && btc.price
@@ -2228,7 +2306,8 @@ export default function App() {
             ["strategy", "אסטרטגיה"],
             ["signals", "📡 סיגנלים"],
             ["trigger", "⚡ מסחר מהיר"],
-            ["stats", "סטטיסטיקה"],
+            ["stats", "סטטיסטיקה (דמו)"],
+            ["stats_live", "סטטיסטיקה לייב"],
             ["tips_v2", "ניתוח v3"],
             ["help", "עזרה ותיעוד"],
           ] as const
@@ -2402,7 +2481,71 @@ export default function App() {
 
           <div style={{ marginTop: 16, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "stretch" }}>
             <Card padding="md" style={{ flex: 1, minWidth: 200 }}>
-              {liveModeEffective && livePortfolio?.ok ? (
+              {liveModeEffective && livePortfolio && livePortfolio.ok === false ? (
+                <>
+                  <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
+                    Polymarket — תיק חי (שגיאת טעינה){" "}
+                    <span
+                      style={{
+                        marginInlineStart: 6,
+                        padding: "1px 6px",
+                        borderRadius: 8,
+                        fontSize: 10,
+                        background: "rgba(248, 113, 113, 0.2)",
+                        color: "#f87171",
+                        border: "1px solid rgba(248, 113, 113, 0.45)",
+                      }}
+                    >
+                      LIVE
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 13, color: "#f87171", lineHeight: 1.45, marginBottom: 10 }}>
+                    {livePortfolio.error ?? "לא ניתן למשוך את תיק ה-CLOB. בדקו מפתח, py-clob-client וחיבור."}
+                  </div>
+                  {pmClobAccount?.ok && pmClobAccount.balance_usd != null && (
+                    <div style={{ fontSize: 13, marginBottom: 10 }}>
+                      יתרת USDC ב-CLOB (אומתה ישירות):{" "}
+                      <strong className="tabular-nums" style={pmClobAccount.balance_usd === 0 ? { color: "#f87171" } : undefined}>
+                        ${pmClobAccount.balance_usd.toFixed(2)}
+                      </strong>
+                      {pmClobAccount.allowance_usd != null && (
+                        <span style={{ marginInlineStart: 10, fontSize: 11, color: "var(--muted)" }}>
+                          Allowance: ${pmClobAccount.allowance_usd.toFixed(2)}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {pmClobAccount?.is_proxy && pmClobAccount.funder_address ? (
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4, wordBreak: "break-all", lineHeight: 1.35 }}>
+                      Funder (proxy): {pmClobAccount.funder_address}
+                      <br />
+                      Signer: {pmClobAccount.address}
+                    </div>
+                  ) : pmClobAccount?.address ? (
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4, wordBreak: "break-all", lineHeight: 1.35 }}>
+                      כתובת חותם: {pmClobAccount.address}
+                    </div>
+                  ) : null}
+                  {pmClobAccount?.hint && (
+                    <div style={{
+                      marginTop: 10,
+                      padding: "10px 12px",
+                      borderRadius: 6,
+                      background: "rgba(250, 204, 21, 0.15)",
+                      border: "1px solid rgba(250, 204, 21, 0.4)",
+                      color: "#facc15",
+                      fontSize: 12,
+                      fontWeight: 500,
+                      lineHeight: 1.45,
+                    }}>
+                      ⚠ {pmClobAccount.hint}
+                    </div>
+                  )}
+                  <div style={{ marginTop: 10, fontSize: 11, color: "var(--muted)", lineHeight: 1.45 }}>
+                    רענון תיק מלא (פוזיציות) מתבצע כל כמה שניות; נתוני יתרה גולמיים מתעדכנים גם מהרענון הכללי של הדשבורד.
+                  </div>
+                </>
+              ) : liveModeEffective && livePortfolio?.ok ? (
                 <>
                   <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
                     Polymarket — נתונים חיים{" "}
@@ -2547,7 +2690,21 @@ export default function App() {
                             : "—"}
                         </strong>
                       </div>
-                      {pmClobAccount.address ? (
+                      {pmClobAccount.is_proxy && pmClobAccount.funder_address ? (
+                        <div
+                          style={{
+                            fontSize: 11,
+                            color: "var(--muted)",
+                            marginTop: 8,
+                            wordBreak: "break-all",
+                            lineHeight: 1.35,
+                          }}
+                        >
+                          Funder (proxy): {pmClobAccount.funder_address}
+                          <br />
+                          Signer: {pmClobAccount.address}
+                        </div>
+                      ) : pmClobAccount.address ? (
                         <div
                           style={{
                             fontSize: 11,
@@ -2560,8 +2717,23 @@ export default function App() {
                           כתובת חותם: {pmClobAccount.address}
                         </div>
                       ) : null}
+                      {pmClobAccount.hint && (
+                        <div style={{
+                          marginTop: 10,
+                          padding: "10px 12px",
+                          borderRadius: 6,
+                          background: "rgba(250, 204, 21, 0.15)",
+                          border: "1px solid rgba(250, 204, 21, 0.4)",
+                          color: "#facc15",
+                          fontSize: 12,
+                          fontWeight: 500,
+                          lineHeight: 1.45,
+                        }}>
+                          ⚠ {pmClobAccount.hint}
+                        </div>
+                      )}
                       <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.4 }}>
-                        זה מה שמערכת ה-CLOB מדווחת; זה לא בהכרח זהה ל«Portfolio» המלא באתר Polymarket.
+                        זה מה שמערכת ה-CLOB מדווחת (get_balance_allowance, collateral); זה לא בהכרח זהה ל«Portfolio» המלא באתר Polymarket.
                       </div>
                     </div>
                   ) : pmClobAccount && !pmClobAccount.ok ? (
@@ -3252,7 +3424,58 @@ export default function App() {
             </div>
           )}
 
-          <h3 style={{ marginTop: 24 }}>יומן</h3>
+          <div
+            style={{
+              marginTop: 24,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+          >
+            <h3 style={{ margin: 0 }}>יומן</h3>
+            <button
+              type="button"
+              disabled={logs.length === 0}
+              title="מעתיק את כל שורות היומן (כפי שמוצג למעלה) ללוח"
+              onClick={async () => {
+                const text = logs.join("\n");
+                try {
+                  if (navigator.clipboard?.writeText) {
+                    await navigator.clipboard.writeText(text);
+                  } else {
+                    const ta = document.createElement("textarea");
+                    ta.value = text;
+                    ta.style.position = "fixed";
+                    ta.style.left = "-9999px";
+                    ta.style.top = "-9999px";
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    document.execCommand("copy");
+                    document.body.removeChild(ta);
+                  }
+                  setLogJournalCopied(true);
+                  window.setTimeout(() => setLogJournalCopied(false), 1600);
+                } catch {
+                  alert("לא ניתן להעתיק ללוח — נסה שוב או העתק ידנית מהתיבה למטה.");
+                }
+              }}
+              style={{
+                fontSize: 12,
+                padding: "6px 12px",
+                borderRadius: 8,
+                border: "1px solid rgba(255,255,255,0.15)",
+                background: logs.length === 0 ? "rgba(255,255,255,0.04)" : "rgba(255,255,255,0.08)",
+                color: "var(--text, #e2e8f0)",
+                cursor: logs.length === 0 ? "not-allowed" : "pointer",
+                opacity: logs.length === 0 ? 0.55 : 1,
+              }}
+            >
+              {logJournalCopied ? "הועתק ללוח" : "העתק את כל היומן"}
+            </button>
+          </div>
           <pre
             style={{
               maxHeight: 200,
@@ -3268,32 +3491,66 @@ export default function App() {
         </Card>
       )}
 
-      {tab === "stats" && (
+      {(tab === "stats" || tab === "stats_live") && (
         <Card padding="lg">
-          <SectionTitle as="h2">סטטיסטיקות סימולציה</SectionTitle>
+          <SectionTitle as="h2">
+            {tab === "stats_live" ? "סטטיסטיקות מסחר חי" : "סטטיסטיקות סימולציה (דמו)"}
+          </SectionTitle>
+          {tab === "stats_live" && (
+            <p style={{ fontSize: 13, color: "var(--muted)", marginTop: 8, marginBottom: 12, lineHeight: 1.5 }}>
+              יתרה ושווי נטו מוצגים מ־<strong>Polymarket (CLOB)</strong> כשמצב לייב פעיל; הגרף והטבלה — עסקאות מסחר חי בלבד (
+              <code style={{ fontSize: 12 }}>execution=live</code>
+              ), בלי דמו.               רשומות <code style={{ fontSize: 12 }}>RECONCILE</code> (סנכרון יומן פנימי מול היתרה האמיתית) לא
+              נספרות ב־PnL; גם <code style={{ fontSize: 12 }}>SETTLE_*</code> / <code style={{ fontSize: 12 }}>EXPIRE_0</code>{" "}
+              (פירוק מודל בסוף חלון) לא נכנסים לגרף/אחוז ניצחונות בלייב — כדי שלא יופיעו קפיצות מזויפות כשהיה drift
+              מול ה־CLOB. רשומות אלה עדיין ב־CSV ובהיסטוריה לביקורת.
+            </p>
+          )}
           {(() => {
+            const statsLive = tab === "stats_live";
             const allTradesRaw = ((demoState as any).trades as any[]) || [];
-            const trades = tradesForSessionStats(allTradesRaw as Trade[], demoState as Record<string, unknown> | null);
+            const sessionTrades = tradesForSessionStats(allTradesRaw as Trade[], demoState as Record<string, unknown> | null);
+            let trades = statsLive ? tradesLiveOnly(sessionTrades) : sessionTrades;
+            if (statsLive) {
+              trades = trades.filter((t) => !isReconcileLedgerEntry(t));
+            }
             const sessions = groupTradesBySession(trades);
             const tradesCount = sessions.length;
-            const balance = Number((demoState as any).balance_usd || 0);
             const lastMark = (demoState as any).last_mark as
               | { equity?: number; unrealized_usd?: number; ts?: number }
               | undefined;
-            const hasOpenPositions = ((demoState as any).positions as unknown[])?.length > 0;
-            const unreal = hasOpenPositions ? Number(lastMark?.unrealized_usd || 0) : 0;
-            const equity = hasOpenPositions ? Number(lastMark?.equity || balance) : balance;
+            const hasOpenDemoPositions = ((demoState as any).positions as unknown[])?.length > 0;
+
+            let balance: number;
+            let unreal: number;
+            let equity: number;
+
+            if (statsLive && liveModeEffective && livePortfolio?.ok) {
+              balance = Number(livePortfolio.balance_usd ?? 0);
+              equity = Number(livePortfolio.equity_usd ?? livePortfolio.balance_usd ?? 0);
+              // לא ממומש: עדיין מחושב במנוע על פוזיציות ה-shadow (אותן פוזיציות כמו בלייב)
+              unreal = hasOpenDemoPositions ? Number(lastMark?.unrealized_usd || 0) : 0;
+            } else if (statsLive) {
+              balance = 0;
+              unreal = 0;
+              equity = 0;
+            } else {
+              balance = Number((demoState as any).balance_usd || 0);
+              unreal = hasOpenDemoPositions ? Number(lastMark?.unrealized_usd || 0) : 0;
+              equity = hasOpenDemoPositions ? Number(lastMark?.equity || balance) : balance;
+            }
 
             // גרף PnL מבוסס על רווח/הפסד ממומש בלבד (realized_pnl),
             // כך שהקו זז רק כשנסגרת עסקה ולא כשמחיר השוק זז.
-            const data = cumPnlChartData;
+            const data = statsLive ? cumPnlChartDataLive : cumPnlChartData;
+            const pnlAnim = statsLive ? cumPnlAnimLive : cumPnlAnim;
 
             const allPnls = data.map((d) => d.pnl);
             const maxPnl = allPnls.length ? Math.max(...allPnls) : 0;
             const minPnl = allPnls.length ? Math.min(...allPnls) : 0;
             const pnl = allPnls.length ? allPnls[allPnls.length - 1] : 0;
 
-            // יציאות עם PnL ממומש: TP / פירוק (SETTLE_*) / EXPIRE_0 — לא רק SELL כדי שלא יפספס הפסדים.
+            // יציאות עם PnL ממומש: בסימולציה — גם SETTLE/EXPIRE; בלייב — רק יציאות CLOB (SELL_*) כדי שלא יספרו פירוקי צל אחרי drift.
             const exitTrades = trades.filter(
               (t) =>
                 t.realized_pnl != null &&
@@ -3302,7 +3559,8 @@ export default function App() {
                   t.type === "SETTLE_WIN" ||
                   t.type === "SETTLE_LOSS" ||
                   t.type === "SETTLE_UNKNOWN" ||
-                  (t.type && String(t.type).startsWith("SELL"))),
+                  (t.type && String(t.type).startsWith("SELL"))) &&
+                (!statsLive || !isShadowWindowSettlementTrade(t)),
             );
             const wins = exitTrades.filter((t) => Number(t.realized_pnl || 0) > 0);
             const losses = exitTrades.filter((t) => Number(t.realized_pnl || 0) < 0);
@@ -3323,6 +3581,28 @@ export default function App() {
             return (
               <>
                 <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+                  {statsLive && !liveModeEffective && (
+                    <div className="alert-error" role="status" style={{ width: "100%", marginBottom: 4 }}>
+                      מצב לייב לא פעיל — הפעל «מסחר חי» מהלוח וודא מפתח. להלן רק עסקאות חי מהיומן (אם יש).
+                    </div>
+                  )}
+                  {statsLive && liveModeEffective && !livePortfolio?.ok && (
+                    <div
+                      style={{
+                        width: "100%",
+                        padding: "10px 12px",
+                        borderRadius: 8,
+                        background: "rgba(250, 204, 21, 0.12)",
+                        border: "1px solid rgba(250, 204, 21, 0.35)",
+                        color: "#facc15",
+                        fontSize: 13,
+                        marginBottom: 4,
+                      }}
+                    >
+                      לא נטען תיק Polymarket — יתרה/שווי מוצגים כ־0. בדוק חיבור ל־CLOB. הגרף משקף עדיין עסקאות חי
+                      ממומשות מהיומן.
+                    </div>
+                  )}
                   <div className="stat-pill" title="זמן מאז שהבוט/המנוע הופעל או מאז האיפוס האחרון (איפוס סטטיסטיקה / איפוס סימולציה / כיבוי מצב הבוט)">
                     זמן ריצה מאז הפעלה/איפוס:{" "}
                     <strong className="tabular-nums">
@@ -3330,10 +3610,22 @@ export default function App() {
                     </strong>
                   </div>
                   <div className="stat-pill">
-                    יתרה במזומן: <strong>${balance.toFixed(2)}</strong>
+                    יתרה במזומן:{" "}
+                    <strong>
+                      {statsLive && !livePortfolio?.ok ? "—" : `$${balance.toFixed(2)}`}
+                    </strong>
+                    {statsLive && livePortfolio?.ok && (
+                      <span style={{ fontSize: 10, color: "var(--muted)", marginInlineStart: 6 }}>(CLOB)</span>
+                    )}
                   </div>
                   <div className="stat-pill">
-                    שווי נטו (כולל פוזיציות פתוחות): <strong>${equity.toFixed(2)}</strong>
+                    שווי נטו (כולל פוזיציות פתוחות):{" "}
+                    <strong>
+                      {statsLive && !livePortfolio?.ok ? "—" : `$${equity.toFixed(2)}`}
+                    </strong>
+                    {statsLive && livePortfolio?.ok && (
+                      <span style={{ fontSize: 10, color: "var(--muted)", marginInlineStart: 6 }}>(Polymarket)</span>
+                    )}
                   </div>
                   <div className="stat-pill">
                     רווח והפסד מצטבר:{" "}
@@ -3398,8 +3690,8 @@ export default function App() {
                     איפוס נתוני סטטיסטיקה
                   </button>
                   <a
-                    href={engineUrl("/api/demo/export.csv")}
-                    download="demo-trades.csv"
+                    href={engineUrl(statsLive ? "/api/demo/export.csv?live_only=true" : "/api/demo/export.csv")}
+                    download={statsLive ? "live-trades.csv" : "demo-trades.csv"}
                     style={{
                       display: "inline-flex",
                       alignItems: "center",
@@ -3418,7 +3710,11 @@ export default function App() {
 
                 <ChartCard
                   title="רווח והפסד מצטברים"
-                  subtitle="רווח או הפסד ממומשים בלבד; הקו מתקדם עם סגירת עסקאות. אחרי איפוס — רק מהסשן הנוכחי (היסטוריה מלאה נשמרת לניתוח v3)."
+                  subtitle={
+                    statsLive
+                      ? "רק עסקאות מסחר חי (ממומש). אחרי איפוס סטטיסטיקה — רק מהסשן הנוכחי."
+                      : "רווח או הפסד ממומשים בלבד; הקו מתקדם עם סגירת עסקאות. אחרי איפוס — רק מהסשן הנוכחי (היסטוריה מלאה נשמרת לניתוח v3)."
+                  }
                 >
                   <div style={{ width: "100%", height: 300 }}>
                     <ResponsiveContainer width="100%" height="100%">
@@ -3456,7 +3752,7 @@ export default function App() {
                           strokeWidth={chartStroke.width}
                           strokeLinecap={chartStroke.linecap}
                           strokeLinejoin={chartStroke.linejoin}
-                          isAnimationActive={cumPnlAnim}
+                          isAnimationActive={pnlAnim}
                           animationDuration={420}
                           animationEasing="ease-out"
                           connectNulls
@@ -3466,7 +3762,9 @@ export default function App() {
                   </div>
                 </ChartCard>
 
-                <h3 style={{ marginTop: 18 }}>היסטוריית עסקאות (בסשן הנוכחי)</h3>
+                <h3 style={{ marginTop: 18 }}>
+                  היסטוריית עסקאות (בסשן הנוכחי{statsLive ? " — לייב בלבד" : ""})
+                </h3>
                 <p style={{ fontSize: 13, color: "var(--muted)", marginBottom: 8 }}>
                   עמודת «תחילת חלון» מבוססת על שדה אורך החלון בכל עסקה (5 דק׳ / 15 דק׳). «עלות הכניסה» = מחיר ליחידה × חוזים בכניסה (ברוטו; העמלה בעמודה נפרדת). אחרי איפוס לוח או איפוס סטטיסטיקה מוצגות כאן רק עסקאות מההתחלה החדשה; הרשומות הישנות נשארות בקובץ לניתוח v3.
                 </p>

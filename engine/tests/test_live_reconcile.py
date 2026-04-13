@@ -10,8 +10,8 @@ from demo_engine import DemoEngine, Position
 
 @pytest.fixture()
 def eng(tmp_path: Path) -> DemoEngine:
-    e = DemoEngine()
-    e.state_path = tmp_path / "demo_state.json"
+    # חובה: state_path מההתחלה — אחרת __init__ טוען את demo_state.json של ה-repo והבדיקות מזוהמות.
+    e = DemoEngine(state_path=tmp_path / "demo_state.json")
     e.reset(100.0)
     return e
 

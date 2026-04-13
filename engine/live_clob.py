@@ -54,11 +54,24 @@ def build_trading_client():
         signature_type = 0
 
     funder = (os.environ.get("POLYMARKET_FUNDER") or "").strip()
+    signer_addr: Optional[str] = None
+    try:
+        signer_addr = temp.get_address()
+    except Exception:
+        pass
+
     if not funder:
-        try:
-            funder = temp.get_address()
-        except Exception:
+        if not signer_addr:
             return None, "הגדר POLYMARKET_FUNDER או וודא מפתח תקין"
+        funder = signer_addr
+
+    # proxy (1 / 2): ה-funder חייב להיות כתובת ה-proxy שבה הכספים — לא ה-EOA. אחרת ההזמנות נכשלות ב-invalid signature.
+    if signature_type in (1, 2) and signer_addr and funder.lower() == signer_addr.lower():
+        return None, (
+            "עבור POLYMARKET_SIGNATURE_TYPE=1 או 2 חובה להגדיר POLYMARKET_FUNDER=<כתובת proxy> "
+            "מחשבון Polymarket (באתר: Profile / Settings — כתובת Deposit / ארנק המסחר). "
+            "לא להשתמש בכתובת החותם (EOA) כ-funder — זה גורם ל־invalid signature בהזמנות."
+        )
 
     client = ClobClient(
         host,
@@ -97,7 +110,8 @@ def check_balance_before_order(required_usd: float) -> tuple[bool, Optional[str]
             if sig_type == 0:
                 msg += (
                     "יתרה 0 — אם ייצאת מפתח מארנק Polymarket, הגדר "
-                    "POLYMARKET_SIGNATURE_TYPE=1 ו-POLYMARKET_FUNDER=<כתובת proxy>. "
+                    "POLYMARKET_SIGNATURE_TYPE=1 (Poly proxy) או 2 (Gnosis Safe) "
+                    "ו-POLYMARKET_FUNDER=<כתובת proxy>. ראו docs.polymarket.com — CLOB quickstart. "
                 )
             msg += (
                 "יש להפקיד USDC לחשבון CLOB ב-Polymarket "
@@ -108,6 +122,49 @@ def check_balance_before_order(required_usd: float) -> tuple[bool, Optional[str]
         return False, msg
 
     return True, None
+
+
+def live_trading_enabled() -> bool:
+    return _live_disabled_reason() is None
+
+
+def _normalize_usdc_amount(val: Any) -> Optional[float]:
+    """ממיר תגובת CLOB (micro-USDC, 6 עשרוניות לדולר) לדולרים.
+
+    לפי תיעוד Polymarket/py-clob-client הערכים הם ביחידות הקטנות (1e6 = 1 USDC).
+    סף כפול: ערכים ≥1e6 בוודאות micro; בין 1e4 ל-1e6 — micro גם כשהסכום < 1$
+    (למשל 500_000 = 0.50$). ערכים עם שבר עשרוני וקטנים מ-1e4 — נחשבים כדולרים כבר מנורמלים.
+    """
+    if val is None:
+        return None
+    try:
+        x = float(val)
+    except (TypeError, ValueError):
+        return None
+    if x == 0:
+        return 0.0
+    ax = abs(x)
+    frac = abs(x - round(x)) > 1e-9
+    if ax >= 1e6:
+        x = x / 1e6
+    elif not frac and ax >= 1e4:
+        # מיקרו מתחת לדולר אחד (ולא מעל 1e6) — לא לפספס 500_000 → 0.50$
+        x = x / 1e6
+    return round(float(x), 4)
+
+
+def _fetch_conditional_balance_shares(client: Any, token_id: str) -> Optional[float]:
+    """יתרת חוזי תוצאה (CONDITIONAL) ב-CLOB — אותה קידוד micro כמו USDC (6 עשרוניות)."""
+    try:
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        pcond = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=str(token_id))
+        raw = client.get_balance_allowance(pcond)
+        if not isinstance(raw, dict):
+            return None
+        bal = raw.get("balance") if raw.get("balance") is not None else raw.get("Balance")
+        return _normalize_usdc_amount(bal)
+    except Exception:
+        return None
 
 
 async def place_limit_order(
@@ -142,6 +199,22 @@ async def place_limit_order(
     except Exception as e:
         return {"ok": False, "error": f"שוק/טוקן: {e}"}
 
+    order_size = float(size)
+    # SELL: ה-CLOB בודק יתרת טוקן תנאי בשרשרת — היומן הפנימי יכול להראות יותר חוזים ממה שבפועל (אחרי reconcile חלקי).
+    if side == "SELL":
+        avail = _fetch_conditional_balance_shares(client, str(token_id))
+        if avail is not None and order_size > avail + 1e-9:
+            capped = max(0.0, min(order_size, avail * (1.0 - 1e-8)))
+            if capped < 1e-8:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"אין מספיק יתרת טוקן ב-CLOB למכירה: זמין ~{avail:.4f} חוזים, "
+                        f"ביקשת {order_size:.4f}. המתן ל-reconcile או רענן."
+                    ),
+                }
+            order_size = float(f"{capped:.6f}")
+
     opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
     side_const = BUY if side == "BUY" else SELL
 
@@ -150,40 +223,65 @@ async def place_limit_order(
             OrderArgs(
                 token_id=token_id,
                 price=float(price),
-                size=float(size),
+                size=float(order_size),
                 side=side_const,
             ),
             opts,
         )
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        err = str(e)
+        low = err.lower()
+        if "invalid signature" in low:
+            err += (
+                " — בדקו: POLYMARKET_FUNDER=כתובת ה-proxy מהאתר (לא EOA); "
+                "נסו POLYMARKET_SIGNATURE_TYPE=2 אם החשבון דרך Gnosis Safe; "
+                "המפתח חייב להיות של אותו חשבון Polymarket ששימש לייצוא."
+            )
+        if "not enough balance" in low or "not enough balance / allowance" in low:
+            err += (
+                " — ב־SELL: ייתכן פחות חוזי תוצאה בשרשרת מבספר הפוזיציה הפנימי; "
+                "המערכת אמורה לכווץ את ההזמנה לפי יתרת ה-CLOB — נסו שוב אחרי reconcile."
+            )
+        return {"ok": False, "error": err}
 
     oid = None
     if isinstance(resp, dict):
         oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
     else:
         oid = str(resp)
-    return {"ok": True, "order_id": oid, "raw": resp, "price": float(price), "size": float(size)}
+    return {"ok": True, "order_id": oid, "raw": resp, "price": float(price), "size": float(order_size)}
 
 
-def live_trading_enabled() -> bool:
-    return _live_disabled_reason() is None
-
-
-def _normalize_usdc_amount(val: Any) -> Optional[float]:
-    """ממיר תגובת CLOB (לרוב micro-USDC, 6 עשרוניות) לדולרים."""
-    if val is None:
-        return None
+def _clob_balance_hint(
+    balance_usd: Optional[float],
+    *,
+    positions_count: int = 0,
+) -> Optional[str]:
+    """רמזי תצורה/הפקדה כשיתרת CLOB 0 או לא זמינה (מותאם ל-signature_type ב-env)."""
+    sig_type = 0
     try:
-        x = float(val)
-    except (TypeError, ValueError):
-        return None
-    if x == 0:
-        return 0.0
-    # ה-API מחזיר לעיתים מספר שלם ב-micro-USDC (למשל 5_000_000 = 5$)
-    if abs(x) >= 1e6:
-        x = x / 1e6
-    return round(float(x), 4)
+        sig_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0").strip() or "0")
+    except ValueError:
+        pass
+    if balance_usd is None or balance_usd == 0:
+        has_positions = positions_count > 0
+        if has_positions:
+            return (
+                "יתרה $0 אבל יש פוזיציות פתוחות — ייתכן שכל הכסף מושקע. "
+                "לכניסות חדשות נדרשת יתרה פנויה ב-CLOB."
+            )
+        if sig_type == 0:
+            return (
+                "יתרה $0 ללא פוזיציות. אם ייצאת מפתח מארנק הדפדפן של Polymarket, "
+                "הגדר POLYMARKET_SIGNATURE_TYPE=1 (או 2) "
+                "ו-POLYMARKET_FUNDER=<כתובת proxy>. ראה docs.polymarket.com — CLOB quickstart."
+            )
+        return (
+            "יתרה $0 ב-CLOB. ודאו שהפקדתם USDC לחשבון המסחר ב-Polymarket "
+            "(Deposit דרך polymarket.com). USDC בארנק Polygon לבד לא מספיק — "
+            "נדרשת הפקדה לחוזה ה-Exchange."
+        )
+    return None
 
 
 def fetch_polymarket_clob_account() -> dict[str, Any]:
@@ -242,6 +340,7 @@ def fetch_polymarket_clob_account() -> dict[str, Any]:
         "address": addr,
         "funder_address": funder_addr,
         "is_proxy": is_proxy,
+        "hint": _clob_balance_hint(bal_usd, positions_count=0),
         "raw": raw if isinstance(raw, dict) else {"response": raw},
     }
 
@@ -384,32 +483,7 @@ async def fetch_live_portfolio(*, force: bool = False) -> dict[str, Any]:
     if isinstance(balance_usd, (int, float)):
         equity_usd = float(balance_usd) + total_pos_value
 
-    # רמז למשתמש בתרחישי יתרה 0
-    hint: Optional[str] = None
-    sig_type = 0
-    try:
-        sig_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0").strip() or "0")
-    except ValueError:
-        pass
-    if balance_usd is None or balance_usd == 0:
-        has_positions = len(positions) > 0
-        if has_positions:
-            hint = (
-                "יתרה $0 אבל יש פוזיציות פתוחות — ייתכן שכל הכסף מושקע. "
-                "לכניסות חדשות נדרשת יתרה פנויה ב-CLOB."
-            )
-        elif sig_type == 0:
-            hint = (
-                "יתרה $0 ללא פוזיציות. אם ייצאת מפתח מארנק הדפדפן של Polymarket, "
-                "הגדר POLYMARKET_SIGNATURE_TYPE=1 (או 2) "
-                "ו-POLYMARKET_FUNDER=<כתובת proxy>. ראה .env.example."
-            )
-        else:
-            hint = (
-                "יתרה $0 ב-CLOB. ודאו שהפקדתם USDC לחשבון המסחר ב-Polymarket "
-                "(Deposit דרך polymarket.com). USDC בארנק Polygon לבד לא מספיק — "
-                "נדרשת הפקדה לחוזה ה-Exchange."
-            )
+    hint = _clob_balance_hint(balance_usd, positions_count=len(positions))
 
     payload = {
         "ok": True,

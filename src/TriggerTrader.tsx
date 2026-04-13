@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "./api";
+import { api, isPageHidden } from "./api";
 import { Card } from "./ui/Card";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -337,7 +337,9 @@ export default function TriggerTrader() {
 
   useEffect(() => {
     poll();
-    pollRef.current = setInterval(poll, 2000);
+    pollRef.current = setInterval(() => {
+      if (!isPageHidden()) poll();
+    }, 2000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [poll]);
 

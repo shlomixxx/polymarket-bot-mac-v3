@@ -12,6 +12,40 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+
+def _load_dotenv_from_project_root() -> None:
+    """טוען משתנים מקובץ .env בשורש הפרויקט (ליד package.json).
+
+    לא דורס ערכים שכבר הוגדרו ב-shell / Electron — כך ש־export ידני עדיין גובר.
+    ללא תלות ב־python-dotenv (פורס שורות KEY=VAL ו־# הערות).
+    """
+    path = Path(__file__).resolve().parent.parent / ".env"
+    if not path.is_file():
+        return
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("export "):
+            s = s[7:].strip()
+        if "=" not in s:
+            continue
+        key, _, val = s.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        os.environ[key] = val
+
+
+_load_dotenv_from_project_root()
+
 import httpx
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
@@ -495,10 +529,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Polymarket Bot Engine", lifespan=lifespan)
+# לא משלבים allow_origins=["*"] עם allow_credentials=True — הדפדפן לא מקבל
+# Access-Control-Allow-Origin בקריאות cross-origin (למשל Vite :5175 → API :8767).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -695,7 +731,7 @@ async def demo_snapshot():
             {
                 "token_id": p.token_id,
                 "side": p.side,
-                "qty": p.qty,
+                "contracts": p.contracts,
                 "avg_cost": p.avg_cost,
             }
             for p in s.positions
@@ -754,13 +790,14 @@ async def api_runtime():
 
 
 @app.get("/api/demo/export.csv", response_class=PlainTextResponse)
-async def demo_export_csv():
-    """CSV של עסקאות + snapshot mark-to-market (נוח לאקסל)."""
+async def demo_export_csv(live_only: bool = False):
+    """CSV של עסקאות + snapshot mark-to-market (נוח לאקסל). live_only=1 — רק עסקאות חי."""
     await demo.mark_to_market()
+    fn = "live-trades.csv" if live_only else "demo-trades.csv"
     return PlainTextResponse(
-        demo.export_csv(),
+        demo.export_csv(live_only=live_only),
         media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": 'attachment; filename="demo-trades.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="{fn}"'},
     )
 
 

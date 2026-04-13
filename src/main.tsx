@@ -13,14 +13,44 @@ function resolveStreamEntry(): { stream: boolean; layout: StreamViewerLayout } {
   const search = new URLSearchParams(window.location.search);
   const streamParam = search.get("stream");
 
+  const layoutDashboard =
+    streamParam === "4" ||
+    streamParam === "dashboard" ||
+    search.get("layout") === "dashboard" ||
+    path === "/stream/dashboard" ||
+    path.endsWith("/stream/dashboard");
+
+  const layoutSpectatorV2 =
+    !layoutDashboard &&
+    (streamParam === "5" ||
+      streamParam === "spectator-v2" ||
+      search.get("layout") === "spectator-v2" ||
+      path === "/stream/spectator-v2" ||
+      path.endsWith("/stream/spectator-v2"));
+
+  const layoutPro =
+    !layoutDashboard &&
+    !layoutSpectatorV2 &&
+    (streamParam === "6" ||
+      streamParam === "pro" ||
+      search.get("layout") === "pro" ||
+      path === "/stream/pro" ||
+      path.endsWith("/stream/pro"));
+
   const layoutSpectator =
-    streamParam === "3" ||
-    streamParam === "spectator" ||
-    search.get("layout") === "spectator" ||
-    path === "/stream/spectator" ||
-    path.endsWith("/stream/spectator");
+    !layoutDashboard &&
+    !layoutSpectatorV2 &&
+    !layoutPro &&
+    (streamParam === "3" ||
+      streamParam === "spectator" ||
+      search.get("layout") === "spectator" ||
+      path === "/stream/spectator" ||
+      path.endsWith("/stream/spectator"));
 
   const layoutShowcase =
+    !layoutDashboard &&
+    !layoutSpectatorV2 &&
+    !layoutPro &&
     !layoutSpectator &&
     (streamParam === "2" ||
       streamParam === "showcase" ||
@@ -32,12 +62,18 @@ function resolveStreamEntry(): { stream: boolean; layout: StreamViewerLayout } {
     streamParam === "1" ||
     streamParam === "2" ||
     streamParam === "3" ||
+    streamParam === "4" ||
+    streamParam === "5" ||
+    streamParam === "6" ||
     streamParam === "showcase" ||
     streamParam === "spectator" ||
+    streamParam === "spectator-v2" ||
+    streamParam === "dashboard" ||
+    streamParam === "pro" ||
     path === "/stream" ||
     path.startsWith("/stream/");
 
-  const layout: StreamViewerLayout = layoutSpectator ? "spectator" : layoutShowcase ? "showcase" : "classic";
+  const layout: StreamViewerLayout = layoutPro ? "pro" : layoutDashboard ? "dashboard" : layoutSpectatorV2 ? "spectator-v2" : layoutSpectator ? "spectator" : layoutShowcase ? "showcase" : "classic";
   return { stream, layout };
 }
 

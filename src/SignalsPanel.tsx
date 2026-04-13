@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "./api";
+import { api, isPageHidden } from "./api";
 import { Card } from "./ui/Card";
 import { SectionTitle } from "./ui/SectionTitle";
 
@@ -440,17 +440,20 @@ export default function SignalsPanel() {
     refresh(false, w);
   }, [refresh]);
 
-  // Auto-refresh signals every 5 seconds
+  // Auto-refresh signals every 5 seconds (skip when tab hidden)
   useEffect(() => {
     refresh();
-    const id = setInterval(() => refresh(), 5_000);
+    const id = setInterval(() => {
+      if (!isPageHidden()) refresh();
+    }, 5_000);
     return () => clearInterval(id);
   }, [refresh]);
 
-  // Contract price poll — every 2s (server caches prices)
+  // Contract price poll — every 2s (server caches prices; skip when tab hidden)
   useEffect(() => {
     let active = true;
     const poll = async () => {
+      if (!active || isPageHidden()) return;
       try {
         const p = await api<ContractPrices>(`/api/contract-prices?window=${selectedWindow}`);
         if (active) {

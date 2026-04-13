@@ -111,6 +111,9 @@ class StrategyRuntime:
     live_trading: bool = False
     # Reconcile של הספר הפנימי מול היתרה/פוזיציות האמיתיות של Polymarket.
     _last_live_reconcile_ts: float = 0.0
+    # כניסה אוטומטית לייב שנכשלה — מצמצמים חזרות על אותה שגיאה (לא משנה לוגיקת מסחר).
+    _last_live_auto_entry_fail_ts: float = 0.0
+    _last_live_auto_entry_fail_msg: str = ""
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -347,26 +350,54 @@ class StrategyRunner:
         """
         closed: list[str] = []
         positions_snapshot = [p for p in self.demo.state.positions if p.token_id not in valid_tokens]
+        no_bid_count = 0
+        sell_fail_msgs: list[str] = []
         for p in positions_snapshot:
             bid, _ = await fetch_best_bid_ask(p.token_id)
             if bid is None or bid <= 0:
-                self.rt.log(f"סגירה אקטיבית: אין bid לטוקן {p.token_id[:12]}… — גיבוי יפעל")
+                no_bid_count += 1
                 continue
             lo = await live_clob.place_limit_order(p.token_id, float(bid), float(p.contracts), "SELL")
             if not lo.get("ok"):
-                self.rt.log(f"סגירה אקטיבית נכשלה: {lo.get('error', 'כשל')} — גיבוי יפעל")
+                err = str(lo.get("error", "כשל"))
+                if err not in sell_fail_msgs:
+                    sell_fail_msgs.append(err)
                 continue
             fill_sell = float(lo.get("price") or bid)
             close_ctx = dict(context)
             close_ctx["reason"] = "EXPIRE_ACTIVE_CLOSE"
             close_ctx["execution"] = "live"
+            sold_sz = float(lo.get("size") or p.contracts)
             try:
-                await self.demo.record_live_sell(p.token_id, fill_sell, context=close_ctx)
+                rs = await self.demo.record_live_sell(
+                    p.token_id,
+                    fill_sell,
+                    context=close_ctx,
+                    contracts_sold=sold_sz,
+                )
             except Exception as e:
                 self.rt.log(f"record_live_sell כשל אחרי מילוי אמיתי: {e}")
                 continue
-            closed.append(p.token_id)
-            self.rt.log(f"סגירה אקטיבית ({p.side}): {p.contracts:.2f} @ {fill_sell:.3f}")
+            if not rs.get("ok"):
+                continue
+            if rs.get("full_exit", True):
+                closed.append(p.token_id)
+            self.rt.log(
+                f"סגירה אקטיבית ({p.side}): {sold_sz:.2f} @ {fill_sell:.3f}"
+                + ("" if rs.get("full_exit", True) else " (חלקי — נותרה פוזיציה)")
+            )
+        if no_bid_count:
+            self.rt.log(
+                f"סגירה אקטיבית: אין bid ל־{no_bid_count} פוזיציות מחוץ לחלון "
+                "(לרוב שוק/ספר כבר לא פעילים אחרי סיום החלון) — גיבוי יפעל"
+            )
+        if sell_fail_msgs:
+            for msg in sell_fail_msgs[:5]:
+                self.rt.log(f"סגירה אקטיבית נכשלה: {msg} — גיבוי יפעל")
+            if len(sell_fail_msgs) > 5:
+                self.rt.log(
+                    f"סגירה אקטיבית: עוד {len(sell_fail_msgs) - 5} סוגי שגיאות — גיבוי יפעל"
+                )
         return closed
 
     async def _live_reconcile_if_enabled(
@@ -400,7 +431,13 @@ class StrategyRunner:
         self.rt._last_live_reconcile_ts = now
         if tr is not None:
             delta = float(tr.get("realized_pnl") or 0.0)
-            self.rt.log_event(f"reconcile לייב: דלתא יתרה {delta:+.2f}$")
+            extra = ""
+            if abs(delta) >= 1000.0:
+                extra = (
+                    " — סנכרון יומן פנימי מול יתרת CLOB; "
+                    "לא בהכרח תנועת כסף בודדת."
+                )
+            self.rt.log_event(f"reconcile לייב: דלתא יתרה {delta:+.2f}${extra}")
 
     async def approve_pending(self, live: Optional[bool] = None) -> dict[str, Any]:
         """מאשר פקודה ממתינה.
@@ -660,6 +697,9 @@ class StrategyRunner:
                     "slug": m.slug,
                     "reason": "EXPIRE_0 rollover",
                 }
+                # כדי ש־SETTLE_* יופיעו בלשונית «סטטיסטיקה לייב» (מסננים execution=live)
+                if self._live_trading_ok():
+                    rollover_ctx["execution"] = "live"
                 # לייב: לפני שאנחנו מסתמכים על פירוק BTC-פרוקסי, ננסה לסגור אקטיבית
                 # את הפוזיציות האמיתיות ב-CLOB. מה שנכשל נופל לגיבוי של expire_all_outside_tokens.
                 if self._live_trading_ok():
@@ -794,32 +834,50 @@ class StrategyRunner:
                         self.rt.log(f"TP לייב: {lo.get('error', 'כשל')}")
                         continue
                     fill_sell = float(lo.get("price") or bid_tp)
-                    r = await self.demo.record_live_sell(p.token_id, fill_sell, context=tp_ctx)
+                    sold_sz = float(lo.get("size") or pos_contracts)
+                    r = await self.demo.record_live_sell(
+                        p.token_id,
+                        fill_sell,
+                        context=tp_ctx,
+                        contracts_sold=sold_sz,
+                    )
                 else:
                     r = await self.demo.simulate_sell_all(p.token_id, context=tp_ctx)
                 if r.get("ok"):
-                    self.rt.record_tp(cfg=cfg, side=p.side)
-                    if cfg.loss_recovery_enabled:
-                        self.demo.state.loss_recovery_streak = 0
-                        self.demo.state.loss_recovery_multiplier = 1.0
-                        self.demo.save()
+                    full_exit = bool(r.get("full_exit", True))
+                    if full_exit:
+                        self.rt.record_tp(cfg=cfg, side=p.side)
+                        if cfg.loss_recovery_enabled:
+                            self.demo.state.loss_recovery_streak = 0
+                            self.demo.state.loss_recovery_multiplier = 1.0
+                            self.demo.save()
                     tr = r.get("trade") or {}
                     price = tr.get("price")
                     peak = tr.get("peak_unrealized_pct")
                     trough = tr.get("trough_unrealized_pct")
                     sid = tr.get("session_id")
-                    self.rt.log_event(
-                        f"TP {p.side}: יציאה @ {float(price) * 100:.1f}¢ (~{upnl:.1f}% מול עלות)"
-                        if price is not None
-                        else f"TP {p.side}: יציאה ~{upnl:.1f}% מול עלות",
-                        session_id=sid,
-                    )
-                    if cfg.loss_recovery_enabled:
+                    sold_c = float(tr.get("contracts") or 0.0)
+                    if full_exit:
                         self.rt.log_event(
-                            "שחזור הפסד: איפוס אחרי TP — מכפיל 1.00×, רצף הפסדים 0 (חזרה לסכום בסיס לכניסה הבאה)",
+                            f"TP {p.side}: יציאה @ {float(price) * 100:.1f}¢ (~{upnl:.1f}% מול עלות)"
+                            if price is not None
+                            else f"TP {p.side}: יציאה ~{upnl:.1f}% מול עלות",
                             session_id=sid,
                         )
-                    if peak is not None or trough is not None:
+                        if cfg.loss_recovery_enabled:
+                            self.rt.log_event(
+                                "שחזור הפסד: איפוס אחרי TP — מכפיל 1.00×, רצף הפסדים 0 (חזרה לסכום בסיס לכניסה הבאה)",
+                                session_id=sid,
+                            )
+                    else:
+                        self.rt.log_event(
+                            f"TP לייב חלקי {p.side}: נמכרו ~{sold_c:.2f} חוזים @ "
+                            f"{float(price) * 100:.1f}¢ — נשארה פוזיציה (יתרת CLOB < גודל ההזמנה המלא)"
+                            if price is not None
+                            else f"TP לייב חלקי {p.side}: נמכרו ~{sold_c:.2f} חוזים — נשארה פוזיציה",
+                            session_id=sid,
+                        )
+                    if full_exit and (peak is not None or trough is not None):
                         peak_s = f"{peak:.1f}%" if peak is not None else "—"
                         trough_s = f"{trough:.1f}%" if trough is not None else "—"
                         self.rt.log_event(
@@ -1175,7 +1233,16 @@ class StrategyRunner:
         if self._live_trading_ok():
             lo = await live_clob.place_limit_order(str(token), float(lim), float(n), "BUY")
             if not lo.get("ok"):
-                self.rt.log(f"כניסה אוטומטית (לייב) נכשלה: {lo.get('error', 'כשל')}")
+                err = str(lo.get("error", "כשל"))
+                t_fail = time.time()
+                if (
+                    err == self.rt._last_live_auto_entry_fail_msg
+                    and t_fail - float(self.rt._last_live_auto_entry_fail_ts or 0) < 45.0
+                ):
+                    return
+                self.rt._last_live_auto_entry_fail_msg = err
+                self.rt._last_live_auto_entry_fail_ts = t_fail
+                self.rt.log(f"כניסה אוטומטית (לייב) נכשלה: {err}")
                 return
             fill_a = float(lo.get("price") or lim)
             r = self.demo.record_live_buy(side, str(token), float(n), fill_a, context=entry_ctx)

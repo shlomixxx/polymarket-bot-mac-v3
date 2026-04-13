@@ -35,7 +35,11 @@ async def test_expire_all_outside_tokens_creates_expire_trade_and_removes_positi
     with patch("btc_price.fetch_window_start_end_btc_usd", AsyncMock(side_effect=_px)):
         created = await eng.expire_all_outside_tokens(
             ("keep", "other"),
-            context={"settled_epoch": 1_700_000_000, "settled_window_sec": 300},
+            context={
+                "settled_epoch": 1_700_000_000,
+                "settled_window_sec": 300,
+                "execution": "live",
+            },
         )
 
     assert len(created) == 1
@@ -49,6 +53,7 @@ async def test_expire_all_outside_tokens_creates_expire_trade_and_removes_positi
     # הפסד מלא של העלות (כולל עמלה בקירוב)
     expected_loss = -(0.4 * 10.0 * (1 + FEE_RATE))
     assert float(t["realized_pnl"]) == pytest.approx(expected_loss)
+    assert t.get("execution") == "live"
 
 
 def test_export_csv_contains_headers_and_snapshot(tmp_path: Path):

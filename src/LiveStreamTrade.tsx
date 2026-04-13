@@ -1,9 +1,12 @@
 import type { ReactNode, RefObject } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { StreamSpectatorLayout } from "./StreamSpectatorLayout";
+import { StreamDashboardLayout } from "./StreamDashboardLayout";
+import { StreamProLayout } from "./StreamProLayout";
 import { playEntryChime, playExitChime, resumeStreamAudio } from "./streamAudio";
 import type { StreamViewerLayout } from "./streamViewerTypes";
 import { smoothRunPnlForChart } from "./runPnlSmoothing";
+import { smoothRunPnlForProChart } from "./runPnlSmoothingPro";
 import {
   Area,
   CartesianGrid,
@@ -30,6 +33,9 @@ type Market = {
   window_sec?: number;
   btc_window?: string;
   seconds_left: number;
+  /** From engine — used to reset window countdown anchor on new market window */
+  epoch?: number;
+  slug?: string;
 };
 
 type StrategyConfigSlice = {
@@ -779,11 +785,17 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     document.documentElement.lang = "en";
     document.documentElement.dir = "ltr";
     const base =
-      layout === "spectator"
-        ? "Live trade — spectator overlay"
-        : layout === "showcase"
-          ? "Live trade — viewer showcase"
-          : "Live trade — stream";
+      layout === "pro"
+        ? "Live trade — pro broadcast"
+        : layout === "spectator-v2"
+          ? "Live trade — spectator v2"
+          : layout === "dashboard"
+            ? "Live trade — dashboard"
+            : layout === "spectator"
+              ? "Live trade — spectator overlay"
+              : layout === "showcase"
+                ? "Live trade — viewer showcase"
+                : "Live trade — stream";
     document.title = fitBroadcast ? `${base} (fit)` : base;
     return () => {
       document.documentElement.lang = "he";
@@ -1059,6 +1071,49 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   const winRateWins = stratCfg?.bot_run_wins_n ?? demo?.bot_run_wins_n ?? 0;
   const winRateHot = winRatePct != null && winRatePct > 90;
 
+  const windowTotalSec = useMemo(() => {
+    if (!market) return 300;
+    if (typeof market.window_sec === "number" && market.window_sec > 0) return market.window_sec;
+    if (market.btc_window === "15m") return 900;
+    return 300;
+  }, [market]);
+
+  /** Server sends seconds_left only on refresh (~2s); anchor + clock tick so UI counts down every second. */
+  const windowSecondsLeftAnchorRef = useRef<{ left: number; atMs: number } | null>(null);
+  useEffect(() => {
+    if (!market) {
+      windowSecondsLeftAnchorRef.current = null;
+      return;
+    }
+    windowSecondsLeftAnchorRef.current = {
+      left: market.seconds_left,
+      atMs: Date.now(),
+    };
+  }, [market?.seconds_left, market?.epoch, market?.slug]);
+
+  const effectiveWindowSecondsLeft = useMemo(() => {
+    void clock;
+    if (!market) return null;
+    const a = windowSecondsLeftAnchorRef.current;
+    if (!a) return market.seconds_left;
+    const driftSec = Math.floor((Date.now() - a.atMs) / 1000);
+    return Math.max(0, a.left - driftSec);
+  }, [market, clock]);
+
+  const windowProgressPct = useMemo(() => {
+    if (!market || effectiveWindowSecondsLeft == null) return 0;
+    const s = Math.max(0, effectiveWindowSecondsLeft);
+    return windowTotalSec > 0 ? Math.min(100, (s / windowTotalSec) * 100) : 0;
+  }, [market, windowTotalSec, effectiveWindowSecondsLeft]);
+
+  /** % of market window elapsed (spectator overlay). */
+  const windowElapsedPct = useMemo(() => {
+    if (!market || windowTotalSec <= 0 || effectiveWindowSecondsLeft == null) return 0;
+    const left = Math.max(0, effectiveWindowSecondsLeft);
+    const elapsed = windowTotalSec - left;
+    return Math.min(100, Math.max(0, (elapsed / windowTotalSec) * 100));
+  }, [market, windowTotalSec, effectiveWindowSecondsLeft]);
+
   const streamMood = useMemo(
     () =>
       resolveStreamMood({
@@ -1066,7 +1121,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
         open,
         pending: pendingApproval,
         statusKey: stratCfg?.strategy_status_key ?? "",
-        secondsLeft: market?.seconds_left,
+        secondsLeft: effectiveWindowSecondsLeft ?? undefined,
         minMinutesForEntry: Number(stratCfg?.min_minutes_for_entry ?? 3),
         freezeLastMinutes: Number(stratCfg?.freeze_last_minutes ?? 1),
         intermediateBlock: !!stratCfg?.intermediate_block_new_entries,
@@ -1081,38 +1136,17 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
       stratCfg?.side_preference,
       open,
       pendingApproval,
-      market?.seconds_left,
+      effectiveWindowSecondsLeft,
     ]
   );
 
-  const windowTotalSec = useMemo(() => {
-    if (!market) return 300;
-    if (typeof market.window_sec === "number" && market.window_sec > 0) return market.window_sec;
-    if (market.btc_window === "15m") return 900;
-    return 300;
-  }, [market]);
-
-  const windowProgressPct = useMemo(() => {
-    void clock;
-    if (!market) return 0;
-    const s = Math.max(0, market.seconds_left);
-    return windowTotalSec > 0 ? Math.min(100, (s / windowTotalSec) * 100) : 0;
-  }, [market, windowTotalSec, clock]);
-
-  /** % of market window elapsed (spectator overlay). */
-  const windowElapsedPct = useMemo(() => {
-    void clock;
-    if (!market || windowTotalSec <= 0) return 0;
-    const left = Math.max(0, market.seconds_left);
-    const elapsed = windowTotalSec - left;
-    return Math.min(100, Math.max(0, (elapsed / windowTotalSec) * 100));
-  }, [market, windowTotalSec, clock]);
-
   const botRunSessionKey = `${stratCfg?.bot_run_started_ts ?? ""}|${demo?.bot_run_started_ts ?? ""}`;
   const botRunSessionRef = useRef<string>("");
+  const isRunPnlLayout = layout === "spectator" || layout === "pro";
+
   /** סשן בוט השתנה — מאתחלים מהיסטוריה בשרת (לא רק state ריק) כדי שהגרף ישרוד רענון דף */
   useEffect(() => {
-    if (layout !== "spectator") return;
+    if (!isRunPnlLayout) return;
     if (botRunSessionKey !== botRunSessionRef.current) {
       botRunSessionRef.current = botRunSessionKey;
       setRunPnlSeries(buildRunPnlSeriesFromEquityHistory(stratCfg, demo));
@@ -1121,7 +1155,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
 
   /** אם אחרי רענון עדיין ריק אבל המנוע כבר שלח equity_history — ממלא פעם אחת */
   useEffect(() => {
-    if (layout !== "spectator") return;
+    if (!isRunPnlLayout) return;
     if (stratCfg?.mode === "off") return;
     setRunPnlSeries((prev) => {
       if (prev.length > 0) return prev;
@@ -1132,7 +1166,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
 
   useEffect(() => {
     void clock;
-    if (layout !== "spectator") return;
+    if (!isRunPnlLayout) return;
     if (stratCfg?.mode === "off") {
       setRunPnlSeries([]);
       return;
@@ -1150,12 +1184,13 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
 
   /** סדרה לתצוגה בלבד — מסיר ספיקים בודדים שלא משקפים מגמה אמיתית */
   const runPnlSeriesDisplay = useMemo(() => {
-    if (layout !== "spectator" || !runPnlSeries.length) return runPnlSeries;
+    if (!isRunPnlLayout || !runPnlSeries.length) return runPnlSeries;
+    if (layout === "pro") return smoothRunPnlForProChart(runPnlSeries);
     return smoothRunPnlForChart(runPnlSeries);
-  }, [runPnlSeries, layout]);
+  }, [runPnlSeries, layout, isRunPnlLayout]);
 
   const runUsdYDomain = useMemo((): [number, number] => {
-    if (layout !== "spectator" || !runPnlSeriesDisplay.length) return [0, 1];
+    if (!isRunPnlLayout || !runPnlSeriesDisplay.length) return [0, 1];
     const vals = runPnlSeriesDisplay.map((x) => x.usd);
     const { lo, hi } = trimmedUsdMinMax(vals);
     const mid = (lo + hi) / 2;
@@ -1171,14 +1206,14 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
 
   /** Ref lines only — trimmed extrema so one glitch doesn’t keep the yellow/red guides forever. */
   const runUsdChartRefExtremes = useMemo(() => {
-    if (layout !== "spectator" || !runPnlSeriesDisplay.length) return null;
+    if (!isRunPnlLayout || !runPnlSeriesDisplay.length) return null;
     const vals = runPnlSeriesDisplay.map((x) => x.usd);
     const { lo, hi } = trimmedUsdMinMax(vals);
     return { minUsd: lo, maxUsd: hi };
   }, [runPnlSeriesDisplay, layout]);
 
   const roundOutcomes = useMemo(() => {
-    if (layout !== "spectator") return [];
+    if (!isRunPnlLayout) return [];
     if (stratCfg?.mode === "off") return [];
     const minTs = toFiniteNumber(stratCfg?.bot_run_started_ts ?? demo?.bot_run_started_ts);
     if (minTs == null) return [];
@@ -1186,7 +1221,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   }, [demo?.trades, layout, stratCfg?.mode, stratCfg?.bot_run_started_ts, demo?.bot_run_started_ts]);
 
   const runUsdSessionStats = useMemo(() => {
-    if (layout !== "spectator" || !runPnlSeriesDisplay.length) return null;
+    if (!isRunPnlLayout || !runPnlSeriesDisplay.length) return null;
     let maxUsd = runPnlSeriesDisplay[0].usd;
     let minUsd = runPnlSeriesDisplay[0].usd;
     for (const p of runPnlSeriesDisplay) {
@@ -1264,13 +1299,13 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
       mode: stratCfg?.mode,
       pending: pendingApproval,
       statusKey: stratCfg?.strategy_status_key ?? "",
-      secondsLeft: market?.seconds_left,
+      secondsLeft: effectiveWindowSecondsLeft ?? undefined,
       minMinutesForEntry: Number(stratCfg?.min_minutes_for_entry ?? 3),
       freezeLastMinutes: Number(stratCfg?.freeze_last_minutes ?? 1),
       intermediateBlock: !!stratCfg?.intermediate_block_new_entries,
       sidePreference: stratCfg?.side_preference,
     });
-  }, [open, stratCfg, market?.seconds_left, pendingApproval]);
+  }, [open, stratCfg, effectiveWindowSecondsLeft, pendingApproval]);
 
   /** Recharts passes `key: "dot-N"` on props; custom dot functions must put it on the returned node. */
   const renderPnlDot = useCallback(
@@ -1322,48 +1357,64 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     [chartExtremes, chartRows.length, lineColor]
   );
 
+  const isPro = layout === "pro";
+  const isSpectatorV2 = layout === "spectator-v2";
+  const isDashboard = layout === "dashboard";
   const isSpectator = layout === "spectator";
   const isShowcase = layout === "showcase";
 
+  const spectatorProps = {
+    fitBroadcast,
+    broadcastParentRef,
+    broadcastContentRef,
+    err,
+    exitBanner,
+    market,
+    stratCfg,
+    orderbook,
+    open,
+    agg,
+    livePct,
+    pnlColor,
+    entrySoundOn,
+    setEntrySoundOn,
+    audioUnlocked,
+    setAudioUnlocked,
+    streamMood,
+    moodStyle,
+    showHotStreak,
+    winRatePct,
+    winRateExits,
+    winRateWins,
+    winRateHot,
+    runPnlUsd,
+    runPnlSeries: runPnlSeriesDisplay,
+    runUsdYDomain,
+    runUsdSessionStats,
+    runUsdChartRefExtremes,
+    botRunUptimeSec,
+    windowSecondsLeftDisplay: effectiveWindowSecondsLeft,
+    windowElapsedPct,
+    roundOutcomes,
+    streamPulseSec,
+    pulseRingRgb,
+    chartIdleCopy,
+  };
+
+  if (isPro) {
+    return <StreamProLayout {...spectatorProps} />;
+  }
+
+  if (isSpectatorV2) {
+    return <StreamSpectatorLayout {...spectatorProps} variant="v2" />;
+  }
+
+  if (isDashboard) {
+    return <StreamDashboardLayout {...spectatorProps} />;
+  }
+
   if (isSpectator) {
-    return (
-      <StreamSpectatorLayout
-        fitBroadcast={fitBroadcast}
-        broadcastParentRef={broadcastParentRef}
-        broadcastContentRef={broadcastContentRef}
-        err={err}
-        exitBanner={exitBanner}
-        market={market}
-        stratCfg={stratCfg}
-        orderbook={orderbook}
-        open={open}
-        agg={agg}
-        livePct={livePct}
-        pnlColor={pnlColor}
-        entrySoundOn={entrySoundOn}
-        setEntrySoundOn={setEntrySoundOn}
-        audioUnlocked={audioUnlocked}
-        setAudioUnlocked={setAudioUnlocked}
-        streamMood={streamMood}
-        moodStyle={moodStyle}
-        showHotStreak={showHotStreak}
-        winRatePct={winRatePct}
-        winRateExits={winRateExits}
-        winRateWins={winRateWins}
-        winRateHot={winRateHot}
-        runPnlUsd={runPnlUsd}
-        runPnlSeries={runPnlSeriesDisplay}
-        runUsdYDomain={runUsdYDomain}
-        runUsdSessionStats={runUsdSessionStats}
-        runUsdChartRefExtremes={runUsdChartRefExtremes}
-        botRunUptimeSec={botRunUptimeSec}
-        windowElapsedPct={windowElapsedPct}
-        roundOutcomes={roundOutcomes}
-        streamPulseSec={streamPulseSec}
-        pulseRingRgb={pulseRingRgb}
-        chartIdleCopy={chartIdleCopy}
-      />
-    );
+    return <StreamSpectatorLayout {...spectatorProps} />;
   }
 
   return (
@@ -1778,7 +1829,9 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
                   Market window
                 </span>
                 <span style={{ fontSize: 22, fontWeight: 800, fontVariantNumeric: "tabular-nums", color: "#6ee7b7" }}>
-                  {market ? formatTimeLeft(market.seconds_left) : "—"}
+                  {market && effectiveWindowSecondsLeft != null
+                    ? formatTimeLeft(effectiveWindowSecondsLeft)
+                    : "—"}
                 </span>
               </div>
               <div style={{ fontSize: 13, color: "var(--text-secondary)", marginTop: 6 }}>Time left until this round resets</div>
@@ -1938,7 +1991,14 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
           </>
         ) : null}
         <StreamBlock label="Window" value={windowLabel(market)} />
-        <StreamBlock label="Time left" value={market ? formatTimeLeft(market.seconds_left) : "—"} />
+        <StreamBlock
+          label="Time left"
+          value={
+            market && effectiveWindowSecondsLeft != null
+              ? formatTimeLeft(effectiveWindowSecondsLeft)
+              : "—"
+          }
+        />
         <StreamBlock
           label="P&L since bot on"
           value={
