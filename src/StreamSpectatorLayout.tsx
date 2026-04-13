@@ -1,5 +1,5 @@
 import type { CSSProperties, ReactNode, RefObject } from "react";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   Area,
   CartesianGrid,
@@ -39,7 +39,7 @@ type OrderbookSummary = {
   down: { mid: number | null };
 };
 
-export type RoundOutcomeRow = { id: string; startLabel: string; endLabel: string; win: boolean };
+export type RoundOutcomeRow = { id: string; startLabel: string; endLabel: string; win: boolean; pnlUsd: number | null };
 
 type ChartIdleCopy = { headline: string; sub: string; showSpinner: boolean };
 
@@ -366,6 +366,7 @@ export function StreamSpectatorLayout(props: StreamSpectatorLayoutProps) {
   } = props;
 
   const runPnlSegments = useMemo(() => splitRunPnlSegments(runPnlSeries), [runPnlSeries]);
+  const [showPnlBreakdown, setShowPnlBreakdown] = useState(false);
 
   return (
     <div
@@ -376,10 +377,13 @@ export function StreamSpectatorLayout(props: StreamSpectatorLayoutProps) {
           ? {
               height: "100dvh",
               maxHeight: "100dvh",
+              width: "100%",
+              maxWidth: "100%",
               display: "flex",
               flexDirection: "column",
               overflow: "hidden",
-              padding: "10px 18px 12px",
+              /* מינימום ריווח — השידור נפרס על כל רוחב המסך בלי עמודות ריקה משני הצדדים */
+              padding: "8px 10px 10px",
             }
           : {
               minHeight: "100vh",
@@ -389,10 +393,10 @@ export function StreamSpectatorLayout(props: StreamSpectatorLayoutProps) {
           "radial-gradient(ellipse 900px 420px at 50% -15%, rgba(251, 191, 36, 0.07), transparent 52%), radial-gradient(ellipse 600px 380px at 100% 40%, rgba(129, 140, 248, 0.06), transparent 45%), var(--bg)",
         color: "var(--text)",
         fontFamily: "var(--font-display)",
-        maxWidth: 1000,
-        margin: "0 auto",
-        borderLeft: "1px solid rgba(251, 191, 36, 0.2)",
-        borderRight: "1px solid rgba(251, 191, 36, 0.2)",
+        maxWidth: fitBroadcast ? "100%" : 1000,
+        margin: fitBroadcast ? 0 : "0 auto",
+        borderLeft: fitBroadcast ? "none" : "1px solid rgba(251, 191, 36, 0.2)",
+        borderRight: fitBroadcast ? "none" : "1px solid rgba(251, 191, 36, 0.2)",
       }}
     >
       <style>
@@ -1109,9 +1113,31 @@ export function StreamSpectatorLayout(props: StreamSpectatorLayoutProps) {
                 boxShadow: "0 0 28px rgba(251, 191, 36, 0.12), inset 0 1px 0 rgba(255,255,255,0.06)",
               }}
             >
-              <div style={{ fontSize: 11, letterSpacing: "0.16em", textTransform: "uppercase", color: "#fde68a", fontWeight: 900, marginBottom: 10 }}>Round history</div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                <div style={{ fontSize: 11, letterSpacing: "0.16em", textTransform: "uppercase", color: "#fde68a", fontWeight: 900 }}>Round history</div>
+                <button
+                  onClick={() => setShowPnlBreakdown((v) => !v)}
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    letterSpacing: "0.08em",
+                    textTransform: "uppercase",
+                    color: showPnlBreakdown ? "#fde68a" : "var(--muted)",
+                    background: showPnlBreakdown ? "rgba(251,191,36,0.12)" : "rgba(255,255,255,0.05)",
+                    border: showPnlBreakdown ? "1px solid rgba(251,191,36,0.45)" : "1px solid rgba(255,255,255,0.1)",
+                    borderRadius: 6,
+                    padding: "3px 9px",
+                    cursor: "pointer",
+                    transition: "all 0.18s",
+                    lineHeight: 1.6,
+                  }}
+                  title={showPnlBreakdown ? "Hide P&L per trade" : "Show P&L per trade"}
+                >
+                  {showPnlBreakdown ? "Hide" : "Show"} P&L
+                </button>
+              </div>
               <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 12, lineHeight: 1.4 }}>
-                One row per exit · this bot run only · newest first · green win / red loss (no dollar amounts). Same minute can repeat if multiple exits.
+                One row per exit · this bot run only · newest first · green win / red loss. Same minute can repeat if multiple exits.
               </div>
               {roundOutcomes.length === 0 ? (
                 <div style={{ fontSize: 13, color: "var(--text-secondary)", fontWeight: 600 }}>No closed rounds yet.</div>
@@ -1127,6 +1153,25 @@ export function StreamSpectatorLayout(props: StreamSpectatorLayoutProps) {
                     <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", flex: 1 }}>
                       {r.startLabel === r.endLabel ? r.startLabel : `${r.startLabel} – ${r.endLabel}`}
                     </span>
+                    {showPnlBreakdown && (
+                      <span
+                        style={{
+                          fontSize: 12,
+                          fontWeight: 800,
+                          fontVariantNumeric: "tabular-nums",
+                          color: r.pnlUsd == null ? "var(--muted)" : r.win ? "#34d399" : "#fb7185",
+                          background: r.pnlUsd == null ? "transparent" : r.win ? "rgba(52,211,153,0.1)" : "rgba(251,113,133,0.1)",
+                          borderRadius: 5,
+                          padding: "1px 6px",
+                          minWidth: 48,
+                          textAlign: "right",
+                        }}
+                      >
+                        {r.pnlUsd == null
+                          ? "—"
+                          : `${r.pnlUsd >= 0 ? "+" : ""}${r.pnlUsd.toFixed(2)}$`}
+                      </span>
+                    )}
                   </div>
                 ))
               )}

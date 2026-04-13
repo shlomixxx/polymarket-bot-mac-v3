@@ -684,6 +684,29 @@ async def demo_state():
     return out
 
 
+@app.get("/api/demo/snapshot")
+async def demo_snapshot():
+    """Lightweight snapshot — balance + last_mark + positions only, no mark_to_market call.
+    Designed for fast 500ms polling to keep P&L display fresh without heavy CLOB calls."""
+    s = demo.state
+    return {
+        "balance_usd": s.balance_usd,
+        "positions": [
+            {
+                "token_id": p.token_id,
+                "side": p.side,
+                "qty": p.qty,
+                "avg_cost": p.avg_cost,
+            }
+            for p in s.positions
+        ],
+        "last_mark": s.last_mark,
+        "bot_run_started_ts": _bot_run_started_ts,
+        "bot_run_equity_baseline_usd": _bot_run_equity_baseline_usd,
+        "ui_runtime_equity_baseline_usd": float(_ui_runtime_equity_baseline_usd),
+    }
+
+
 class ResetBody(BaseModel):
     balance: float = 10_000.0
 

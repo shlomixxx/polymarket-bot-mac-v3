@@ -345,7 +345,7 @@ function describeStreamExit(trades: DemoState["trades"]): string {
   return "✅ Position closed — flat until next entry.";
 }
 
-type RoundOutcome = { id: string; startLabel: string; endLabel: string; win: boolean };
+type RoundOutcome = { id: string; startLabel: string; endLabel: string; win: boolean; pnlUsd: number | null };
 
 /** Per-exit history for spectator overlay — win/loss only, no dollar amounts. Newest first; one row per exit (multiple rows in the same clock minute if multiple trades). */
 function buildRoundOutcomes(
@@ -393,7 +393,9 @@ function buildRoundOutcomes(
     const typ = String(t.type ?? "");
     const id = `${sec}-${idx}-${typ}`;
     idx += 1;
-    out.push({ id, startLabel: timeLabel, endLabel: timeLabel, win });
+    const pnlRaw = Number(t.realized_pnl);
+    const pnlUsd = Number.isFinite(pnlRaw) ? pnlRaw : null;
+    out.push({ id, startLabel: timeLabel, endLabel: timeLabel, win, pnlUsd });
     if (out.length >= maxItems) break;
   }
   return out;
@@ -650,6 +652,8 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   const [runPnlSeries, setRunPnlSeries] = useState<{ t: number; usd: number }[]>([]);
   const [audioUnlocked, setAudioUnlocked] = useState(false);
   const prevLivePctRef = useRef<number | null>(null);
+  const prevEquityRef = useRef<number | null>(null);
+  const equitySpikeCountRef = useRef<number>(0);
 
   /** ניסיון ראשון (למשל Electron עם autoplayPolicy) — אחרת נדרשת מחווה. */
   useEffect(() => {
@@ -795,6 +799,36 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     }, 2000);
     return () => { cancelled = true; window.clearInterval(id); };
   }, [refresh]);
+
+  /** Fast 500ms snapshot poll — רק balance + last_mark + positions לעדכון P&L מהיר */
+  useEffect(() => {
+    let cancelled = false;
+    const pollSnapshot = async () => {
+      if (cancelled || isPageHidden()) return;
+      try {
+        const snap = await api<DemoState>("/api/demo/snapshot");
+        if (!cancelled) {
+          setDemo((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  balance_usd: snap.balance_usd,
+                  positions: snap.positions ?? prev.positions,
+                  last_mark: snap.last_mark ?? prev.last_mark,
+                  bot_run_started_ts: snap.bot_run_started_ts,
+                  bot_run_equity_baseline_usd: snap.bot_run_equity_baseline_usd,
+                  ui_runtime_equity_baseline_usd: snap.ui_runtime_equity_baseline_usd,
+                }
+              : snap,
+          );
+        }
+      } catch {
+        // silent — full refresh will recover
+      }
+    };
+    const id = window.setInterval(pollSnapshot, 500);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
 
   useEffect(() => {
     const id = window.setInterval(() => setClock((c) => c + 1), 1000);
@@ -968,7 +1002,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   /** מיושר ל־DemoEngine.equity_snapshot_usd — מניעת קפיצות כש־last_mark נשאר עם equity ישן בזמן throttle.
    *  בלייב: שווי נטו אמיתי מ-Polymarket; בדמו: equity מהספר הפנימי.
    */
-  const equityNow = useMemo(() => {
+  const equityNowRaw = useMemo(() => {
     if (isLive) {
       const liveEq = livePortfolio?.equity_usd ?? livePortfolio?.balance_usd;
       if (typeof liveEq === "number" && Number.isFinite(liveEq) && liveEq >= 0) return liveEq;
@@ -979,6 +1013,26 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     if (typeof eq === "number" && Number.isFinite(eq) && eq >= 0) return eq;
     return safeBal;
   }, [isLive, livePortfolio?.equity_usd, livePortfolio?.balance_usd, demo?.last_mark?.equity, demo?.balance_usd]);
+
+  /** סינון ספיקים: אם הערך החדש קופץ ביותר מ-15% מהערך הקודם — מתעלמים ממנו.
+   *  אם הערך הגדול נמשך 2+ פולים ברצף — מקבלים אותו (שינוי אמיתי). */
+  const equityNow = (() => {
+    const prev = prevEquityRef.current;
+    if (prev !== null && prev > 0) {
+      const changePct = Math.abs(equityNowRaw - prev) / prev;
+      if (changePct > 0.15) {
+        equitySpikeCountRef.current += 1;
+        // אם הספייק נמשך 2+ פולים ברצף — כנראה שינוי אמיתי, מקבלים אותו
+        if (equitySpikeCountRef.current < 2) {
+          return prev;
+        }
+      } else {
+        equitySpikeCountRef.current = 0;
+      }
+    }
+    prevEquityRef.current = equityNowRaw;
+    return equityNowRaw;
+  })();
 
   const equityBaselineUsd = useMemo(() => pickBotRunEquityBaseline(stratCfg, demo), [stratCfg, demo]);
 

@@ -1841,6 +1841,32 @@ export default function App() {
     };
   }, [refresh]);
 
+  /** Fast 500ms snapshot poll — רק balance + last_mark + positions לעדכון P&L מהיר */
+  useEffect(() => {
+    let cancelled = false;
+    const pollSnapshot = async () => {
+      if (cancelled || isPageHidden()) return;
+      try {
+        const snap = await api<Record<string, unknown>>("/api/demo/snapshot");
+        if (!cancelled) {
+          setDemoState((prev) => ({
+            ...prev,
+            balance_usd: snap.balance_usd,
+            positions: snap.positions ?? (prev as any).positions,
+            last_mark: snap.last_mark ?? (prev as any).last_mark,
+            bot_run_started_ts: snap.bot_run_started_ts,
+            bot_run_equity_baseline_usd: snap.bot_run_equity_baseline_usd,
+            ui_runtime_equity_baseline_usd: snap.ui_runtime_equity_baseline_usd,
+          }));
+        }
+      } catch {
+        // silent — full refresh will recover
+      }
+    };
+    const id = window.setInterval(pollSnapshot, 500);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
   /** Polling נפרד לתיק חי מ-Polymarket: רק כשמצב לייב "effective" (מפתח, דגל ו-kill-switch). */
   useEffect(() => {
     if (!liveModeEffective) {
