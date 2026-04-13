@@ -71,6 +71,45 @@ def build_trading_client():
     return client, None
 
 
+def check_balance_before_order(required_usd: float) -> tuple[bool, Optional[str]]:
+    """
+    בודק שיתרת CLOB מספיקה לפני שליחת הזמנה.
+    מחזיר (True, None) אם בסדר, או (False, הודעת_שגיאה) אם לא.
+    """
+    acct = fetch_polymarket_clob_account()
+    if not acct.get("ok"):
+        return False, f"לא ניתן לבדוק יתרה: {acct.get('error', 'שגיאה לא ידועה')}"
+
+    balance = acct.get("balance_usd")
+    if balance is None:
+        return False, "לא ניתן לקרוא יתרת CLOB — בדקו הגדרות מפתח וחיבור."
+
+    if balance < required_usd:
+        msg = (
+            f"יתרת CLOB: ${balance:.2f}, נדרש ~${required_usd:.2f}. "
+        )
+        if balance == 0:
+            sig_type = 0
+            try:
+                sig_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0").strip() or "0")
+            except ValueError:
+                pass
+            if sig_type == 0:
+                msg += (
+                    "יתרה 0 — אם ייצאת מפתח מארנק Polymarket, הגדר "
+                    "POLYMARKET_SIGNATURE_TYPE=1 ו-POLYMARKET_FUNDER=<כתובת proxy>. "
+                )
+            msg += (
+                "יש להפקיד USDC לחשבון CLOB ב-Polymarket "
+                "(Deposit דרך polymarket.com — USDC בארנק Polygon לבד לא מספיק)."
+            )
+        else:
+            msg += "יש להפקיד עוד USDC לחשבון CLOB ב-Polymarket."
+        return False, msg
+
+    return True, None
+
+
 async def place_limit_order(
     token_id: str,
     price: float,
@@ -89,6 +128,13 @@ async def place_limit_order(
     client, err = build_trading_client()
     if err:
         return {"ok": False, "error": err}
+
+    # בדיקת יתרה מראש — הודעה ברורה במקום שגיאת CLOB קריפטית
+    if side == "BUY":
+        required = float(price) * float(size)
+        bal_ok, bal_err = check_balance_before_order(required)
+        if not bal_ok:
+            return {"ok": False, "error": bal_err}
 
     try:
         tick_size = client.get_tick_size(token_id)
@@ -175,11 +221,27 @@ def fetch_polymarket_clob_account() -> dict[str, Any]:
     except Exception:
         pass
 
+    # funder — הכתובת שמחזיקה את ה-collateral בפועל (proxy wallet).
+    # עבור EOA (signature_type=0) זהה בדרך כלל ל-addr; עבור proxy — שונה.
+    funder_addr = None
+    try:
+        funder_addr = getattr(client, "funder", None)
+        if funder_addr is None:
+            funder_addr = getattr(getattr(client, "builder", None), "funder", None)
+    except Exception:
+        pass
+
+    is_proxy = bool(
+        funder_addr and addr and funder_addr.lower() != addr.lower()
+    )
+
     return {
         "ok": True,
         "balance_usd": bal_usd,
         "allowance_usd": allow_usd,
         "address": addr,
+        "funder_address": funder_addr,
+        "is_proxy": is_proxy,
         "raw": raw if isinstance(raw, dict) else {"response": raw},
     }
 
@@ -293,18 +355,25 @@ async def fetch_live_portfolio(*, force: bool = False) -> dict[str, Any]:
             "ok": False,
             "error": acct.get("error", "לא ניתן לקרוא ל-CLOB"),
             "address": acct.get("address"),
+            "funder_address": acct.get("funder_address"),
+            "is_proxy": acct.get("is_proxy", False),
             "balance_usd": None,
             "allowance_usd": None,
             "positions": [],
             "equity_usd": None,
+            "hint": None,
             "ts": now,
         }
         _PORTFOLIO_CACHE["ts"] = now
         _PORTFOLIO_CACHE["payload"] = payload
         return payload
 
-    address = acct.get("address") or ""
-    positions = await fetch_live_positions(address)
+    signer_address = acct.get("address") or ""
+    funder_address = acct.get("funder_address") or ""
+    is_proxy = acct.get("is_proxy", False)
+    # פוזיציות מאוחסנות תחת הכתובת שמחזיקה את הכספים — funder עבור proxy, signer עבור EOA.
+    positions_address = funder_address if funder_address else signer_address
+    positions = await fetch_live_positions(positions_address)
     balance_usd = acct.get("balance_usd")
     total_pos_value = 0.0
     for p in positions:
@@ -315,13 +384,43 @@ async def fetch_live_portfolio(*, force: bool = False) -> dict[str, Any]:
     if isinstance(balance_usd, (int, float)):
         equity_usd = float(balance_usd) + total_pos_value
 
+    # רמז למשתמש בתרחישי יתרה 0
+    hint: Optional[str] = None
+    sig_type = 0
+    try:
+        sig_type = int(os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0").strip() or "0")
+    except ValueError:
+        pass
+    if balance_usd is None or balance_usd == 0:
+        has_positions = len(positions) > 0
+        if has_positions:
+            hint = (
+                "יתרה $0 אבל יש פוזיציות פתוחות — ייתכן שכל הכסף מושקע. "
+                "לכניסות חדשות נדרשת יתרה פנויה ב-CLOB."
+            )
+        elif sig_type == 0:
+            hint = (
+                "יתרה $0 ללא פוזיציות. אם ייצאת מפתח מארנק הדפדפן של Polymarket, "
+                "הגדר POLYMARKET_SIGNATURE_TYPE=1 (או 2) "
+                "ו-POLYMARKET_FUNDER=<כתובת proxy>. ראה .env.example."
+            )
+        else:
+            hint = (
+                "יתרה $0 ב-CLOB. ודאו שהפקדתם USDC לחשבון המסחר ב-Polymarket "
+                "(Deposit דרך polymarket.com). USDC בארנק Polygon לבד לא מספיק — "
+                "נדרשת הפקדה לחוזה ה-Exchange."
+            )
+
     payload = {
         "ok": True,
-        "address": address or None,
+        "address": signer_address or None,
+        "funder_address": funder_address or None,
+        "is_proxy": is_proxy,
         "balance_usd": balance_usd,
         "allowance_usd": acct.get("allowance_usd"),
         "positions": positions,
         "equity_usd": equity_usd,
+        "hint": hint,
         "ts": now,
     }
     _PORTFOLIO_CACHE["ts"] = now

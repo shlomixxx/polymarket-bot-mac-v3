@@ -28,6 +28,6 @@
   "loss_recovery_step_pct": 20.0,
   "loss_recovery_every_n_losses": 1,
   "loss_recovery_max_multiplier": 10.0,
-  "mode": "off",
-  "live_trading": true
+  "mode": "auto",
+  "live_trading": false
 }

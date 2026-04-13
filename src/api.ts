@@ -25,16 +25,31 @@ function getApiBase() {
 
 const BASE = getApiBase();
 
-export async function api<T>(path: string, opt?: RequestInit): Promise<T> {
-  const r = await fetch(`${BASE}${path}`, {
-    ...opt,
-    headers: { "Content-Type": "application/json", ...opt?.headers },
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t || r.statusText);
+const DEFAULT_TIMEOUT_MS = 8_000;
+
+export async function api<T>(path: string, opt?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  const { timeoutMs, ...fetchOpt } = opt ?? {};
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  try {
+    const r = await fetch(`${BASE}${path}`, {
+      ...fetchOpt,
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json", ...fetchOpt?.headers },
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(t || r.statusText);
+    }
+    return r.json() as Promise<T>;
+  } finally {
+    clearTimeout(timer);
   }
-  return r.json() as Promise<T>;
+}
+
+/** true when the tab/window is hidden — polls should back off. */
+export function isPageHidden(): boolean {
+  return typeof document !== "undefined" && document.visibilityState === "hidden";
 }
 
 export function engineUrl(path: string) {

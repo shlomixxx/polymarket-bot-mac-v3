@@ -440,14 +440,14 @@ export default function SignalsPanel() {
     refresh(false, w);
   }, [refresh]);
 
-  // Auto-refresh signals every 3 seconds
+  // Auto-refresh signals every 5 seconds
   useEffect(() => {
     refresh();
-    const id = setInterval(() => refresh(), 3_000);
+    const id = setInterval(() => refresh(), 5_000);
     return () => clearInterval(id);
   }, [refresh]);
 
-  // Fast contract price poll — every 500ms
+  // Contract price poll — every 2s (server caches prices)
   useEffect(() => {
     let active = true;
     const poll = async () => {
@@ -462,7 +462,7 @@ export default function SignalsPanel() {
       }
     };
     poll();
-    const id = setInterval(poll, 500);
+    const id = setInterval(poll, 2_000);
     if (priceTimerRef.current) clearInterval(priceTimerRef.current);
     priceTimerRef.current = setInterval(() => setPriceAge(a => a + 1), 1000);
     return () => {

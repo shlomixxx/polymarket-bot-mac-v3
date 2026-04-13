@@ -1051,8 +1051,15 @@ class StrategyRunner:
                 )
                 return
         if n < min_c:
+            market_min = int(math.ceil(float(m.order_min_size)))
+            if market_min > cfg.min_contracts:
+                detail = (
+                    f"מחושב {n}; מינ׳ השוק {market_min}, הגדרתך {cfg.min_contracts}"
+                )
+            else:
+                detail = f"מחושב {n}"
             self.rt.status(
-                f"סטטוס: סכום/מחיר לא מספיקים למינ׳ {min_c} חוזים (מחושב {n})",
+                f"סטטוס: סכום/מחיר לא מספיקים למינ׳ {min_c} חוזים ({detail})",
                 key="size_too_small",
             )
             return

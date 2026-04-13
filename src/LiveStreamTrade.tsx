@@ -15,7 +15,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { api } from "./api";
+import { api, isPageHidden } from "./api";
 
 async function safeApi<T>(path: string): Promise<T | null> {
   try {
@@ -621,8 +621,11 @@ type LivePortfolio = {
     value_usd: number | null;
   }[];
   address: string | null;
+  funder_address?: string | null;
+  is_proxy?: boolean;
   ts: number | null;
   error?: string;
+  hint?: string;
 };
 
 export default function LiveStreamTrade({ layout = "classic" }: { layout?: StreamViewerLayout }) {
@@ -690,7 +693,14 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
       setLiveModeEffective(Boolean(lm?.effective));
     } catch (e) {
       if (gen !== refreshGeneration.current) return;
-      setErr(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      if (e instanceof DOMException && e.name === "AbortError") {
+        setErr("Server slow — retrying…");
+      } else if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
+        setErr("Connection lost — retrying…");
+      } else {
+        setErr(msg);
+      }
     }
   }, []);
 
@@ -778,29 +788,17 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   }, [layout, fitBroadcast]);
 
   useEffect(() => {
-    refresh();
-    const id = window.setInterval(refresh, 1000);
-    return () => window.clearInterval(id);
+    let cancelled = false;
+    void refresh();
+    const id = window.setInterval(() => {
+      if (!cancelled && !isPageHidden()) void refresh();
+    }, 2000);
+    return () => { cancelled = true; window.clearInterval(id); };
   }, [refresh]);
 
   useEffect(() => {
     const id = window.setInterval(() => setClock((c) => c + 1), 1000);
     return () => window.clearInterval(id);
-  }, []);
-
-  /** Mid prices (¢) — faster than full refresh so stream view tracks Polymarket closer. */
-  useEffect(() => {
-    let cancelled = false;
-    const poll = async () => {
-      const ob = await safeApi<OrderbookSummary>("/api/market/orderbook-summary");
-      if (!cancelled && ob) setOrderbook(ob);
-    };
-    void poll();
-    const id = window.setInterval(poll, 400);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
   }, []);
 
   /** Polling תיק חי מ-Polymarket: רק כש-live mode effective */
@@ -811,11 +809,12 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     }
     let cancelled = false;
     const poll = async () => {
+      if (isPageHidden()) return;
       const p = await safeApi<LivePortfolio>("/api/live/portfolio");
       if (!cancelled && p) setLivePortfolio(p);
     };
     void poll();
-    const id = window.setInterval(poll, 3000);
+    const id = window.setInterval(poll, 5000);
     return () => {
       cancelled = true;
       window.clearInterval(id);

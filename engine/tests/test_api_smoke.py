@@ -200,7 +200,9 @@ def test_private_key_delete(client: TestClient, monkeypatch):
 def test_live_mode_state_includes_persisted(client: TestClient, monkeypatch):
     """GET /api/live/mode includes persisted_in_keychain field."""
     import secret_store
+    import main as engine_main
     monkeypatch.setattr(secret_store, "has_persisted_key", lambda: True)
+    engine_main._invalidate_persisted_key_cache()
 
     r = client.get("/api/live/mode")
     assert r.status_code == 200

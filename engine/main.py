@@ -378,11 +378,14 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
 TIPS_V2_CACHE_PATH = DATA_ROOT / "tips_v2_cache.json"
 TIPS_V2_CACHE_TTL_SEC = 300.0  # cache for 5 minutes
 WEB_DIST_DIR = Path(os.environ.get("WEB_DIST_DIR", str(Path(__file__).resolve().parent.parent / "dist"))).resolve()
-ORDERBOOK_SUMMARY_CACHE_TTL_SEC = 0.32
+ORDERBOOK_SUMMARY_CACHE_TTL_SEC = float(
+    os.environ.get("ORDERBOOK_CACHE_TTL", "2.0")
+)
 last_orderbook_summary: Optional[dict[str, Any]] = None
 last_orderbook_summary_ts: float = 0.0
 # Lock למניעת race condition: מונע שני threads מלעדכן את ה-cache בו-זמנית
 _orderbook_summary_lock: Optional[asyncio.Lock] = None
+_shared_httpx: Optional[httpx.AsyncClient] = None
 
 
 def _get_orderbook_lock() -> asyncio.Lock:
@@ -391,6 +394,14 @@ def _get_orderbook_lock() -> asyncio.Lock:
     if _orderbook_summary_lock is None:
         _orderbook_summary_lock = asyncio.Lock()
     return _orderbook_summary_lock
+
+
+def _get_shared_httpx() -> httpx.AsyncClient:
+    """מחזיר httpx client משותף — חוסך TLS handshake בכל בקשה."""
+    global _shared_httpx
+    if _shared_httpx is None:
+        _shared_httpx = httpx.AsyncClient(timeout=8.0)
+    return _shared_httpx
 
 
 def _ensure_log_run_dir() -> None:
@@ -479,6 +490,8 @@ async def lifespan(app: FastAPI):
         _history_recorder_task = None
     trigger.stop_loop()
     runner.stop_loop()
+    if _shared_httpx is not None:
+        await _shared_httpx.aclose()
 
 
 app = FastAPI(title="Polymarket Bot Engine", lifespan=lifespan)
@@ -569,11 +582,10 @@ async def btc_window_prices(epoch: int, window_sec: int = 300):
 
 @app.get("/api/orderbook/{token_id}")
 async def orderbook(token_id: str):
-    async with httpx.AsyncClient() as client:
-        try:
-            return await get_clob_book(client, token_id)
-        except Exception as e:
-            raise HTTPException(502, str(e))
+    try:
+        return await get_clob_book(_get_shared_httpx(), token_id)
+    except Exception as e:
+        raise HTTPException(502, str(e))
 
 
 def _best_book_prices(book: Optional[dict[str, Any]]) -> dict[str, Any]:
@@ -625,17 +637,17 @@ async def market_orderbook_summary():
         up_book: Optional[dict[str, Any]] = None
         down_book: Optional[dict[str, Any]] = None
         degraded_reason: Optional[str] = None
-        async with httpx.AsyncClient() as client:
-            try:
-                up_book = await get_clob_book(client, m.token_up)
-                down_book = await get_clob_book(client, m.token_down)
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code if e.response is not None else None
-                degraded_reason = f"clob_http_{status}" if status is not None else "clob_http_error"
-                if status == 429:
-                    degraded_reason = "clob_rate_limited"
-            except Exception:
-                degraded_reason = "clob_unavailable"
+        client = _get_shared_httpx()
+        try:
+            up_book = await get_clob_book(client, m.token_up)
+            down_book = await get_clob_book(client, m.token_down)
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            degraded_reason = f"clob_http_{status}" if status is not None else "clob_http_error"
+            if status == 429:
+                degraded_reason = "clob_rate_limited"
+        except Exception:
+            degraded_reason = "clob_unavailable"
 
         result: dict[str, Any] = {
             "slug": m.slug,
@@ -1042,6 +1054,7 @@ async def set_private_key(body: dict[str, Any]):
         else:
             # "שמירה ריקה לצמיתות" = מחיקה מפורשת של מפתח שמור
             secret_store.delete_key()
+        _invalidate_persisted_key_cache()
 
     clob_ok = False
     try:
@@ -1065,12 +1078,25 @@ async def delete_private_key():
     """מוחק מפתח מהסשן ומה-Keychain. אחרי זה צריך להקליד שוב כדי לסחור לייב."""
     os.environ["POLYMARKET_PRIVATE_KEY"] = ""
     removed = secret_store.delete_key()
+    _invalidate_persisted_key_cache()
     reset_portfolio_cache()
     return {"ok": True, "removed_from_keychain": removed, **_live_mode_state()}
 
 
+_persisted_key_cache: Optional[bool] = None
+_persisted_key_cache_ts: float = 0.0
+_PERSISTED_KEY_CACHE_TTL = 10.0  # בודקים keyring פעם ב-10 שניות, לא בכל בקשה
+
+
+def _invalidate_persisted_key_cache() -> None:
+    global _persisted_key_cache, _persisted_key_cache_ts
+    _persisted_key_cache = None
+    _persisted_key_cache_ts = 0.0
+
+
 def _live_mode_state() -> dict[str, Any]:
     """מחזיר את מצב "כסף אמיתי" הכולל — דגל ממשק + kill-switch פריסה + מפתח."""
+    global _persisted_key_cache, _persisted_key_cache_ts
     env_kill = os.environ.get("POLYMARKET_LIVE", "").strip().lower() in (
         "0", "false", "no", "off",
     )
@@ -1083,17 +1109,19 @@ def _live_mode_state() -> dict[str, Any]:
         reason = "POLYMARKET_LIVE=0 (kill-switch בפריסה)"
     elif enabled and not has_key:
         reason = "חסר POLYMARKET_PRIVATE_KEY"
-    persisted = False
-    try:
-        persisted = secret_store.has_persisted_key()
-    except Exception:
-        persisted = False
+    now = time.time()
+    if _persisted_key_cache is None or (now - _persisted_key_cache_ts) > _PERSISTED_KEY_CACHE_TTL:
+        try:
+            _persisted_key_cache = secret_store.has_persisted_key()
+        except Exception:
+            _persisted_key_cache = False
+        _persisted_key_cache_ts = now
     return {
         "enabled": enabled,
         "effective": effective,
         "env_kill_switch": env_kill,
         "has_private_key": has_key,
-        "persisted_in_keychain": persisted,
+        "persisted_in_keychain": _persisted_key_cache,
         "reason_blocked": reason,
     }
 
@@ -1163,9 +1191,9 @@ async def api_signals(refresh: bool = False, window: Optional[str] = None):
     down_book: Optional[dict[str, Any]] = None
     if m:
         try:
-            async with httpx.AsyncClient() as client:
-                up_book = await get_clob_book(client, m.token_up)
-                down_book = await get_clob_book(client, m.token_down)
+            client = _get_shared_httpx()
+            up_book = await get_clob_book(client, m.token_up)
+            down_book = await get_clob_book(client, m.token_down)
         except Exception:
             pass
     window_sec = m.window_sec if m else 300
@@ -1202,7 +1230,7 @@ async def api_signals(refresh: bool = False, window: Optional[str] = None):
 # cache קצר — נפרד לכל window (5m / 15m)
 _contract_price_cache: dict[str, dict[str, Any]] = {}
 _contract_price_cache_ts: dict[str, float] = {}
-CONTRACT_PRICE_CACHE_TTL = 0.4  # שניות
+CONTRACT_PRICE_CACHE_TTL = 2.0  # שניות
 
 
 @app.get("/api/contract-prices")
@@ -1225,24 +1253,24 @@ async def api_contract_prices(window: Optional[str] = None):
     up_ask: Optional[float] = None
     down_ask: Optional[float] = None
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            up_book, down_book = await asyncio.gather(
-                get_clob_book(client, m.token_up),
-                get_clob_book(client, m.token_down),
-                return_exceptions=True,
-            )
-            def _first_ask(book: Any) -> Optional[float]:
-                if isinstance(book, Exception) or not isinstance(book, dict):
-                    return None
-                asks = book.get("asks") or []
-                if not asks:
-                    return None
-                try:
-                    return round(float(asks[0]["price"]) * 100, 1)
-                except Exception:
-                    return None
-            up_ask = _first_ask(up_book)
-            down_ask = _first_ask(down_book)
+        client = _get_shared_httpx()
+        up_book, down_book = await asyncio.gather(
+            get_clob_book(client, m.token_up),
+            get_clob_book(client, m.token_down),
+            return_exceptions=True,
+        )
+        def _first_ask(book: Any) -> Optional[float]:
+            if isinstance(book, Exception) or not isinstance(book, dict):
+                return None
+            asks = book.get("asks") or []
+            if not asks:
+                return None
+            try:
+                return round(float(asks[0]["price"]) * 100, 1)
+            except Exception:
+                return None
+        up_ask = _first_ask(up_book)
+        down_ask = _first_ask(down_book)
     except Exception:
         pass
 
@@ -1481,11 +1509,11 @@ async def trigger_share_bundle():
                 "order_min_size": m_live.order_min_size,
             }
             # best asks לשני הצדדים
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                up_book, down_book = await asyncio.gather(
-                    get_clob_book(client, m_live.token_up),
-                    get_clob_book(client, m_live.token_down),
-                )
+            client = _get_shared_httpx()
+            up_book, down_book = await asyncio.gather(
+                get_clob_book(client, m_live.token_up),
+                get_clob_book(client, m_live.token_down),
+            )
             asks_snap["up"] = float(up_book["asks"][0]["price"]) if (up_book.get("asks") or []) else None
             asks_snap["down"] = float(down_book["asks"][0]["price"]) if (down_book.get("asks") or []) else None
     except Exception as e:

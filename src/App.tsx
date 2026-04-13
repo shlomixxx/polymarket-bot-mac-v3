@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ReferenceLine, ResponsiveContainer } from "recharts";
-import { api, engineUrl } from "./api";
+import { api, engineUrl, isPageHidden } from "./api";
 import {
   chartAxisTick,
   chartTooltipStyle,
@@ -1596,6 +1596,8 @@ export default function App() {
     allowance_usd: number | null;
     equity_usd: number | null;
     address: string | null;
+    funder_address?: string | null;
+    is_proxy?: boolean;
     positions: {
       token_id: string;
       side: string;
@@ -1606,6 +1608,7 @@ export default function App() {
     }[];
     ts: number | null;
     error?: string;
+    hint?: string;
   } | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [logEntries, setLogEntries] = useState<{ ts: number; msg: string; type: string; session_id?: string }[]>([]);
@@ -1827,9 +1830,9 @@ export default function App() {
     const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
     (async () => {
       while (!cancelled) {
-        await refresh();
+        if (!isPageHidden()) await refresh();
         if (cancelled) break;
-        const ms = hasOpenDemoPositionsRef.current ? 500 : 1000;
+        const ms = isPageHidden() ? 10_000 : hasOpenDemoPositionsRef.current ? 1500 : 3000;
         await sleep(ms);
       }
     })();
@@ -1838,9 +1841,7 @@ export default function App() {
     };
   }, [refresh]);
 
-  /** Polling נפרד לתיק חי מ-Polymarket: רק כשמצב לייב "effective" (מפתח, דגל ו-kill-switch).
-   *  קצב 3 שניות — מספיק לעיניים, ולא חונק את ה-CLOB (שרת מבצע cache פנימי של ~2 שניות).
-   */
+  /** Polling נפרד לתיק חי מ-Polymarket: רק כשמצב לייב "effective" (מפתח, דגל ו-kill-switch). */
   useEffect(() => {
     if (!liveModeEffective) {
       setLivePortfolio(null);
@@ -1848,6 +1849,7 @@ export default function App() {
     }
     let cancelled = false;
     const poll = async () => {
+      if (isPageHidden()) return;
       try {
         const p = await api<typeof livePortfolio>("/api/live/portfolio");
         if (!cancelled) setLivePortfolio(p);
@@ -1856,7 +1858,7 @@ export default function App() {
       }
     };
     void poll();
-    const id = window.setInterval(poll, 3000);
+    const id = window.setInterval(poll, 5000);
     return () => {
       cancelled = true;
       window.clearInterval(id);
@@ -2393,9 +2395,32 @@ export default function App() {
                     </span>
                   </div>
                   יתרת USDC ב-CLOB:{" "}
-                  <strong className="tabular-nums">
+                  <strong className="tabular-nums" style={Number(livePortfolio.balance_usd ?? 0) === 0 ? { color: "#f87171" } : undefined}>
                     ${Number(livePortfolio.balance_usd ?? 0).toFixed(2)}
                   </strong>
+                  {livePortfolio.allowance_usd != null && (
+                    <span style={{
+                      marginInlineStart: 10,
+                      fontSize: 11,
+                      color: Number(livePortfolio.allowance_usd) < Number(livePortfolio.balance_usd ?? 0) ? "#facc15" : "var(--muted)",
+                    }}>
+                      Allowance: ${Number(livePortfolio.allowance_usd).toFixed(2)}
+                    </span>
+                  )}
+                  {Number(livePortfolio.balance_usd ?? 0) === 0 && !livePortfolio.hint && (
+                    <div style={{
+                      marginTop: 8,
+                      padding: "8px 10px",
+                      borderRadius: 6,
+                      background: "rgba(248, 113, 113, 0.12)",
+                      border: "1px solid rgba(248, 113, 113, 0.35)",
+                      color: "#f87171",
+                      fontSize: 11,
+                      lineHeight: 1.4,
+                    }}>
+                      יתרה 0 — לא ניתן לסחור. הפקידו USDC לחשבון CLOB ב-polymarket.com (Deposit).
+                    </div>
+                  )}
                   <div style={{ marginTop: 6, color: "var(--muted)", fontSize: 12 }}>
                     שווי נטו (כולל פוזיציות פתוחות ב-Polymarket):{" "}
                     <strong className="tabular-nums" style={{ color: "var(--text)" }}>
@@ -2408,11 +2433,32 @@ export default function App() {
                       {livePortfolio.positions?.length ?? 0}
                     </strong>
                   </div>
-                  {livePortfolio.address ? (
+                  {livePortfolio.is_proxy && livePortfolio.funder_address ? (
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 8, wordBreak: "break-all", lineHeight: 1.35 }}>
+                      Funder (proxy): {livePortfolio.funder_address}
+                      <br />
+                      Signer: {livePortfolio.address}
+                    </div>
+                  ) : livePortfolio.address ? (
                     <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 8, wordBreak: "break-all", lineHeight: 1.35 }}>
                       כתובת חותם: {livePortfolio.address}
                     </div>
                   ) : null}
+                  {livePortfolio.hint && (
+                    <div style={{
+                      marginTop: 8,
+                      padding: "10px 12px",
+                      borderRadius: 6,
+                      background: "rgba(250, 204, 21, 0.15)",
+                      border: "1px solid rgba(250, 204, 21, 0.4)",
+                      color: "#facc15",
+                      fontSize: 12,
+                      fontWeight: 500,
+                      lineHeight: 1.45,
+                    }}>
+                      ⚠ {livePortfolio.hint}
+                    </div>
+                  )}
                   <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed var(--border)", fontSize: 11, color: "var(--muted)", lineHeight: 1.45 }}>
                     נתוני היתרה והפוזיציות נמשכים ישירות מ-Polymarket (CLOB + Data API). ספר הסימולציה הפנימי מתסנכרן אוטומטית (reconcile) מדי רוטציה של חלון.
                   </div>

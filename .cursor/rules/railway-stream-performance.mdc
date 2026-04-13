@@ -1,0 +1,49 @@
+---
+description: Performance checklist for Railway deployment & stream pages (polling, caching, keyring, network latency)
+alwaysApply: false
+---
+
+## Railway + Stream Performance
+
+### Problem Pattern
+When deployed to Railway (US-East), network round-trip to Polymarket CLOB adds ~50-200ms per external call. Aggressive client polling (sub-second) combined with short server cache TTLs creates request storms that block user interactions (POST approve/mode stuck behind GET queues).
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `engine/main.py` | FastAPI server: cache TTLs, httpx client, orderbook-summary, contract-prices, keyring calls |
+| `engine/secret_store.py` | Keyring access — must short-circuit on Linux (no desktop keyring backend) |
+| `src/api.ts` | Fetch wrapper: timeout, `isPageHidden()` helper |
+| `src/LiveStreamTrade.tsx` | Stream overlay: refresh interval, orderbook poll, live portfolio poll |
+| `src/App.tsx` | Main dashboard: refresh loop (dynamic interval), live portfolio poll |
+| `src/SignalsPanel.tsx` | Signals tab: signals refresh + contract-prices poll |
+| `src/TriggerTrader.tsx` | Trigger page: 2s poll (OK as-is) |
+
+### Tuning Knobs (env vars)
+
+- `ORDERBOOK_CACHE_TTL` — server-side orderbook-summary cache seconds (default `2.0`; was `0.32`)
+- `CONTRACT_PRICE_CACHE_TTL` — contract-prices cache (hardcoded `2.0`; was `0.4`)
+
+### Checklist: Before Deploy
+
+1. Verify Railway region matches user base (US-East for Polymarket CLOB)
+2. Set `ORDERBOOK_CACHE_TTL=2` (or higher) in Railway env — reduces CLOB calls per viewer
+3. Confirm no `keyring` pip package or verify `secret_store.py` short-circuits gracefully
+4. Check Railway instance has enough memory (polling + httpx pool)
+
+### Checklist: After Deploy
+
+1. **Logs**: no repeated "keyring" / "No recommended backend" warnings (should appear once then stop)
+2. **Request rate**: `grep -c orderbook-summary` in 60s of logs — should be ~30/min per viewer (was ~150)
+3. **Response times**: `/api/live/mode` should be <5ms (no keyring call); orderbook-summary <50ms on cache hit
+4. **UI**: clicks on "approve" / "mode toggle" respond within 200ms, no queueing behind GETs
+5. **Stream pages**: no visible stutter or data gaps; error banner shows "retrying..." on timeout, recovers automatically
+
+### Success Criteria
+
+- No orderbook-summary flood in logs (max 1 req/2s per viewer)
+- No keyring errors after first log line
+- POST actions (approve, mode toggle) not blocked by GET queue
+- Stream pages: smooth mid-price updates, graceful reconnect on network blip
+- Background tabs: near-zero network traffic
