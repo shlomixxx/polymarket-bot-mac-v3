@@ -404,6 +404,7 @@ class DemoEngine:
         real_positions: list[dict[str, Any]],
         *,
         context: Optional[dict[str, Any]] = None,
+        exclude_token_ids: Optional[set[str]] = None,
     ) -> Optional[dict[str, Any]]:
         """מסנכרן את הספר הפנימי (ששימש כ-shadow ledger במצב לייב) ליתרה
         ולפוזיציות האמיתיות של Polymarket. נקרא אחרי epoch rollover ובקצב קבוע.
@@ -441,9 +442,12 @@ class DemoEngine:
         shadow_by_token = {p.token_id: p for p in self.state.positions}
         new_positions: list[Position] = []
         real_token_ids: set[str] = set()
+        _exclude = exclude_token_ids or set()
         for rp in real_positions or []:
             tid = str(rp.get("token_id") or "").strip()
             if not tid:
+                continue
+            if tid in _exclude:
                 continue
             size = rp.get("size")
             try:
@@ -1061,9 +1065,7 @@ class DemoEngine:
         # מילוי פירוק BTC ל-TP — בכל קריאה (מגבלה פנימית לעסקאות/קריאה) כדי שה-UI יקבל נתונים מיד אחרי /api/demo/state
         if await self._backfill_missing_tp_settlement_btc():
             self.save()
-        # Throttle: לא לפגוע ב-CLOB; ~0.55s מאפשר לרענון UI כל 1s לקבל סימון מלא ודגימת מסלול עדכנית.
-        # לא מדללים כשיש פוזיציה בלי רגל תואמת ב־last_mark (למשל כניסה מיד אחרי tick) — אחרת ה־UI
-        # מקבל legs ריקים / בלי pnl_path ורואה גרף נעלם + placeholder "ממתין לדגימה…".
+        # Throttle: WS cache makes reads instant, so we can be more aggressive.
         try:
             last_ts = float((self.state.last_mark or {}).get("ts") or 0.0)
             pos_ids = {p.token_id for p in self.state.positions}
@@ -1072,11 +1074,19 @@ class DemoEngine:
             missing_leg_for_position = bool(pos_ids) and not pos_ids.issubset(leg_tids)
             now_gate = time.time()
             aggressive_mark = now_gate < float(getattr(self, "_mark_aggressive_until", 0.0) or 0.0)
-            # פוזיציה פתוחה: רגיל ~0.38s; אחרי תנודתיות גבוהה בין טיקים — ~0.22s עד סוף החלון
+            ws_available = False
+            try:
+                from ws_price_stream import price_stream
+                ws_available = price_stream.connected
+            except Exception:
+                pass
             if self.state.positions:
-                throttle_sec = MARK_THROTTLE_VOLATILE_SEC if aggressive_mark else 0.38
+                if ws_available:
+                    throttle_sec = 0.10 if aggressive_mark else 0.15
+                else:
+                    throttle_sec = MARK_THROTTLE_VOLATILE_SEC if aggressive_mark else 0.38
             else:
-                throttle_sec = 0.55
+                throttle_sec = 0.25 if ws_available else 0.55
             if last_ts and (now_gate - last_ts) < throttle_sec and not missing_leg_for_position:
                 # אין פוזיציות — מאפסים unrealized גם בתוך חלון ה-throttle
                 if not self.state.positions and self.state.last_mark:
@@ -1096,24 +1106,33 @@ class DemoEngine:
         if not self.state.positions:
             self.state.last_mark = {"equity": eq, "unrealized_usd": 0.0, "ts": now, "legs": []}
 
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=6.0) as client:
             if self.state.positions:
                 for p in list(self.state.positions):
-                    r = await client.get(
-                        "https://clob.polymarket.com/book",
-                        params={"token_id": p.token_id},
-                        timeout=15.0,
-                    )
-                    if r.status_code != 200:
-                        continue
-                    bids = list((r.json().get("bids") or []))
-                    if not bids:
-                        continue
+                    bid: float | None = None
                     try:
-                        bids.sort(key=lambda x: float(x["price"]), reverse=True)
+                        from ws_price_stream import price_stream
+                        tp = price_stream.get_price(p.token_id)
+                        if tp and tp.bid is not None and (now - tp.ts) < 30.0:
+                            bid = tp.bid
                     except Exception:
                         pass
-                    bid = float(bids[0]["price"])
+                    if bid is None:
+                        r = await client.get(
+                            "https://clob.polymarket.com/book",
+                            params={"token_id": p.token_id},
+                            timeout=8.0,
+                        )
+                        if r.status_code != 200:
+                            continue
+                        bids = list((r.json().get("bids") or []))
+                        if not bids:
+                            continue
+                        try:
+                            bids.sort(key=lambda x: float(x["price"]), reverse=True)
+                        except Exception:
+                            pass
+                        bid = float(bids[0]["price"])
                     leg_value = bid * p.contracts * (1 - FEE_RATE)
                     leg_cost = p.avg_cost * p.contracts * (1 + FEE_RATE)
                     leg_unreal = leg_value - leg_cost

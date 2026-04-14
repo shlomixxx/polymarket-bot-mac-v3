@@ -84,6 +84,8 @@ type DemoState = {
     epoch?: number;
     settled_window_sec?: number;
     window_sec?: number;
+    /** Up / Down — כיוון הפוזיציה ביציאה */
+    side?: string;
   }[];
   positions?: {
     side: string;
@@ -352,7 +354,21 @@ function describeStreamExit(trades: DemoState["trades"]): string {
   return "✅ Position closed — flat until next entry.";
 }
 
-type RoundOutcome = { id: string; startLabel: string; endLabel: string; win: boolean; pnlUsd: number | null };
+type RoundOutcome = {
+  id: string;
+  startLabel: string;
+  endLabel: string;
+  win: boolean;
+  pnlUsd: number | null;
+  side: "Up" | "Down" | null;
+};
+
+function tradeExitSide(t: { side?: unknown }): "Up" | "Down" | null {
+  const s = String(t.side ?? "").trim();
+  if (s === "Up") return "Up";
+  if (s === "Down") return "Down";
+  return null;
+}
 
 /** Per-exit history for spectator overlay — win/loss only, no dollar amounts. Newest first; one row per exit (multiple rows in the same clock minute if multiple trades). */
 function buildRoundOutcomes(
@@ -388,6 +404,18 @@ function buildRoundOutcomes(
   const out: RoundOutcome[] = [];
   const fmt = (d: Date) =>
     d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  /** פירוק בסוף חלון — לעיתים ה-ts מגיע שניה אחרי הקצה; מציגים דקה עגולה (שניות 00). */
+  const exitTimeLabel = (sec: number, typ: string) => {
+    const d = new Date(sec * 1000);
+    const isWindowEndSettlement =
+      typ === "SETTLE_WIN" || typ === "SETTLE_LOSS" || typ === "SETTLE_UNKNOWN";
+    if (isWindowEndSettlement) {
+      const floored = new Date(d);
+      floored.setSeconds(0, 0);
+      return fmt(floored);
+    }
+    return fmt(d);
+  };
   let idx = 0;
   for (const t of sorted) {
     const tsSec = Number(t.ts);
@@ -395,14 +423,14 @@ function buildRoundOutcomes(
     const sec = Number.isFinite(tsSec) ? tsSec : Number(fallbackEpoch);
     if (!Number.isFinite(sec)) continue;
     const win = Number(t.realized_pnl) > 0;
-    const d = new Date(sec * 1000);
-    const timeLabel = fmt(d);
     const typ = String(t.type ?? "");
+    const timeLabel = exitTimeLabel(sec, typ);
     const id = `${sec}-${idx}-${typ}`;
     idx += 1;
     const pnlRaw = Number(t.realized_pnl);
     const pnlUsd = Number.isFinite(pnlRaw) ? pnlRaw : null;
-    out.push({ id, startLabel: timeLabel, endLabel: timeLabel, win, pnlUsd });
+    const side = tradeExitSide(t);
+    out.push({ id, startLabel: timeLabel, endLabel: timeLabel, win, pnlUsd, side });
     if (out.length >= maxItems) break;
   }
   return out;

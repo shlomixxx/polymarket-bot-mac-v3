@@ -114,6 +114,8 @@ class StrategyRuntime:
     # כניסה אוטומטית לייב שנכשלה — מצמצמים חזרות על אותה שגיאה (לא משנה לוגיקת מסחר).
     _last_live_auto_entry_fail_ts: float = 0.0
     _last_live_auto_entry_fail_msg: str = ""
+    _settled_token_ids: set = field(default_factory=set)
+    _settled_token_ids_ts: float = 0.0
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -276,16 +278,22 @@ def dca_ref_price_from_ask(ask: float, entry_target_usd: float, cfg: StrategyCon
 
 
 async def fetch_best_bid_ask(token_id: str) -> tuple[Optional[float], Optional[float]]:
-    async with httpx.AsyncClient() as client:
+    from ws_price_stream import price_stream
+    bid, ask = price_stream.get_best_bid_ask(token_id)
+    if bid is not None or ask is not None:
+        tp = price_stream.get_price(token_id)
+        if tp and (time.time() - tp.ts) < 30.0:
+            return bid, ask
+    async with httpx.AsyncClient(timeout=6.0) as client:
         try:
             book = await get_clob_book(client, token_id)
         except Exception:
-            return None, None
+            return bid, ask
     bids = book.get("bids") or []
     asks = book.get("asks") or []
-    bid = float(bids[0]["price"]) if bids else None
-    ask = float(asks[0]["price"]) if asks else None
-    return bid, ask
+    rest_bid = float(bids[0]["price"]) if bids else None
+    rest_ask = float(asks[0]["price"]) if asks else None
+    return rest_bid, rest_ask
 
 
 class StrategyRunner:
@@ -405,9 +413,11 @@ class StrategyRunner:
         *,
         context: Optional[dict[str, Any]] = None,
         force: bool = False,
+        exclude_token_ids: Optional[set[str]] = None,
     ) -> None:
         """מושך יתרה + פוזיציות אמיתיות של Polymarket ומסנכרן את demo.state.
         קורה אחרי rollover ובקצב קבוע (כל ~2 דק׳) כסדר־גב נגד drift.
+        exclude_token_ids — טוקנים שכבר פורקו ב-expire; לא להחזיר ב-reconcile.
         """
         if not self._live_trading_ok():
             return
@@ -427,6 +437,7 @@ class StrategyRunner:
             portfolio.get("balance_usd"),
             list(portfolio.get("positions") or []),
             context=ctx,
+            exclude_token_ids=exclude_token_ids,
         )
         self.rt._last_live_reconcile_ts = now
         if tr is not None:
@@ -594,14 +605,13 @@ class StrategyRunner:
             try:
                 await self._tick()
             except Exception as e:
-                # לפעמים str(e) ריק; נשמור repr כדי לקבל סוג/פרטים.
                 self.rt.log(f"שגיאה: {e!r}")
                 try:
                     from run_logging import log_error
                     log_error(repr(e), {"context": "_tick"})
                 except Exception:
                     pass
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.25)
 
     def _prune_trade_timestamps(self, now: float) -> None:
         """שומר רק עסקאות מהשעה האחרונה (למגבלת trades/hour)."""
@@ -617,7 +627,18 @@ class StrategyRunner:
                 key="limit_trades_per_hour",
             )
             return False
-        if cfg.max_entries_per_window > 0 and self.rt.entries_this_window >= cfg.max_entries_per_window:
+        # המשך סלייסי DCA לא נספר כ«כניסה חדשה» למגבלה — אחרת max_entries=1 חוסם סלייס 2..N
+        # ו-TP נשאר נעול לנצח (dca_done_slices < dca_slices).
+        dca_mid_round = (
+            cfg.dca_enabled
+            and self.rt.dca_done_slices >= 1
+            and self.rt.dca_done_slices < cfg.dca_slices
+        )
+        if (
+            cfg.max_entries_per_window > 0
+            and self.rt.entries_this_window >= cfg.max_entries_per_window
+            and not dca_mid_round
+        ):
             self.rt.status(
                 f"סטטוס: הגיע למקס׳ כניסות בחלון ({cfg.max_entries_per_window}) — לא נכנסים יותר בחלון הזה",
                 key="limit_entries_per_window",
@@ -676,8 +697,16 @@ class StrategyRunner:
         self.rt.last_tick_ts = time.time()
         # Reconcile קבוע (לא יותר מ-1 ל-120 שניות) כדי לתפוס drift בין הספר הפנימי
         # ליתרה/פוזיציות האמיתיות של Polymarket — רץ רק במצב לייב.
+        # ניקוי settled_token_ids אחרי שעה (Data API כבר מפסיק להחזיר אותם).
+        if (
+            self.rt._settled_token_ids
+            and time.time() - self.rt._settled_token_ids_ts > 3600
+        ):
+            self.rt._settled_token_ids.clear()
         try:
-            await self._live_reconcile_if_enabled()
+            await self._live_reconcile_if_enabled(
+                exclude_token_ids=self.rt._settled_token_ids or None,
+            )
         except Exception:
             pass
         m = await discover_active_btc_window(self.rt.config.btc_window)
@@ -713,9 +742,22 @@ class StrategyRunner:
                     (m.token_up, m.token_down),
                     context=rollover_ctx,
                 )
-                # לייב: אחרי פירוק — reconcile מלא מול המציאות כדי לטפל בכל drift שנשאר.
+                # אסוף token_ids שפורקו — לא להחזיר ב-reconcile (Data API עלול
+                # עדיין להחזיר אותם → כפילות SETTLE + שחזור הפסד שגוי).
+                settled_tids: set[str] = set()
+                for st in settlement_trades:
+                    tid = st.get("token_id") or ""
+                    if tid:
+                        settled_tids.add(tid)
+                self.rt._settled_token_ids.update(settled_tids)
+                if settled_tids:
+                    self.rt._settled_token_ids_ts = time.time()
                 if self._live_trading_ok():
-                    await self._live_reconcile_if_enabled(context=rollover_ctx, force=True)
+                    await self._live_reconcile_if_enabled(
+                        context=rollover_ctx,
+                        force=True,
+                        exclude_token_ids=self.rt._settled_token_ids,
+                    )
                 cfg_lr = self.rt.config
                 if settlement_trades:
                     has_loss = any(float(t.get("realized_pnl") or 0) < 0 for t in settlement_trades)
@@ -776,6 +818,7 @@ class StrategyRunner:
                     f"שוק CLOB: Up Ask {_fmt_px(ask_u)}/Bid {_fmt_px(bid_u)} · Down Ask {_fmt_px(ask_d)}/Bid {_fmt_px(bid_d)}"
                 )
         gate_ctx = self._time_gates(min_left, cfg)
+        # m.order_min_size מגיע מ־Gamma ואז מעודכן מ־CLOB ‎/book‎ ב־discover (סמכותי למסחר)
         min_c = max(cfg.min_contracts, int(math.ceil(float(m.order_min_size))))
         base_ctx: dict[str, Any] = {
             "epoch": m.epoch,
@@ -818,11 +861,13 @@ class StrategyRunner:
                 tp_ctx = dict(base_ctx)
                 tp_ctx["reason"] = f"TP {p.side}: upnl={upnl:.2f}% >= {cfg.take_profit_pct:.2f}%"
                 pos_contracts = float(p.contracts)
+                if pos_contracts <= 1e-8:
+                    continue
                 if pos_contracts < float(m.order_min_size):
                     self.rt.log(
-                        f"TP: פוזיציה {pos_contracts} מתחת למינימום השוק {m.order_min_size} — דילוג"
+                        f"TP: פוזיציה {pos_contracts:.4f} חוזים — מתחת למינ׳ הזמנה {m.order_min_size} של השוק; "
+                        f"מנסה סגירה (SELL) בכל זאת — אם הבורסה תדחה, סגר ידנית או הגדל/י מינ׳ חוזים בכניסה"
                     )
-                    continue
                 if self._live_trading_ok():
                     _, bid_tp = await fetch_best_bid_ask(p.token_id)
                     if bid_tp is None:
@@ -1242,7 +1287,30 @@ class StrategyRunner:
                     return
                 self.rt._last_live_auto_entry_fail_msg = err
                 self.rt._last_live_auto_entry_fail_ts = t_fail
-                self.rt.log(f"כניסה אוטומטית (לייב) נכשלה: {err}")
+                notional_check = float(lim) * float(n)
+                lr_note = (
+                    f"בסיס ${float(cfg.investment_usd):.2f} · מכפיל שחזור {lr_mult_snapshot:.2f}× "
+                    f"· יעד אפקטיבי ${eff_inv_snapshot:.2f}"
+                    if cfg.loss_recovery_enabled
+                    else f"יעד השקעה (ללא שחזור) ${eff_inv_snapshot:.2f}"
+                )
+                dca_note = ""
+                if cfg.dca_enabled:
+                    ds = max(1, int(cfg.dca_slices))
+                    per_slice = float(eff_inv_snapshot) / float(ds)
+                    dca_note = (
+                        f" · DCA סלייס {self.rt.dca_done_slices}/{cfg.dca_slices} · "
+                        f"תקציב לסלייס ≈ ${per_slice:.2f} "
+                        f"(יעד אפקטיבי ${eff_inv_snapshot:.2f} ÷ {ds})"
+                    )
+                self.rt.log(
+                    f"כניסה אוטומטית (לייב) נכשלה: {err} — "
+                    f"פירוט: {side} ×{float(n):.2f} חוזים · limit {float(lim):.4f}$ · "
+                    f"בדיקת CLOB (מחיר×חוזים, ללא עמלה) ≈ ${notional_check:.2f} · "
+                    f"עלות משוערת כולל עמלה ≈ ${planned_cost:.2f} · "
+                    f"{lr_note}{dca_note} · "
+                    f"Ask בשוק {_fmt_px(ask)} · cap כניסה {float(entry_cap_price):.4f}$"
+                )
                 return
             fill_a = float(lo.get("price") or lim)
             r = self.demo.record_live_buy(side, str(token), float(n), fill_a, context=entry_ctx)

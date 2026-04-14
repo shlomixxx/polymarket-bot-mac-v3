@@ -114,6 +114,17 @@ function formatTimeLeft(sec: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+/** זמן ריצה מאז הפעלת semi/auto — כמו ב־StreamProLayout */
+function formatBotUptime(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return "—";
+  const h = Math.floor(sec / 3600);
+  const mi = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return `${h}h ${mi}m ${String(s).padStart(2, "0")}s`;
+  if (mi > 0) return `${mi}m ${String(s).padStart(2, "0")}s`;
+  return `${s}s`;
+}
+
 function pxToCentsLabel(px: number | null | undefined): string {
   if (px == null || !Number.isFinite(Number(px))) return "—";
   return `${(Number(px) * 100).toFixed(1)}¢`;
@@ -250,6 +261,7 @@ export function StreamLiveBroadcastLayout(
     runUsdSessionStats,
     runUsdChartRefExtremes,
     windowSecondsLeftDisplay,
+    botRunUptimeSec,
     roundOutcomes,
     chartIdleCopy,
   } = props;
@@ -273,6 +285,13 @@ export function StreamLiveBroadcastLayout(
     windowSecondsLeftDisplay != null
       ? formatTimeLeft(windowSecondsLeftDisplay)
       : "—";
+
+  const botRunDisplay =
+    stratCfg?.mode === "off"
+      ? "—"
+      : botRunUptimeSec != null
+        ? formatBotUptime(botRunUptimeSec)
+        : "—";
 
   const lastTrades = useMemo(() => {
     return [...roundOutcomes].slice(0, 6);
@@ -453,6 +472,19 @@ export function StreamLiveBroadcastLayout(
               }}
             >
               {nowDateLabel()} | {nowTimeWindowLabel(market)}
+            </div>
+            <div
+              style={{
+                fontSize: 11,
+                color: "rgba(255,255,255,0.28)",
+                marginTop: 6,
+                fontWeight: 500,
+                letterSpacing: "0.03em",
+                fontVariantNumeric: "tabular-nums",
+              }}
+              title="Wall time since semi/auto was enabled"
+            >
+              Bot run · {botRunDisplay}
             </div>
           </div>
 
@@ -1274,15 +1306,38 @@ export function StreamLiveBroadcastLayout(
                       />
                       <span
                         style={{
-                          fontSize: 12,
-                          fontWeight: 700,
-                          color: "rgba(255,255,255,0.65)",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          flexWrap: "wrap",
                           flex: 1,
+                          minWidth: 0,
                         }}
                       >
-                        {r.startLabel === r.endLabel
-                          ? r.startLabel
-                          : `${r.startLabel}`}
+                        <span
+                          style={{
+                            fontSize: 12,
+                            fontWeight: 700,
+                            color: "rgba(255,255,255,0.65)",
+                          }}
+                        >
+                          {r.startLabel === r.endLabel
+                            ? r.startLabel
+                            : `${r.startLabel}`}
+                        </span>
+                        {r.side ? (
+                          <span
+                            style={{
+                              fontSize: 10,
+                              fontWeight: 900,
+                              letterSpacing: "0.12em",
+                              color: r.side === "Up" ? "#4ade80" : "#fb7185",
+                              flexShrink: 0,
+                            }}
+                          >
+                            {r.side === "Up" ? "UP" : "DOWN"}
+                          </span>
+                        ) : null}
                       </span>
                       {showPnl && (
                         <span

@@ -1,6 +1,8 @@
 """חלון 5m / 15m — גילוי שוק ו־window_sec."""
 from __future__ import annotations
 
+import asyncio
+
 import market_discovery as md
 
 
@@ -47,3 +49,18 @@ def test_seconds_until_window_end():
     epoch = int(now) - 60  # 60 שניות מתחילת חלון 5m
     left = md.seconds_until_window_end(epoch, 300)
     assert 200 <= left <= 241  # ~240 שניות נותרו (סביבה)
+
+
+def test_apply_clob_order_min_size_overrides_gamma(monkeypatch):
+    am = md._parse_event(_minimal_event("btc-updown-5m-1700000000"))
+    assert am is not None
+    assert am.order_min_size == 5
+    assert am.order_min_size_source == "gamma"
+
+    async def fake_get_book(_client, _token_id):
+        return {"min_order_size": "7", "bids": [], "asks": []}
+
+    monkeypatch.setattr(md, "get_clob_book", fake_get_book)
+    asyncio.run(md.apply_clob_order_min_size(am, None))  # client לא בשימוש ב-mock
+    assert am.order_min_size == 7.0
+    assert am.order_min_size_source == "clob"

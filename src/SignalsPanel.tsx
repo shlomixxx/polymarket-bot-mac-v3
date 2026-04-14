@@ -449,7 +449,7 @@ export default function SignalsPanel() {
     return () => clearInterval(id);
   }, [refresh]);
 
-  // Contract price poll — every 2s (server caches prices; skip when tab hidden)
+  // Contract price poll — every 750ms (server uses WS cache; skip when tab hidden)
   useEffect(() => {
     let active = true;
     const poll = async () => {
@@ -465,7 +465,7 @@ export default function SignalsPanel() {
       }
     };
     poll();
-    const id = setInterval(poll, 2_000);
+    const id = setInterval(poll, 750);
     if (priceTimerRef.current) clearInterval(priceTimerRef.current);
     priceTimerRef.current = setInterval(() => setPriceAge(a => a + 1), 1000);
     return () => {

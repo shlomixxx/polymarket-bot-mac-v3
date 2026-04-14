@@ -40,7 +40,15 @@ type OrderbookSummary = {
   down: { mid: number | null };
 };
 
-export type RoundOutcomeRow = { id: string; startLabel: string; endLabel: string; win: boolean; pnlUsd: number | null };
+export type RoundOutcomeRow = {
+  id: string;
+  startLabel: string;
+  endLabel: string;
+  win: boolean;
+  pnlUsd: number | null;
+  /** כיוון הפוזיציה ביציאה (Up / Down) — מגיע מעסקת המנוע */
+  side: "Up" | "Down" | null;
+};
 
 type ChartIdleCopy = { headline: string; sub: string; showSpinner: boolean };
 
@@ -1168,8 +1176,34 @@ export function StreamSpectatorLayout(props: StreamSpectatorLayoutProps) {
                       title={r.win ? "Win" : "Loss"}
                       aria-hidden
                     />
-                    <span style={{ fontSize: 13, fontWeight: 700, color: "var(--text)", flex: 1 }}>
-                      {r.startLabel === r.endLabel ? r.startLabel : `${r.startLabel} – ${r.endLabel}`}
+                    <span
+                      style={{
+                        fontSize: 13,
+                        fontWeight: 700,
+                        color: "var(--text)",
+                        flex: 1,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        flexWrap: "wrap",
+                        minWidth: 0,
+                      }}
+                    >
+                      <span>
+                        {r.startLabel === r.endLabel ? r.startLabel : `${r.startLabel} – ${r.endLabel}`}
+                      </span>
+                      {r.side ? (
+                        <span
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 900,
+                            letterSpacing: "0.1em",
+                            color: r.side === "Up" ? "var(--up)" : "var(--down)",
+                          }}
+                        >
+                          {r.side === "Up" ? "UP" : "DOWN"}
+                        </span>
+                      ) : null}
                     </span>
                     {showPnlBreakdown && (
                       <span

@@ -496,17 +496,24 @@ export function StreamProLayout(props: StreamProLayoutProps) {
           }
           .pro-pulse-orb {
             position: relative;
-            width: ${fb ? 130 : 164}px;
-            height: ${fb ? 130 : 164}px;
+            width: ${fb ? 100 : 140}px;
+            height: ${fb ? 100 : 140}px;
             border-radius: 50%;
             display: grid;
             place-items: center;
             flex-shrink: 0;
           }
+          .pro-pulse-orb--embedded {
+            width: ${fb ? 92 : 120}px;
+            height: ${fb ? 92 : 120}px;
+          }
+          .pro-pulse-orb--embedded::before {
+            inset: -6px !important;
+          }
           .pro-pulse-orb::before {
             content: "";
             position: absolute;
-            inset: ${fb ? "-10px" : "-14px"};
+            inset: ${fb ? "-8px" : "-12px"};
             border-radius: 50%;
             border: 2px solid rgba(var(--pulse-rgb), 0.52);
             animation: proPulseRing var(--pulse-sec, 2.8s) ease-in-out infinite;
@@ -531,7 +538,7 @@ export function StreamProLayout(props: StreamProLayoutProps) {
       {/* ── HEADER ── */}
       <header
         style={{
-          marginBottom: fb ? 6 : 24,
+          marginBottom: fb ? 4 : 24,
           flexShrink: 0,
           display: "flex",
           justifyContent: "space-between",
@@ -650,6 +657,54 @@ export function StreamProLayout(props: StreamProLayoutProps) {
         </div>
       </header>
 
+      {/* ── QR hero (fit broadcast): גדול למעלה, בלי "שטח מת" למטה — */}
+      {fb ? (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "flex-start",
+            gap: 14,
+            flexWrap: "wrap",
+            marginBottom: 6,
+            padding: "10px 12px",
+            borderRadius: 12,
+            border: "2px solid rgba(251, 191, 36, 0.55)",
+            background:
+              "linear-gradient(135deg, rgba(251, 191, 36, 0.14), rgba(15, 23, 42, 0.97)), radial-gradient(ellipse 80% 120% at 0% 50%, rgba(251, 191, 36, 0.12), transparent 50%)",
+            boxShadow: "0 0 28px rgba(251, 191, 36, 0.18), inset 0 1px 0 rgba(255,255,255,0.08)",
+          }}
+        >
+          <QRCodeSVG
+            value="https://t.me/roller000"
+            size={92}
+            bgColor="#ffffff"
+            fgColor="#0f172a"
+            level="M"
+            style={{ borderRadius: 8, flexShrink: 0, boxShadow: "0 4px 18px rgba(0,0,0,0.35)" }}
+            role="img"
+            aria-label="QR code — Telegram @roller000"
+          />
+          <div style={{ flex: "1 1 200px", minWidth: 0 }}>
+            <div style={{ fontSize: 15, fontWeight: 900, letterSpacing: "0.04em", color: "#fef3c7", textShadow: "0 0 16px rgba(251,191,36,0.4)" }}>Scan · Telegram</div>
+            <div style={{ fontSize: 13, fontWeight: 700, marginTop: 2 }}>
+              <a
+                href="https://t.me/roller000"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "#fbbf24", textDecoration: "underline", textUnderlineOffset: 3 }}
+              >
+                t.me/roller000
+              </a>
+            </div>
+            <div style={{ fontSize: 11, color: "var(--text-secondary)", marginTop: 4, lineHeight: 1.35 }}>
+              Suggestions / collaboration — code is sharp; camera grabs it instantly.
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {/* ── BROADCAST FIT WRAPPER ── */}
       <BroadcastFit enabled={fb} parentRef={broadcastParentRef} contentRef={broadcastContentRef}>
         {err ? (
@@ -677,14 +732,14 @@ export function StreamProLayout(props: StreamProLayoutProps) {
           </div>
         ) : null}
 
-        {/* ── MODE + TIMER + PULSE ORB ── */}
+        {/* ── MODE + RUN WINDOW (עיגול unrealized בתוך כרטיס הזמן — בלי חפיפה לריבוע השכן) ── */}
         <section
           aria-label="Session clock and market window"
           style={{
-            marginBottom: fb ? 6 : 22,
+            marginBottom: fb ? 4 : 22,
             display: "flex",
             flexWrap: "wrap",
-            gap: fb ? 8 : 16,
+            gap: fb ? 6 : 16,
             alignItems: "stretch",
             justifyContent: "space-between",
           }}
@@ -692,17 +747,17 @@ export function StreamProLayout(props: StreamProLayoutProps) {
           <div style={{ flex: "2 1 260px", minWidth: 0 }}>
             <div
               style={{
-                padding: fb ? "14px 16px" : "18px 20px",
+                padding: fb ? "10px 12px" : "18px 20px",
                 borderRadius: 12,
                 border: `1px solid ${moodStyle.border}`,
                 background: moodStyle.bg,
                 boxShadow: moodStyle.shadow,
               }}
             >
-              <div style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--muted)", marginBottom: 6 }}>Bot mode</div>
+              <div style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: "var(--muted)", marginBottom: fb ? 4 : 6 }}>Bot mode</div>
               <div
                 style={{
-                  fontSize: fb ? "clamp(22px, 4vw, 30px)" : "clamp(26px, 4.5vw, 34px)",
+                  fontSize: fb ? "clamp(20px, 3.6vw, 28px)" : "clamp(26px, 4.5vw, 34px)",
                   fontWeight: 900,
                   letterSpacing: "0.08em",
                   lineHeight: 1.1,
@@ -718,83 +773,112 @@ export function StreamProLayout(props: StreamProLayoutProps) {
                   </span>
                 ) : null}
               </div>
-              <div style={{ fontSize: 13, color: "var(--text-secondary)", marginTop: 8, lineHeight: 1.45 }}>{streamMood.hint}</div>
+              <div style={{ fontSize: fb ? 12 : 13, color: "var(--text-secondary)", marginTop: fb ? 4 : 8, lineHeight: 1.4 }}>{streamMood.hint}</div>
               {showHotStreak ? (
-                <div style={{ marginTop: 8, fontSize: 12, fontWeight: 700, color: "#fbbf24", display: "flex", alignItems: "center", gap: 6 }}>
+                <div style={{ marginTop: fb ? 6 : 8, fontSize: fb ? 11 : 12, fontWeight: 700, color: "#fbbf24", display: "flex", alignItems: "center", gap: 6 }}>
                   Hot streak — {winRatePct != null ? `${winRatePct.toFixed(0)}%` : "—"} win rate ({winRateWins}/{winRateExits} exits)
                 </div>
               ) : null}
             </div>
           </div>
 
-          <div style={{ flex: "1.4 1 220px", minWidth: 0 }}>
+          <div style={{ flex: "1.65 1 280px", minWidth: 0 }}>
             <div
               style={{
                 height: "100%",
-                minHeight: fb ? 120 : 140,
-                padding: fb ? "12px 14px" : "16px 18px",
+                minHeight: fb ? 0 : 140,
+                padding: fb ? "10px 10px 10px 12px" : "16px 18px",
                 borderRadius: 12,
                 border: "1px solid rgba(251, 191, 36, 0.42)",
                 background:
                   "linear-gradient(160deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.4)), radial-gradient(ellipse 180% 90% at 100% 0%, rgba(251, 191, 36, 0.12), transparent 52%)",
                 boxShadow: "0 0 24px rgba(251, 191, 36, 0.12), inset 0 1px 0 rgba(255,255,255,0.05)",
+                display: "flex",
+                flexDirection: "row",
+                alignItems: "stretch",
+                gap: fb ? 8 : 12,
+                overflow: "hidden",
               }}
             >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap", marginBottom: 6 }}>
-                <span style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: "#fde68a", fontWeight: 800 }}>Run time</span>
-                <span
-                  title="Wall time since semi/auto was enabled"
-                  style={{
-                    fontSize: fb ? "clamp(18px, 3vw, 24px)" : "clamp(20px, 3.5vw, 26px)",
-                    fontWeight: 900,
-                    fontVariantNumeric: "tabular-nums",
-                    color: "#fbbf24",
-                    textShadow: "0 0 18px rgba(251, 191, 36, 0.45)",
-                  }}
-                >
-                  {stratCfg?.mode === "off" ? "—" : botRunUptimeSec != null ? formatBotUptime(botRunUptimeSec) : "—"}
-                </span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
-                <span style={{ fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--muted)", fontWeight: 700 }}>Market window</span>
-                <span style={{ fontSize: 20, fontWeight: 800, fontVariantNumeric: "tabular-nums", color: "#6ee7b7" }}>
-                  {market && windowSecondsLeftDisplay != null
-                    ? formatTimeLeft(windowSecondsLeftDisplay)
-                    : "—"}
-                </span>
-              </div>
-              <div style={{ fontSize: 12, color: "var(--text-secondary)", marginTop: 4 }}>Time left · bar shows elapsed %</div>
-              <div className="pro-window-bar" aria-hidden>
-                <div className="pro-window-bar-fill pro-window-bar-fill--elapsed" style={{ width: `${windowElapsedPct}%` }} />
-              </div>
-              <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 6 }}>
-                {windowLabel(market)} · {windowElapsedPct.toFixed(0)}% elapsed
-              </div>
-            </div>
-          </div>
-
-          {/* Pulse orb */}
-          <div style={{ flex: "0 0 auto", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
-            <div
-              className="pro-pulse-orb"
-              role="img"
-              aria-label="Unrealized PnL"
-              style={{ "--pulse-rgb": pulseRingRgb, "--pulse-sec": `${streamPulseSec}s` } as CSSProperties}
-            >
-              <div style={{ position: "relative", zIndex: 1, textAlign: "center", padding: fb ? "6px 8px 6px" : "10px 10px 8px" }}>
-                <div style={{ fontSize: 10, letterSpacing: "0.05em", textTransform: "uppercase", color: "var(--muted)", fontWeight: 600, marginBottom: 4, lineHeight: 1.25, maxWidth: 120 }}>
-                  Unrealized · {windowLabel(market)}
+              <div style={{ flex: "1 1 120px", minWidth: 0, display: "flex", flexDirection: "column", justifyContent: "space-between" }}>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap", marginBottom: 6 }}>
+                    <span style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: "#fde68a", fontWeight: 800 }}>Run time</span>
+                    <span
+                      title="Wall time since semi/auto was enabled"
+                      style={{
+                        fontSize: fb ? "clamp(16px, 2.8vw, 22px)" : "clamp(20px, 3.5vw, 26px)",
+                        fontWeight: 900,
+                        fontVariantNumeric: "tabular-nums",
+                        color: "#fbbf24",
+                        textShadow: "0 0 18px rgba(251, 191, 36, 0.45)",
+                      }}
+                    >
+                      {stratCfg?.mode === "off" ? "—" : botRunUptimeSec != null ? formatBotUptime(botRunUptimeSec) : "—"}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 11, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--muted)", fontWeight: 700 }}>Market window</span>
+                    <span style={{ fontSize: fb ? 17 : 20, fontWeight: 800, fontVariantNumeric: "tabular-nums", color: "#6ee7b7" }}>
+                      {market && windowSecondsLeftDisplay != null
+                        ? formatTimeLeft(windowSecondsLeftDisplay)
+                        : "—"}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: fb ? 11 : 12, color: "var(--text-secondary)", marginTop: 4, lineHeight: 1.3 }}>Time left · bar = elapsed %</div>
                 </div>
+                <div className="pro-window-bar" aria-hidden style={{ marginTop: 6 }}>
+                  <div className="pro-window-bar-fill pro-window-bar-fill--elapsed" style={{ width: `${windowElapsedPct}%` }} />
+                </div>
+                <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 6 }}>
+                  {windowLabel(market)} · {windowElapsedPct.toFixed(0)}% elapsed
+                </div>
+              </div>
+
+              <div
+                style={{
+                  flex: "0 0 auto",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  paddingInlineStart: 4,
+                  borderInlineStart: "1px solid rgba(251, 191, 36, 0.22)",
+                  alignSelf: "center",
+                }}
+              >
                 <div
-                  style={{
-                    fontSize: fb ? 24 : 28,
-                    fontWeight: 900,
-                    fontVariantNumeric: "tabular-nums",
-                    color: livePct == null ? "var(--muted)" : livePct >= 0 ? "var(--up)" : "var(--down)",
-                    lineHeight: 1.1,
-                  }}
+                  className="pro-pulse-orb pro-pulse-orb--embedded"
+                  role="img"
+                  aria-label="Unrealized PnL"
+                  style={{ "--pulse-rgb": pulseRingRgb, "--pulse-sec": `${streamPulseSec}s` } as CSSProperties}
                 >
-                  {livePct != null ? `${livePct >= 0 ? "+" : ""}${livePct.toFixed(2)}%` : "—"}
+                  <div style={{ position: "relative", zIndex: 1, textAlign: "center", padding: fb ? "4px 4px" : "8px 6px" }}>
+                    <div
+                      style={{
+                        fontSize: fb ? 8 : 10,
+                        letterSpacing: "0.04em",
+                        textTransform: "uppercase",
+                        color: "var(--muted)",
+                        fontWeight: 600,
+                        marginBottom: 2,
+                        lineHeight: 1.2,
+                        maxWidth: 88,
+                      }}
+                    >
+                      Unrealized
+                    </div>
+                    <div
+                      style={{
+                        fontSize: fb ? 18 : 24,
+                        fontWeight: 900,
+                        fontVariantNumeric: "tabular-nums",
+                        color: livePct == null ? "var(--muted)" : livePct >= 0 ? "var(--up)" : "var(--down)",
+                        lineHeight: 1.1,
+                      }}
+                    >
+                      {livePct != null ? `${livePct >= 0 ? "+" : ""}${livePct.toFixed(2)}%` : "—"}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -805,9 +889,9 @@ export function StreamProLayout(props: StreamProLayoutProps) {
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
-            gap: fb ? 8 : 16,
-            marginBottom: fb ? 6 : 24,
+            gridTemplateColumns: fb ? "repeat(auto-fill, minmax(148px, 1fr))" : "repeat(auto-fill, minmax(180px, 1fr))",
+            gap: fb ? 6 : 16,
+            marginBottom: fb ? 4 : 24,
           }}
         >
           <StreamBlock
@@ -892,8 +976,8 @@ export function StreamProLayout(props: StreamProLayoutProps) {
           style={{
             display: "flex",
             flexWrap: "wrap",
-            gap: fb ? 6 : 14,
-            marginBottom: fb ? 6 : 24,
+            gap: fb ? 5 : 14,
+            marginBottom: fb ? 4 : 24,
             justifyContent: "center",
             alignItems: "stretch",
           }}
@@ -943,14 +1027,14 @@ export function StreamProLayout(props: StreamProLayoutProps) {
             ) : null}
           </div>
 
-          <div style={{ display: "flex", flexWrap: "wrap", gap: fb ? 6 : 12, alignItems: "stretch" }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: fb ? 5 : 12, alignItems: "stretch" }}>
             <div
               className="pro-run-chart-shell"
               style={{
                 flex: "3 1 300px",
                 minWidth: 0,
                 width: "100%",
-                height: fb ? 220 : 320,
+                height: fb ? 236 : 320,
                 overflow: "hidden",
               }}
             >
@@ -1080,7 +1164,7 @@ export function StreamProLayout(props: StreamProLayoutProps) {
                 flex: "1 1 200px",
                 minWidth: 170,
                 maxWidth: 300,
-                maxHeight: fb ? 220 : 320,
+                maxHeight: fb ? 236 : 320,
                 overflow: "auto",
                 padding: "10px 12px",
                 borderRadius: 10,
@@ -1127,8 +1211,34 @@ export function StreamProLayout(props: StreamProLayoutProps) {
                       title={r.win ? "Win" : "Loss"}
                       aria-hidden
                     />
-                    <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text)", flex: 1 }}>
-                      {r.startLabel === r.endLabel ? r.startLabel : `${r.startLabel} – ${r.endLabel}`}
+                    <span
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 700,
+                        color: "var(--text)",
+                        flex: 1,
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                        flexWrap: "wrap",
+                        minWidth: 0,
+                      }}
+                    >
+                      <span>
+                        {r.startLabel === r.endLabel ? r.startLabel : `${r.startLabel} – ${r.endLabel}`}
+                      </span>
+                      {r.side ? (
+                        <span
+                          style={{
+                            fontSize: 10,
+                            fontWeight: 900,
+                            letterSpacing: "0.1em",
+                            color: r.side === "Up" ? "var(--up)" : "var(--down)",
+                          }}
+                        >
+                          {r.side === "Up" ? "UP" : "DOWN"}
+                        </span>
+                      ) : null}
                     </span>
                     {showPnlBreakdown && (
                       <span
@@ -1156,47 +1266,49 @@ export function StreamProLayout(props: StreamProLayoutProps) {
           </div>
         </section>
 
-        {/* ── INLINE QR STRIP (always visible, not in <footer>) ── */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 14,
-            padding: fb ? "8px 14px" : "14px 18px",
-            marginTop: fb ? 8 : 20,
-            borderRadius: 10,
-            border: "1px solid rgba(251, 191, 36, 0.25)",
-            background: "linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.45))",
-            boxShadow: "0 0 18px rgba(251, 191, 36, 0.06), inset 0 1px 0 rgba(255,255,255,0.04)",
-          }}
-        >
-          <QRCodeSVG
-            value="https://t.me/roller000"
-            size={fb ? 48 : 72}
-            bgColor="#ffffff"
-            fgColor="#0f172a"
-            level="M"
-            style={{ borderRadius: 5, flexShrink: 0 }}
-            role="img"
-            aria-label="QR code — Telegram @roller000"
-          />
-          <div style={{ flex: 1, minWidth: 120 }}>
-            <div style={{ fontSize: fb ? 12 : 13, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 2 }}>
-              Suggestions or collaboration?
-            </div>
-            <div style={{ fontSize: fb ? 11 : 12, color: "var(--muted)", lineHeight: 1.45 }}>
-              Telegram:{" "}
-              <a
-                href="https://t.me/roller000"
-                target="_blank"
-                rel="noopener noreferrer"
-                style={{ color: "#fbbf24", fontWeight: 700, textDecoration: "none" }}
-              >
-                @roller000
-              </a>
+        {/* ── QR (במצב fit כבר למעלה; כאן רק כשלא fit) ── */}
+        {!fb ? (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 14,
+              padding: "14px 18px",
+              marginTop: 20,
+              borderRadius: 10,
+              border: "1px solid rgba(251, 191, 36, 0.25)",
+              background: "linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.45))",
+              boxShadow: "0 0 18px rgba(251, 191, 36, 0.06), inset 0 1px 0 rgba(255,255,255,0.04)",
+            }}
+          >
+            <QRCodeSVG
+              value="https://t.me/roller000"
+              size={72}
+              bgColor="#ffffff"
+              fgColor="#0f172a"
+              level="M"
+              style={{ borderRadius: 5, flexShrink: 0 }}
+              role="img"
+              aria-label="QR code — Telegram @roller000"
+            />
+            <div style={{ flex: 1, minWidth: 120 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: "var(--text-secondary)", marginBottom: 2 }}>
+                Suggestions or collaboration?
+              </div>
+              <div style={{ fontSize: 12, color: "var(--muted)", lineHeight: 1.45 }}>
+                Telegram:{" "}
+                <a
+                  href="https://t.me/roller000"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ color: "#fbbf24", fontWeight: 700, textDecoration: "none" }}
+                >
+                  @roller000
+                </a>
+              </div>
             </div>
           </div>
-        </div>
+        ) : null}
       </BroadcastFit>
     </div>
   );

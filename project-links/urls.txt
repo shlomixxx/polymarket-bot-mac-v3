@@ -1,0 +1,47 @@
+# קישורים לפרויקט polymarket-bot-mac-v3 (נאסף מהקוד והתיעוד)
+# שורות שמתחילות ב-# הן הערות.
+#
+# לפתיחה בדפדפן: ProjectLinks.html בשורש (מפנה ל-project-links/index.html)
+# לא לפתוח את index.html בשורש — זה Vite והוא ריק ב-file://
+
+## פיתוח מקומי (ברירת מחדל: Vite 5175, מנוע 8767)
+http://127.0.0.1:5175/
+http://127.0.0.1:8767/
+http://127.0.0.1:8767/api/health
+http://127.0.0.1:5175/?stream=1
+http://127.0.0.1:5175/?stream=2
+http://127.0.0.1:5175/?stream=3
+http://127.0.0.1:5175/?stream=3&fit=1#stream-stats
+http://127.0.0.1:5175/stream/spectator
+
+## Railway (עדכן אם הדומיין השתנה)
+https://polymarket-bot-mac-v3-production.up.railway.app/
+https://polymarket-bot-mac-v3-production.up.railway.app/api/health
+https://polymarket-bot-mac-v3-production.up.railway.app/?stream=3&fit=1#stream-stats
+
+## Polymarket — משתמש / תיעוד
+https://polymarket.com/
+https://docs.polymarket.com/
+https://docs.polymarket.com/trading/quickstart
+
+## APIs במנוע
+https://gamma-api.polymarket.com/
+https://clob.polymarket.com/
+https://data-api.polymarket.com/
+wss://ws-subscriptions-clob.polymarket.com/ws/market
+
+## נתוני שוק חיצוניים
+https://api.binance.com/api/v3/klines
+https://fapi.binance.com/fapi/v1/fundingRate
+https://api.alternative.me/fng/?limit=1
+
+## Polygon RPC (btc_price.py)
+https://polygon-bor.publicnode.com
+https://1rpc.io/matic
+https://polygon.drpc.org
+
+## כלים / קהילה
+https://nodejs.org/
+https://github.com/Polymarket/py-clob-client
+https://github.com/Polymarket/py-clob-client/issues/277
+https://t.me/roller000

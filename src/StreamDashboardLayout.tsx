@@ -218,8 +218,34 @@ function RoundRow({ r, showPnl }: { r: RoundOutcomeRow; showPnl: boolean }) {
         }}
         aria-hidden
       />
-      <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text)", flex: 1 }}>
-        {r.startLabel === r.endLabel ? r.startLabel : `${r.startLabel} – ${r.endLabel}`}
+      <span
+        style={{
+          fontSize: 13,
+          fontWeight: 600,
+          color: "var(--text)",
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          flexWrap: "wrap",
+          minWidth: 0,
+        }}
+      >
+        <span>
+          {r.startLabel === r.endLabel ? r.startLabel : `${r.startLabel} – ${r.endLabel}`}
+        </span>
+        {r.side ? (
+          <span
+            style={{
+              fontSize: 10,
+              fontWeight: 900,
+              letterSpacing: "0.1em",
+              color: r.side === "Up" ? GREEN : RED,
+            }}
+          >
+            {r.side === "Up" ? "UP" : "DOWN"}
+          </span>
+        ) : null}
       </span>
       {showPnl && (
         <span

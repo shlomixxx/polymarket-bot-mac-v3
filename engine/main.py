@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import json
+import math
 import os
 import time
 from contextlib import asynccontextmanager
@@ -47,7 +48,7 @@ def _load_dotenv_from_project_root() -> None:
 _load_dotenv_from_project_root()
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -84,6 +85,7 @@ from history_tracker import record_window_result, get_recent_windows, get_hourly
 from trigger_engine import TriggerEngine, TriggerConfig
 from strategy_runner import StrategyConfig, StrategyRunner
 from tips_v2 import delete_run_folder_by_key, generate_tips_v2, list_run_folders_detailed
+from ws_price_stream import price_stream
 
 def _autoload_private_key_from_store() -> None:
     """טוען מפתח שמור (Keychain / Secret Service / Credential Manager) אל os.environ
@@ -282,6 +284,20 @@ def _load_persisted_config() -> None:
         print(f"[polymarket-bot] אזהרה: לא ניתן לטעון config שמור — {e}", flush=True)
 
 
+async def _clamp_min_contracts_to_market_floor() -> None:
+    """מגדיל את min_contracts לפחות למינימום השוק הפעיל (מ־discover + CLOB) לפני שמירה לדיסק."""
+    try:
+        m = await discover_active_btc_window(runner.rt.config.btc_window)
+        if not m:
+            return
+        floor = int(math.ceil(float(m.order_min_size)))
+        cur = int(getattr(runner.rt.config, "min_contracts", 1))
+        if floor > cur:
+            runner.rt.config.min_contracts = floor
+    except Exception:
+        pass
+
+
 def _save_persisted_config() -> None:
     """שומר הגדרות + מצב לקובץ — לזכירה בהפעלות הבאות."""
     try:
@@ -325,6 +341,28 @@ def _save_persisted_config() -> None:
         print(f"[polymarket-bot] אזהרה: לא ניתן לשמור config — {e}", flush=True)
 _snapshot_task: Optional[asyncio.Task] = None
 _history_recorder_task: Optional[asyncio.Task] = None
+_ws_subscription_task: Optional[asyncio.Task] = None
+
+
+async def _ws_subscription_loop(interval: float = 5.0) -> None:
+    """Keeps WebSocket subscriptions in sync with the active market tokens."""
+    last_up = ""
+    last_down = ""
+    await asyncio.sleep(2.0)
+    while True:
+        try:
+            m = await discover_active_btc_window(runner.rt.config.btc_window)
+            if m and (m.token_up != last_up or m.token_down != last_down):
+                await price_stream.subscribe_tokens(
+                    m.token_up, m.token_down,
+                    token_side_map={m.token_up: "Up", m.token_down: "Down"},
+                )
+                last_up, last_down = m.token_up, m.token_down
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
 price_buf = PriceHistoryBuffer()
 last_epoch_for_open: int = 0
 cached_open: Optional[float] = None
@@ -413,7 +451,7 @@ TIPS_V2_CACHE_PATH = DATA_ROOT / "tips_v2_cache.json"
 TIPS_V2_CACHE_TTL_SEC = 300.0  # cache for 5 minutes
 WEB_DIST_DIR = Path(os.environ.get("WEB_DIST_DIR", str(Path(__file__).resolve().parent.parent / "dist"))).resolve()
 ORDERBOOK_SUMMARY_CACHE_TTL_SEC = float(
-    os.environ.get("ORDERBOOK_CACHE_TTL", "2.0")
+    os.environ.get("ORDERBOOK_CACHE_TTL", "0.5")
 )
 last_orderbook_summary: Optional[dict[str, Any]] = None
 last_orderbook_summary_ts: float = 0.0
@@ -486,7 +524,7 @@ def _count_strategy_run_dirs() -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _history_recorder_task
+    global _snapshot_task, _history_recorder_task, _ws_subscription_task
     _ensure_log_run_dir()
     n_snap = _count_strategy_run_dirs()
     print(
@@ -497,7 +535,10 @@ async def lifespan(app: FastAPI):
     _load_persisted_config()
     _load_trigger_config()
     _reset_ui_runtime("lifespan_start")
-    runner.rt.mode = "off"  # תמיד אחרי טעינת הגדרות — לא מפעילים בוט אוטומטית
+    runner.rt.mode = "off"
+    # Start real-time WebSocket price stream from Polymarket CLOB
+    price_stream.start()
+    _ws_subscription_task = asyncio.create_task(_ws_subscription_loop(5.0))
     runner.start_loop()
     trigger.start_loop()
     _history_recorder_task = asyncio.create_task(auto_history_recorder_loop(10.0))
@@ -515,6 +556,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         _snapshot_task = None
+    if _ws_subscription_task:
+        _ws_subscription_task.cancel()
+        try:
+            await _ws_subscription_task
+        except asyncio.CancelledError:
+            pass
+        _ws_subscription_task = None
     if _history_recorder_task:
         _history_recorder_task.cancel()
         try:
@@ -522,6 +570,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         _history_recorder_task = None
+    price_stream.stop()
     trigger.stop_loop()
     runner.stop_loop()
     if _shared_httpx is not None:
@@ -584,6 +633,7 @@ async def market_current():
         "token_down": m.token_down,
         "outcome_prices": list(m.outcome_prices),
         "order_min_size": m.order_min_size,
+        "order_min_size_source": getattr(m, "order_min_size_source", "gamma"),
         "window_sec": m.window_sec,
         "btc_window": runner.rt.config.btc_window,
         "seconds_left": seconds_until_window_end(m.epoch, m.window_sec),
@@ -651,7 +701,23 @@ async def market_orderbook_summary():
         raise HTTPException(404, "לא נמצא שוק פעיל")
 
     now = time.time()
-    # בדיקת cache ללא lock — קריאה בלבד, מספיק atomic ב-CPython
+    # Try WebSocket cache first — zero-latency response
+    up_tp = price_stream.get_price(m.token_up)
+    down_tp = price_stream.get_price(m.token_down)
+    if (
+        up_tp is not None and (up_tp.bid is not None or up_tp.ask is not None) and (now - up_tp.ts) < 15.0
+        and down_tp is not None and (down_tp.bid is not None or down_tp.ask is not None) and (now - down_tp.ts) < 15.0
+    ):
+        ws_result: dict[str, Any] = {
+            "slug": m.slug,
+            "up": {"bid": up_tp.bid, "ask": up_tp.ask, "mid": up_tp.mid},
+            "down": {"bid": down_tp.bid, "ask": down_tp.ask, "mid": down_tp.mid},
+            "source": "ws",
+        }
+        last_orderbook_summary = dict(ws_result)
+        last_orderbook_summary_ts = now
+        return ws_result
+
     if (
         last_orderbook_summary is not None
         and (now - last_orderbook_summary_ts) <= ORDERBOOK_SUMMARY_CACHE_TTL_SEC
@@ -879,14 +945,16 @@ async def strategy_config(body: ConfigBody):
         if hasattr(c, k):
             setattr(c, k, v)
     c.side_preference = body.side_preference  # type: ignore
+    await _clamp_min_contracts_to_market_floor()
+    saved = {**body.model_dump(), "min_contracts": runner.rt.config.min_contracts}
     append_event(
         "strategy_config_updated",
-        {"config": body.model_dump(), "mode": runner.rt.mode},
+        {"config": saved, "mode": runner.rt.mode},
     )
     append_strategy_journal(f"\n--- עדכון אסטרטגיה: {time.strftime('%H:%M:%S')} ---\n")
     write_strategy_snapshot(runner, demo)
     _save_persisted_config()
-    return {"ok": True, "config": body.model_dump()}
+    return {"ok": True, "config": saved}
 
 
 @app.get("/api/strategy/config")
@@ -1290,25 +1358,42 @@ async def api_signals(refresh: bool = False, window: Optional[str] = None):
 # cache קצר — נפרד לכל window (5m / 15m)
 _contract_price_cache: dict[str, dict[str, Any]] = {}
 _contract_price_cache_ts: dict[str, float] = {}
-CONTRACT_PRICE_CACHE_TTL = 2.0  # שניות
+CONTRACT_PRICE_CACHE_TTL = 0.5  # שניות
 
 
 @app.get("/api/contract-prices")
 async def api_contract_prices(window: Optional[str] = None):
     """
-    מחזיר את מחירי ה-Ask הנוכחיים של חוזי Up/Down מה-CLOB בלבד.
-    פרמטר window: 5m | 15m (ברירת מחדל: לפי הגדרת btc_window של runner)
+    מחזיר את מחירי ה-Ask הנוכחיים של חוזי Up/Down.
+    קודם כל מנסה מ-WebSocket cache (אפס latency), אחרת CLOB REST.
     """
     btc_win = window if window in ("5m", "15m") else runner.rt.config.btc_window
-
     now = time.time()
-    cached = _contract_price_cache.get(btc_win)
-    if cached and (now - _contract_price_cache_ts.get(btc_win, 0)) < CONTRACT_PRICE_CACHE_TTL:
-        return JSONResponse(content=cached)
 
     m = await discover_active_btc_window(btc_win)
     if m is None:
         return JSONResponse(content={"up": None, "down": None, "slug": None, "btc_window": btc_win, "ts": now})
+
+    up_tp = price_stream.get_price(m.token_up)
+    down_tp = price_stream.get_price(m.token_down)
+    ws_fresh = (
+        up_tp is not None and up_tp.ask is not None and (now - up_tp.ts) < 15.0
+        and down_tp is not None and down_tp.ask is not None and (now - down_tp.ts) < 15.0
+    )
+    if ws_fresh:
+        result = {
+            "up": round(up_tp.ask * 100, 1) if up_tp and up_tp.ask else None,
+            "down": round(down_tp.ask * 100, 1) if down_tp and down_tp.ask else None,
+            "slug": m.slug,
+            "btc_window": btc_win,
+            "ts": now,
+            "source": "ws",
+        }
+        return JSONResponse(content=result)
+
+    cached = _contract_price_cache.get(btc_win)
+    if cached and (now - _contract_price_cache_ts.get(btc_win, 0)) < CONTRACT_PRICE_CACHE_TTL:
+        return JSONResponse(content=cached)
 
     up_ask: Optional[float] = None
     down_ask: Optional[float] = None
@@ -1723,6 +1808,81 @@ async def trigger_share_bundle():
         bundle_lines.append("```")
 
     return {"ok": True, "text": "\n".join(bundle_lines)}
+
+
+@app.get("/api/ws-prices/status")
+async def ws_prices_status():
+    """Status of the WebSocket price stream from Polymarket."""
+    return {
+        "connected": price_stream.connected,
+        "last_msg_ts": price_stream.last_message_ts,
+        "subscribed_tokens": len(price_stream._subscribed_tokens),
+    }
+
+
+@app.get("/api/prices/realtime")
+async def prices_realtime():
+    """Zero-latency price snapshot from WebSocket cache (no CLOB HTTP call)."""
+    m = await discover_active_btc_window(runner.rt.config.btc_window)
+    if not m:
+        return JSONResponse(content={"up": None, "down": None, "ws_connected": price_stream.connected})
+    up_tp = price_stream.get_price(m.token_up)
+    down_tp = price_stream.get_price(m.token_down)
+    now = time.time()
+    return JSONResponse(content={
+        "slug": m.slug,
+        "up": {
+            "bid": up_tp.bid if up_tp else None,
+            "ask": up_tp.ask if up_tp else None,
+            "mid": up_tp.mid if up_tp else None,
+            "age_ms": int((now - up_tp.ts) * 1000) if up_tp and up_tp.ts else None,
+        },
+        "down": {
+            "bid": down_tp.bid if down_tp else None,
+            "ask": down_tp.ask if down_tp else None,
+            "mid": down_tp.mid if down_tp else None,
+            "age_ms": int((now - down_tp.ts) * 1000) if down_tp and down_tp.ts else None,
+        },
+        "ws_connected": price_stream.connected,
+        "ts": now,
+    })
+
+
+@app.websocket("/ws/prices")
+async def ws_prices_endpoint(websocket: WebSocket):
+    """WebSocket endpoint: streams real-time price updates to the frontend."""
+    await websocket.accept()
+    q = price_stream.register_frontend_client()
+    try:
+        # Send initial snapshot
+        for tid in list(price_stream._subscribed_tokens):
+            tp = price_stream.get_price(tid)
+            if tp and (tp.bid is not None or tp.ask is not None):
+                side_label = price_stream._token_to_side.get(tid, "unknown")
+                await websocket.send_json({
+                    "type": "price",
+                    "token_id": tid,
+                    "side": side_label,
+                    "bid": tp.bid,
+                    "ask": tp.ask,
+                    "mid": tp.mid,
+                    "ts": tp.ts,
+                })
+        while True:
+            try:
+                msg = await asyncio.wait_for(q.get(), timeout=15.0)
+                await websocket.send_text(msg)
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        price_stream.unregister_frontend_client(q)
 
 
 @app.get("/remote", include_in_schema=False)

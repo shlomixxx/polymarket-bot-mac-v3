@@ -64,6 +64,56 @@ def test_strategy_config_roundtrip(client: TestClient):
     assert isinstance(j.get("ui_runtime_equity_baseline_usd"), (int, float))
 
 
+def test_strategy_config_clamps_min_contracts_to_market_floor(client: TestClient, monkeypatch):
+    """אחרי שמירה — min_contracts לא נשאר מתחת למינימום השוק (מ־discover)."""
+    import main as engine_main
+    from types import SimpleNamespace
+
+    async def fake_discover(window="5m"):
+        return SimpleNamespace(order_min_size=7.0)
+
+    monkeypatch.setattr(engine_main, "discover_active_btc_window", fake_discover)
+
+    body = {
+        "investment_usd": 5.0,
+        "entry_price_cents": 30,
+        "min_contracts": 3,
+        "take_profit_pct": 12.0,
+        "min_minutes_for_entry": 3,
+        "freeze_last_minutes": 1,
+        "intermediate_block_new_entries": True,
+        "dca_enabled": False,
+        "dca_slices": 4,
+        "dca_interval_sec": 30,
+        "dca_discount_enabled": False,
+        "dca_discount_pct": 2,
+        "hedge_enabled": False,
+        "hedge_combined_ask_max": 0.98,
+        "side_preference": "Up",
+        "btc_window": "5m",
+        "auto_reenter_after_tp": True,
+        "reenter_cooldown_sec": 8,
+        "max_entries_per_window": 3,
+        "max_notional_per_window_usd": 1_000_000,
+        "max_trades_per_hour": 1000,
+        "near_entry_pct": 3,
+        "near_tp_pct": 2,
+        "dca_tp_override_pct": 50,
+        "book_log_interval_sec": 0,
+        "loss_recovery_enabled": False,
+        "loss_recovery_step_pct": 20,
+        "loss_recovery_every_n_losses": 1,
+        "loss_recovery_max_multiplier": 10,
+    }
+    r = client.post("/api/strategy/config", json=body)
+    assert r.status_code == 200
+    out = r.json().get("config") or {}
+    assert out.get("min_contracts") == 7
+    assert engine_main.runner.rt.config.min_contracts == 7
+    r2 = client.get("/api/strategy/config")
+    assert r2.json().get("min_contracts") == 7
+
+
 def test_demo_reset_and_clear_stats(client: TestClient):
     import main as engine_main
 
@@ -123,7 +173,8 @@ def test_strategy_logs_cleared_on_off_to_auto(client: TestClient):
     assert lines == []
 
 
-def test_polymarket_clob_account_without_key(client: TestClient):
+def test_polymarket_clob_account_without_key(client: TestClient, monkeypatch):
+    monkeypatch.delenv("POLYMARKET_PRIVATE_KEY", raising=False)
     r = client.get("/api/live/polymarket-clob-account")
     assert r.status_code == 200
     j = r.json()

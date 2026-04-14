@@ -4,6 +4,7 @@ slug: btc-updown-5m-{epoch} (כל 300s) או btc-updown-15m-{epoch} (כל 900s).
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Literal, Optional
@@ -39,6 +40,8 @@ class ActiveMarket:
     order_min_size: float
     title: str
     window_sec: int  # 300 או 900 — לאורך החלון בשניות
+    # מקור מינימום החוזים: gamma=מטא-דאטה API; clob=מ־GET /book (סמכותי למסחר)
+    order_min_size_source: Literal["clob", "gamma"] = "gamma"
     # קישור מקור הרזולוציה מ-Gamma — ללא מחיר מספרי ב-API
     resolution_source: Optional[str] = None
 
@@ -94,6 +97,22 @@ def _parse_event(data: dict[str, Any]) -> Optional[ActiveMarket]:
     )
 
 
+async def apply_clob_order_min_size(am: ActiveMarket, client: httpx.AsyncClient) -> None:
+    """מעדכן את order_min_size מתשובת CLOB ‎/book‎ (מינימום אמיתי להזמנה). Gamma עלול להסתדר אחרת."""
+    try:
+        book = await get_clob_book(client, am.token_up)
+        raw = book.get("min_order_size")
+        if raw is None:
+            return
+        v = float(raw)
+        if not math.isfinite(v) or v <= 0:
+            return
+        am.order_min_size = v
+        am.order_min_size_source = "clob"
+    except Exception:
+        pass
+
+
 async def fetch_event_slug(client: httpx.AsyncClient, slug: str) -> Optional[dict]:
     r = await client.get(f"{GAMMA}/events/slug/{slug}", timeout=15.0)
     if r.status_code != 200:
@@ -117,6 +136,7 @@ async def discover_active_btc_window(window: BtcWindow = "5m") -> Optional[Activ
                 continue
             am = _parse_event(data)
             if am and not am.closed:
+                await apply_clob_order_min_size(am, client)
                 return am
         for delta in range(-10, 12):
             epoch = base + delta * step
@@ -126,6 +146,7 @@ async def discover_active_btc_window(window: BtcWindow = "5m") -> Optional[Activ
                 continue
             am = _parse_event(data)
             if am and not am.closed:
+                await apply_clob_order_min_size(am, client)
                 return am
     return None
 

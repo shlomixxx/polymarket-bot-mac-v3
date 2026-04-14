@@ -10,6 +10,7 @@ import {
 } from "./chartConstants";
 import { formatPnlAxisTime, formatPctAxisTick } from "./pnlChartFormatters";
 import { useChartAnimationGate } from "./hooks/useChartAnimationGate";
+import { usePriceStream } from "./hooks/usePriceStream";
 import { Button } from "./ui/Button";
 import { Card } from "./ui/Card";
 import { ChartCard } from "./ui/ChartCard";
@@ -26,6 +27,8 @@ type Market = {
   token_up: string;
   token_down: string;
   order_min_size: number;
+  /** clob = מינימום מספר CLOB (/book); gamma = רק מטא־דאטה Gamma לפני CLOB */
+  order_min_size_source?: "clob" | "gamma";
   window_sec?: number;
   btc_window?: string;
   seconds_left: number;
@@ -1645,6 +1648,24 @@ export default function App() {
   const [pending, setPending] = useState<Record<string, unknown> | null>(null);
   const [err, setErr] = useState("");
   const [ob, setOb] = useState<OrderbookSummary | null>(null);
+  const priceStream = usePriceStream();
+
+  useEffect(() => {
+    if (!priceStream.lastUpdateTs) return;
+    setOb((prev) => {
+      const base = prev ?? { slug: "", up: { bid: null, ask: null, mid: null }, down: { bid: null, ask: null, mid: null } };
+      return {
+        ...base,
+        up: priceStream.up
+          ? { bid: priceStream.up.bid, ask: priceStream.up.ask, mid: priceStream.up.mid }
+          : base.up,
+        down: priceStream.down
+          ? { bid: priceStream.down.bid, ask: priceStream.down.ask, mid: priceStream.down.mid }
+          : base.down,
+      };
+    });
+  }, [priceStream.up?.bid, priceStream.up?.ask, priceStream.down?.bid, priceStream.down?.ask, priceStream.lastUpdateTs]);
+
   const [engineStatus, setEngineStatus] = useState("");
   const [engineLastTickTs, setEngineLastTickTs] = useState<number | null>(null);
   /** unix seconds — נקודת התחלה לטיימר זמן ריצה (מהשרת, מתוך config) */
@@ -1715,10 +1736,21 @@ export default function App() {
     setCfgDirty(true);
   }, []);
 
+  const exchangeMinContractsCeil = useMemo(() => {
+    if (market?.order_min_size == null) return undefined;
+    return Math.ceil(market.order_min_size);
+  }, [market?.order_min_size]);
+
   const effectiveMinContracts = useMemo(
     () => computeEffectiveMinContracts(minContracts, market?.order_min_size),
     [minContracts, market?.order_min_size]
   );
+
+  /** מינימום Polymarket לשוק הנוכחי — לא נסחר מתחת (מסונכרן ל־min_contracts כשהשוק נטען) */
+  useEffect(() => {
+    if (exchangeMinContractsCeil == null) return;
+    setMinContracts((prev) => Math.max(prev, exchangeMinContractsCeil));
+  }, [market?.slug, exchangeMinContractsCeil]);
 
   const contracts = useMemo(() => {
     const price = entryCents / 100;
@@ -1829,7 +1861,11 @@ export default function App() {
         if (typeof c.book_log_interval_sec === "number") setBookLogIntervalSec(c.book_log_interval_sec);
         const bw = c.btc_window;
         if (bw === "5m" || bw === "15m") setBtcWindow(bw);
-        if (typeof c.min_contracts === "number") setMinContracts(c.min_contracts);
+        if (typeof c.min_contracts === "number") {
+          const floor =
+            typeof m.order_min_size === "number" ? Math.ceil(m.order_min_size) : c.min_contracts;
+          setMinContracts(Math.max(c.min_contracts, floor));
+        }
         if (typeof c.loss_recovery_enabled === "boolean") setLossRecoveryEnabled(c.loss_recovery_enabled);
         if (typeof c.loss_recovery_step_pct === "number") setLossRecoveryStepPct(c.loss_recovery_step_pct);
         if (typeof c.loss_recovery_every_n_losses === "number") setLossRecoveryEveryN(c.loss_recovery_every_n_losses);
@@ -2344,7 +2380,12 @@ export default function App() {
                 {market.window_sec != null
                   ? `${Math.round(market.window_sec / 60)} דקות`
                   : "—"}{" "}
-                · מינימום הזמנה {market.order_min_size} חוזים
+                · מינ׳ Polymarket (CLOB) {market.order_min_size} חוזים
+                {market.order_min_size_source === "gamma" ? " — מטא־דאטה Gamma (CLOB לא זמין)" : ""}
+                {" · "}
+                <span style={{ color: priceStream.connected ? "#10b981" : "#ef4444", fontWeight: 600, fontSize: 11 }}>
+                  {priceStream.connected ? "⚡ WS Live" : "⏳ WS מתחבר…"}
+                </span>
               </div>
               <p style={{ fontSize: 14, marginTop: 12 }}>
                 <strong>מחיר יעד לפתיחת החלון:</strong>{" "}
@@ -2865,21 +2906,33 @@ export default function App() {
             </span>
           </label>
           <label>
-            מינ׳ חוזים (לפחות)
+            מינ׳ חוזים (רצפה — לא פחות ממינ׳ Polymarket)
             <input
               type="number"
-              min={1}
+              min={exchangeMinContractsCeil ?? 1}
               step={1}
               value={minContracts}
               onChange={(e) => {
-                setMinContracts(Number(e.target.value));
+                const v = Number(e.target.value);
+                const floor = exchangeMinContractsCeil ?? 1;
+                setMinContracts(Number.isFinite(v) ? Math.max(v, floor) : floor);
                 markCfgDirty();
               }}
               style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, marginTop: 6, padding: 8 }}
             />
             <span style={{ fontSize: 12, color: "var(--muted)" }}>
-              בפועל: לפחות {effectiveMinContracts} (מקסימום בין מה שהגדרת לבין מינ׳ השוק
-              {market != null ? ` — כרגע ${Math.ceil(market.order_min_size)}` : ""}).
+              מינ׳ בורסה לשוק הנוכחי:{" "}
+              {market != null ? (
+                <>
+                  <strong>{Math.ceil(market.order_min_size)}</strong> חוזים
+                  {market.order_min_size_source === "clob"
+                    ? " (מספר CLOB — סמכותי)"
+                    : " (Gamma — עד עדכון מ־CLOB)"}
+                </>
+              ) : (
+                "טוען…"
+              )}
+              . בפועל הבוט סוחר בלפחות <strong>{effectiveMinContracts}</strong> חוזים.
             </span>
           </label>
           <div style={{ marginBottom: 12, color: contracts ? "var(--up)" : "#f87171" }}>
