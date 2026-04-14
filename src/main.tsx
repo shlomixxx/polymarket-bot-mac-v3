@@ -28,9 +28,19 @@ function resolveStreamEntry(): { stream: boolean; layout: StreamViewerLayout } {
       path === "/stream/spectator-v2" ||
       path.endsWith("/stream/spectator-v2"));
 
+  const layoutBroadcast =
+    !layoutDashboard &&
+    !layoutSpectatorV2 &&
+    (streamParam === "7" ||
+      streamParam === "broadcast" ||
+      search.get("layout") === "broadcast" ||
+      path === "/stream/broadcast" ||
+      path.endsWith("/stream/broadcast"));
+
   const layoutPro =
     !layoutDashboard &&
     !layoutSpectatorV2 &&
+    !layoutBroadcast &&
     (streamParam === "6" ||
       streamParam === "pro" ||
       search.get("layout") === "pro" ||
@@ -65,15 +75,17 @@ function resolveStreamEntry(): { stream: boolean; layout: StreamViewerLayout } {
     streamParam === "4" ||
     streamParam === "5" ||
     streamParam === "6" ||
+    streamParam === "7" ||
     streamParam === "showcase" ||
     streamParam === "spectator" ||
     streamParam === "spectator-v2" ||
     streamParam === "dashboard" ||
     streamParam === "pro" ||
+    streamParam === "broadcast" ||
     path === "/stream" ||
     path.startsWith("/stream/");
 
-  const layout: StreamViewerLayout = layoutPro ? "pro" : layoutDashboard ? "dashboard" : layoutSpectatorV2 ? "spectator-v2" : layoutSpectator ? "spectator" : layoutShowcase ? "showcase" : "classic";
+  const layout: StreamViewerLayout = layoutBroadcast ? "broadcast" : layoutPro ? "pro" : layoutDashboard ? "dashboard" : layoutSpectatorV2 ? "spectator-v2" : layoutSpectator ? "spectator" : layoutShowcase ? "showcase" : "classic";
   return { stream, layout };
 }
 

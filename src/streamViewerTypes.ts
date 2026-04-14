@@ -1,1 +1,1 @@
-export type StreamViewerLayout = "classic" | "showcase" | "spectator" | "spectator-v2" | "dashboard" | "pro";
+export type StreamViewerLayout = "classic" | "showcase" | "spectator" | "spectator-v2" | "dashboard" | "pro" | "broadcast";

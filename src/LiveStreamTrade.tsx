@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { StreamSpectatorLayout } from "./StreamSpectatorLayout";
 import { StreamDashboardLayout } from "./StreamDashboardLayout";
 import { StreamProLayout } from "./StreamProLayout";
+import { StreamLiveBroadcastLayout } from "./StreamLiveBroadcastLayout";
 import { playEntryChime, playExitChime, resumeStreamAudio } from "./streamAudio";
 import type { StreamViewerLayout } from "./streamViewerTypes";
 import { smoothRunPnlForChart } from "./runPnlSmoothing";
@@ -785,17 +786,19 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     document.documentElement.lang = "en";
     document.documentElement.dir = "ltr";
     const base =
-      layout === "pro"
-        ? "Live trade — pro broadcast"
-        : layout === "spectator-v2"
-          ? "Live trade — spectator v2"
-          : layout === "dashboard"
-            ? "Live trade — dashboard"
-            : layout === "spectator"
-              ? "Live trade — spectator overlay"
-              : layout === "showcase"
-                ? "Live trade — viewer showcase"
-                : "Live trade — stream";
+      layout === "broadcast"
+        ? "Live trade — cinematic broadcast"
+        : layout === "pro"
+          ? "Live trade — pro broadcast"
+          : layout === "spectator-v2"
+            ? "Live trade — spectator v2"
+            : layout === "dashboard"
+              ? "Live trade — dashboard"
+              : layout === "spectator"
+                ? "Live trade — spectator overlay"
+                : layout === "showcase"
+                  ? "Live trade — viewer showcase"
+                  : "Live trade — stream";
     document.title = fitBroadcast ? `${base} (fit)` : base;
     return () => {
       document.documentElement.lang = "he";
@@ -1142,7 +1145,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
 
   const botRunSessionKey = `${stratCfg?.bot_run_started_ts ?? ""}|${demo?.bot_run_started_ts ?? ""}`;
   const botRunSessionRef = useRef<string>("");
-  const isRunPnlLayout = layout === "spectator" || layout === "pro";
+  const isRunPnlLayout = layout === "spectator" || layout === "pro" || layout === "broadcast";
 
   /** סשן בוט השתנה — מאתחלים מהיסטוריה בשרת (לא רק state ריק) כדי שהגרף ישרוד רענון דף */
   useEffect(() => {
@@ -1185,7 +1188,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
   /** סדרה לתצוגה בלבד — מסיר ספיקים בודדים שלא משקפים מגמה אמיתית */
   const runPnlSeriesDisplay = useMemo(() => {
     if (!isRunPnlLayout || !runPnlSeries.length) return runPnlSeries;
-    if (layout === "pro") return smoothRunPnlForProChart(runPnlSeries);
+    if (layout === "pro" || layout === "broadcast") return smoothRunPnlForProChart(runPnlSeries);
     return smoothRunPnlForChart(runPnlSeries);
   }, [runPnlSeries, layout, isRunPnlLayout]);
 
@@ -1357,6 +1360,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     [chartExtremes, chartRows.length, lineColor]
   );
 
+  const isBroadcast = layout === "broadcast";
   const isPro = layout === "pro";
   const isSpectatorV2 = layout === "spectator-v2";
   const isDashboard = layout === "dashboard";
@@ -1400,6 +1404,10 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     pulseRingRgb,
     chartIdleCopy,
   };
+
+  if (isBroadcast) {
+    return <StreamLiveBroadcastLayout {...spectatorProps} />;
+  }
 
   if (isPro) {
     return <StreamProLayout {...spectatorProps} />;
