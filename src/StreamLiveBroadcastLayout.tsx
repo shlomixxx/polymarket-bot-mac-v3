@@ -178,7 +178,12 @@ function BroadcastFit(props: {
           top: 0,
           left: 0,
           right: 0,
+          bottom: 0,
           width: "100%",
+          height: "100%",
+          display: "flex",
+          flexDirection: "column",
+          minHeight: 0,
           transformOrigin: "top center",
         }}
       >
@@ -227,6 +232,12 @@ export type StreamLiveBroadcastLayoutProps = {
   streamPulseSec: number;
   pulseRingRgb: string;
   chartIdleCopy: ChartIdleCopy | null;
+  /** האם הבוט רץ על כסף אמיתי (Polymarket CLOB) — מחליף את כל המספרים בנתוני החשבון האמיתי */
+  isLive?: boolean;
+  /** יתרת USDC לייב ב-Polymarket (equity כולל פוזיציות פתוחות) — זמין רק כ-isLive=true */
+  liveAccountUsd?: number | null;
+  /** יתרת דמו — מוצג כש-isLive=false */
+  demoBalanceUsd?: number | null;
 };
 
 /* ══════════════════════════════════════════════════════════════════
@@ -264,6 +275,9 @@ export function StreamLiveBroadcastLayout(
     botRunUptimeSec,
     roundOutcomes,
     chartIdleCopy,
+    isLive = false,
+    liveAccountUsd = null,
+    demoBalanceUsd = null,
   } = props;
 
   const runPnlSegments = useMemo(
@@ -418,7 +432,23 @@ export function StreamLiveBroadcastLayout(
         parentRef={broadcastParentRef}
         contentRef={broadcastContentRef}
       >
-        <div style={{ padding: fb ? "6px 12px 10px" : "20px 28px 28px" }}>
+        <div
+          style={{
+            padding: fb ? "6px 12px 10px" : "20px 28px 28px",
+            ...(fb
+              ? {
+                  height: "100%",
+                  minHeight: 0,
+                  boxSizing: "border-box",
+                  display: "flex",
+                  flexDirection: "column",
+                }
+              : {}),
+          }}
+        >
+          <div
+            style={fb ? { flexShrink: 0, width: "100%" } : undefined}
+          >
           {/* ── LIVE NOW BANNER ── */}
           <div
             style={{
@@ -633,6 +663,69 @@ export function StreamLiveBroadcastLayout(
                   </span>
                 </>
               )}
+            </div>
+
+            {/* ── LIVE / DEMO ACCOUNT BADGE ── */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "6px 12px",
+                borderRadius: 10,
+                border: isLive
+                  ? "1.5px solid rgba(248, 113, 113, 0.7)"
+                  : "1px solid rgba(148, 163, 184, 0.35)",
+                background: isLive
+                  ? "linear-gradient(135deg, rgba(127, 29, 29, 0.55), rgba(10, 14, 25, 0.95))"
+                  : "rgba(255,255,255,0.04)",
+                boxShadow: isLive
+                  ? "0 0 14px rgba(248, 113, 113, 0.25)"
+                  : "none",
+                flexShrink: 0,
+              }}
+              title={
+                isLive
+                  ? "חשבון אמיתי (Polymarket CLOB) — ה-PnL והיתרה מייצגים USDC אמיתי"
+                  : "מצב דמו — מספרים סימולטיביים"
+              }
+            >
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  background: isLive ? "#f87171" : "#94a3b8",
+                  boxShadow: isLive
+                    ? "0 0 8px rgba(248, 113, 113, 0.8)"
+                    : "none",
+                  animation: isLive ? "lbLivePulse 1.6s ease-in-out infinite" : undefined,
+                }}
+              />
+              <span
+                style={{
+                  fontSize: 11,
+                  fontWeight: 900,
+                  letterSpacing: "0.14em",
+                  color: isLive ? "#fca5a5" : "rgba(255,255,255,0.5)",
+                }}
+              >
+                {isLive ? "LIVE" : "DEMO"}
+              </span>
+              <span
+                style={{
+                  fontSize: 13,
+                  fontWeight: 900,
+                  fontVariantNumeric: "tabular-nums",
+                  color: isLive ? "#fef2f2" : "rgba(255,255,255,0.75)",
+                }}
+              >
+                {(() => {
+                  const v = isLive ? liveAccountUsd : demoBalanceUsd;
+                  if (typeof v !== "number" || !Number.isFinite(v)) return "—";
+                  return `$${v.toFixed(2)}`;
+                })()}
+              </span>
             </div>
 
             {/* Sound controls */}
@@ -922,9 +1015,23 @@ export function StreamLiveBroadcastLayout(
               </div>
             </div>
           </div>
+          </div>
 
           {/* ── CHART + LAST TRADES ── */}
-          <section id="stream-stats" aria-label="Run PnL and trade history">
+          <section
+            id="stream-stats"
+            aria-label="Run PnL and trade history"
+            style={
+              fb
+                ? {
+                    flex: 1,
+                    minHeight: 0,
+                    display: "flex",
+                    flexDirection: "column",
+                  }
+                : undefined
+            }
+          >
             {/* Chart header */}
             <div
               style={{
@@ -995,21 +1102,35 @@ export function StreamLiveBroadcastLayout(
                 flexWrap: "wrap",
                 gap: fb ? 6 : 12,
                 alignItems: "stretch",
+                ...(fb
+                  ? {
+                      flex: 1,
+                      minHeight: 0,
+                    }
+                  : {}),
               }}
             >
               {/* Chart */}
               <div
                 className="lb-chart-shell"
                 style={{
-                  flex: "3 1 300px",
+                  flex: fb ? "3 1 0" : "3 1 300px",
                   minWidth: 0,
                   width: "100%",
-                  height: fb ? 220 : 300,
+                  ...(fb
+                    ? {
+                        minHeight: 0,
+                        alignSelf: "stretch",
+                        display: "flex",
+                        flexDirection: "column",
+                      }
+                    : { height: 300 }),
                 }}
               >
                 {stratCfg?.mode === "off" && chartIdleCopy ? (
                   <div
                     style={{
+                      flex: fb ? 1 : undefined,
                       height: "100%",
                       display: "flex",
                       flexDirection: "column",
@@ -1048,6 +1169,7 @@ export function StreamLiveBroadcastLayout(
                 ) : stratCfg?.mode !== "off" && runPnlSeries.length === 0 ? (
                   <div
                     style={{
+                      flex: fb ? 1 : undefined,
                       height: "100%",
                       display: "flex",
                       flexDirection: "column",
@@ -1071,6 +1193,13 @@ export function StreamLiveBroadcastLayout(
                     </div>
                   </div>
                 ) : (
+                  <div
+                    style={
+                      fb
+                        ? { flex: 1, minHeight: 0, width: "100%", minWidth: 0 }
+                        : { width: "100%", height: "100%" }
+                    }
+                  >
                   <ResponsiveContainer width="100%" height="100%">
                     <ComposedChart
                       data={runPnlSeries}
@@ -1122,7 +1251,11 @@ export function StreamLiveBroadcastLayout(
                         content={({ active, payload }) => {
                           if (!active || !payload || payload.length === 0)
                             return null;
-                          const pt = payload[0].payload as RunPnlPoint;
+                          const row =
+                            payload.find(
+                              (p) => String(p.name ?? "") === "runPnlHit"
+                            ) ?? payload[0];
+                          const pt = row?.payload as RunPnlPoint;
                           if (!pt || pt.t == null) return null;
                           const v = pt.usd;
                           const c = v >= 0 ? RUN_PNL_GREEN : RUN_PNL_RED;
@@ -1197,6 +1330,8 @@ export function StreamLiveBroadcastLayout(
                           fillOpacity={0.15}
                           baseLine={0}
                           isAnimationActive={false}
+                          activeDot={false}
+                          pointerEvents="none"
                         />
                       ))}
                       {runPnlSegments.map((seg, i) => (
@@ -1209,15 +1344,44 @@ export function StreamLiveBroadcastLayout(
                           strokeWidth={2.5}
                           dot={false}
                           isAnimationActive={false}
-                          activeDot={{
-                            r: 5,
-                            strokeWidth: 0,
-                            fill: seg.stroke,
-                          }}
+                          activeDot={false}
+                          pointerEvents="none"
                         />
                       ))}
+                      {/* Single invisible series: full series so Tooltip/activeDot work on entire curve (not only green fill). */}
+                      <Line
+                        name="runPnlHit"
+                        type="monotone"
+                        data={runPnlSeries}
+                        dataKey="usd"
+                        stroke="transparent"
+                        strokeWidth={20}
+                        dot={false}
+                        isAnimationActive={false}
+                        activeDot={(props: {
+                          cx?: number;
+                          cy?: number;
+                          payload?: RunPnlPoint;
+                        }) => {
+                          const v = props.payload?.usd ?? 0;
+                          const c = v >= 0 ? RUN_PNL_GREEN : RUN_PNL_RED;
+                          const cx = props.cx ?? 0;
+                          const cy = props.cy ?? 0;
+                          return (
+                            <circle
+                              cx={cx}
+                              cy={cy}
+                              r={6}
+                              fill={c}
+                              stroke="rgba(255,255,255,0.35)"
+                              strokeWidth={1}
+                            />
+                          );
+                        }}
+                      />
                     </ComposedChart>
                   </ResponsiveContainer>
+                  </div>
                 )}
               </div>
 
@@ -1225,10 +1389,17 @@ export function StreamLiveBroadcastLayout(
               <aside
                 aria-label="Last trades"
                 style={{
-                  flex: "1 1 200px",
+                  flex: fb ? "1 1 0" : "1 1 200px",
                   minWidth: 180,
-                  maxWidth: 300,
-                  maxHeight: fb ? 220 : 300,
+                  maxWidth: fb ? "none" : 300,
+                  ...(fb
+                    ? {
+                        minHeight: 0,
+                        alignSelf: "stretch",
+                        maxHeight: "none",
+                        height: "auto",
+                      }
+                    : { maxHeight: 300 }),
                   overflow: "auto",
                   padding: "12px 14px",
                   borderRadius: 10,

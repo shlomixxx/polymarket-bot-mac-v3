@@ -40,6 +40,9 @@ def _safe_int(x: Any) -> int | None:
 def _group_trades_by_session(trades: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     by_sid: DefaultDict[str, list[dict[str, Any]]] = defaultdict(list)
     for t in trades:
+        # פוזיציות מ-reconcile (chain) — לא חלק מסטטיסטיקת הריצה/עצות (Tips v2)
+        if t.get("reconcile_origin"):
+            continue
         sid = t.get("session_id")
         tid = t.get("id")
         if not sid:

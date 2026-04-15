@@ -59,6 +59,7 @@ type Trade = {
   fee_est?: number;
   token_id?: string;
   session_id?: string;
+  reconcile_origin?: boolean;
   realized_pnl?: number;
   trade_num?: number;
   peak_unrealized_pct?: number;
@@ -194,7 +195,26 @@ type SessionGroup = { sessionId: string; trades: Trade[] };
 
 function groupTradesBySession(trades: Trade[]): SessionGroup[] {
   /** יציאות (EXPIRE/SELL) בלי session_id — מצמידים ל-session של ה-BUY באותו token_id */
-  const sorted = [...trades].sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
+  // פוזיציות שנטענו מה-chain (reconcile_origin) לא נפתחו ב-BUY של הריצה → לא מציגים
+  // אותן כ«עסקה» ריקה בהיסטוריית הריצה. היתרה מתעדכנת רגיל דרך SETTLE/RECONCILE.
+  // תאימות אחורה: רשומות ישנות שנוצרו לפני הוספת הדגל — נזהה אותן כ-SETTLE/EXPIRE ללא
+  // session_id ושאין להן BUY תואם באותו token_id ברשימה.
+  const buysByToken = new Set<string>();
+  for (const t of trades) {
+    if (t.type === "BUY" && t.token_id) buysByToken.add(t.token_id);
+  }
+  const isLegacyOrphanSettle = (t: Trade) => {
+    const isSettleOrExpire =
+      t.type === "SETTLE_WIN" ||
+      t.type === "SETTLE_LOSS" ||
+      t.type === "SETTLE_UNKNOWN" ||
+      t.type === "EXPIRE_0";
+    if (!isSettleOrExpire) return false;
+    if (t.session_id) return false;
+    return !t.token_id || !buysByToken.has(t.token_id);
+  };
+  const filtered = trades.filter((t) => !t.reconcile_origin && !isLegacyOrphanSettle(t));
+  const sorted = [...filtered].sort((a, b) => (Number(a.ts) || 0) - (Number(b.ts) || 0));
   const sessionByToken = new Map<string, string>();
   for (const t of sorted) {
     if (t.type === "BUY" && t.token_id) {
@@ -203,7 +223,7 @@ function groupTradesBySession(trades: Trade[]): SessionGroup[] {
     }
   }
   const bySession = new Map<string, Trade[]>();
-  for (const t of trades) {
+  for (const t of filtered) {
     let sid = t.session_id;
     if (!sid && t.token_id) {
       const fromTok = sessionByToken.get(t.token_id);
@@ -1705,6 +1725,13 @@ export default function App() {
   const [lossRecoveryStepPct, setLossRecoveryStepPct] = useState(20);
   const [lossRecoveryEveryN, setLossRecoveryEveryN] = useState(1);
   const [lossRecoveryMaxMult, setLossRecoveryMaxMult] = useState(10);
+  /** ביצוע: "limit" = GTC קלאסי (תאימות לאחור); "market" = FOK לכניסה, FAK+retry ליציאה */
+  const [orderMode, setOrderMode] = useState<"limit" | "market">("limit");
+  const [entrySlippagePct, setEntrySlippagePct] = useState(2);
+  const [exitSlippagePct, setExitSlippagePct] = useState(5);
+  const [peakWatchdogEnabled, setPeakWatchdogEnabled] = useState(true);
+  const [peakRetreatExitPct, setPeakRetreatExitPct] = useState(2);
+  const [retryMaxAttempts, setRetryMaxAttempts] = useState(3);
   /** מצב ריצה מהשרת (תמיד מסונכרן) */
   const [lossRecoveryStreak, setLossRecoveryStreak] = useState(0);
   const [lossRecoveryMultLive, setLossRecoveryMultLive] = useState(1);
@@ -1870,6 +1897,12 @@ export default function App() {
         if (typeof c.loss_recovery_step_pct === "number") setLossRecoveryStepPct(c.loss_recovery_step_pct);
         if (typeof c.loss_recovery_every_n_losses === "number") setLossRecoveryEveryN(c.loss_recovery_every_n_losses);
         if (typeof c.loss_recovery_max_multiplier === "number") setLossRecoveryMaxMult(c.loss_recovery_max_multiplier);
+        if (c.order_mode === "limit" || c.order_mode === "market") setOrderMode(c.order_mode);
+        if (typeof c.entry_slippage_pct === "number") setEntrySlippagePct(c.entry_slippage_pct);
+        if (typeof c.exit_slippage_pct === "number") setExitSlippagePct(c.exit_slippage_pct);
+        if (typeof c.peak_watchdog_enabled === "boolean") setPeakWatchdogEnabled(c.peak_watchdog_enabled);
+        if (typeof c.peak_retreat_exit_pct === "number") setPeakRetreatExitPct(c.peak_retreat_exit_pct);
+        if (typeof c.retry_max_attempts === "number") setRetryMaxAttempts(c.retry_max_attempts);
       }
       setOb(obSummary);
     } catch (e: unknown) {
@@ -1993,6 +2026,12 @@ export default function App() {
         loss_recovery_step_pct: lossRecoveryStepPct,
         loss_recovery_every_n_losses: Math.max(1, Math.floor(lossRecoveryEveryN)),
         loss_recovery_max_multiplier: Math.max(1, lossRecoveryMaxMult),
+        order_mode: orderMode,
+        entry_slippage_pct: Math.max(0, entrySlippagePct),
+        exit_slippage_pct: Math.max(0, exitSlippagePct),
+        peak_watchdog_enabled: peakWatchdogEnabled,
+        peak_retreat_exit_pct: Math.max(0, peakRetreatExitPct),
+        retry_max_attempts: Math.max(0, Math.floor(retryMaxAttempts)),
       }),
     });
     cfgDirtyRef.current = false;
@@ -2001,6 +2040,26 @@ export default function App() {
     setTimeout(() => setSaveFeedback(null), 3000);
     await refresh();
   };
+
+  /** Auto-save: אם המשתמש ערך ערך בלשונית אסטרטגיה — שמור אוטומטית 1.5s אחרי הקלדה אחרונה
+   *  (debounce). כך אין תלות בלחיצה ידנית על "שמור הגדרות" — אם סוגרים את הבוט/דפדפן
+   *  תוך כדי עריכה, הערך האחרון כבר נשמר ל-config_persisted.json.
+   */
+  const pushConfigRef = useRef(pushConfig);
+  useEffect(() => { pushConfigRef.current = pushConfig; });
+  useEffect(() => {
+    if (!cfgDirty) return;
+    const id = window.setTimeout(() => {
+      void pushConfigRef.current().catch(() => { /* שקט — נסיון חוזר בשינוי הבא */ });
+    }, 1500);
+    return () => window.clearTimeout(id);
+  }, [cfgDirty, inv, entryCents, minContracts, btcWindow, tp, minMin, freezeMin, interBlock,
+      dca, dcaSlices, dcaInt, dcaDiscountEnabled, dcaDiscountPct, hedge, hedgeMax, side,
+      autoReenter, reenterCooldown, maxEntriesPerWindow, maxNotionalPerWindow, maxTradesPerHour,
+      nearEntryPct, nearTpPct, dcaTpOverridePct, bookLogIntervalSec,
+      lossRecoveryEnabled, lossRecoveryStepPct, lossRecoveryEveryN, lossRecoveryMaxMult,
+      orderMode, entrySlippagePct, exitSlippagePct, peakWatchdogEnabled, peakRetreatExitPct,
+      retryMaxAttempts]);
 
   const setMode = async (m: "off" | "semi" | "auto") => {
     await pushConfig();
@@ -3248,6 +3307,106 @@ export default function App() {
                 marginBottom: 12,
               }}
             >
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>ביצוע מובטח (Market / FOK+FAK)</div>
+              <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 10px", lineHeight: 1.55 }}>
+                מצב &quot;ביצוע מובטח&quot;: כניסה ב-FOK (או הכל או כלום — אין חצי פוזיציה), יציאה ב-FAK עם slippage רחב +
+                retry ladder. פותר את הבעיה של &quot;עסקה שהייתה ברווח והפכה להפסד כי ה-LIMIT SELL לא התמלא&quot;.
+              </p>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                <input
+                  type="checkbox"
+                  checked={orderMode === "market"}
+                  onChange={(e) => {
+                    setOrderMode(e.target.checked ? "market" : "limit");
+                    markCfgDirty();
+                  }}
+                />
+                הפעל ביצוע מובטח (Market). כבוי = LIMIT GTC קלאסי (ברירת מחדל, תאימות לאחור).
+              </label>
+              <label>
+                Slippage כניסה (% — תקרת מחיר מעל Ask ב-BUY FOK)
+                <input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={50}
+                  disabled={orderMode !== "market"}
+                  value={entrySlippagePct}
+                  onChange={(e) => {
+                    setEntrySlippagePct(Math.max(0, Number(e.target.value) || 0));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label>
+                Slippage יציאה (% — מינ׳ מחיר מתחת ל-Bid ב-SELL FAK; רחב יותר = ביצוע ודאי יותר)
+                <input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={50}
+                  disabled={orderMode !== "market"}
+                  value={exitSlippagePct}
+                  onChange={(e) => {
+                    setExitSlippagePct(Math.max(0, Number(e.target.value) || 0));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label>
+                נסיונות חוזרים ליציאה חלקית (retry ladder — slippage מתרחב)
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  max={10}
+                  disabled={orderMode !== "market"}
+                  value={retryMaxAttempts}
+                  onChange={(e) => {
+                    setRetryMaxAttempts(Math.max(0, Math.floor(Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6, marginBottom: 10 }}>
+                <input
+                  type="checkbox"
+                  checked={peakWatchdogEnabled}
+                  onChange={(e) => {
+                    setPeakWatchdogEnabled(e.target.checked);
+                    markCfgDirty();
+                  }}
+                />
+                Peak Watchdog — אחרי שה-bid נגע ב-TP, מכירה אוטומטית אם נופל מהשיא
+              </label>
+              <label>
+                נסיגה מהשיא שמפעילה יציאה (% — ברגע שה-bid נפל X% משיאו אחרי TP, מוכרים)
+                <input
+                  type="number"
+                  step="0.1"
+                  min={0}
+                  max={50}
+                  disabled={!peakWatchdogEnabled}
+                  value={peakRetreatExitPct}
+                  onChange={(e) => {
+                    setPeakRetreatExitPct(Math.max(0, Number(e.target.value) || 0));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+            </div>
+            <div
+              style={{
+                marginTop: 14,
+                paddingTop: 14,
+                borderTop: "1px dashed #263244",
+                marginBottom: 12,
+              }}
+            >
               <div style={{ fontWeight: 700, marginBottom: 8 }}>שחזור אחרי הפסד (מכפיל כניסה)</div>
               <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 10px", lineHeight: 1.55 }}>
                 רלוונטי כשהחלון נסגר והפוזיציה נפרקת בהפסד (הזמן נגמר / Up או Down הפסיד לפי מחיר הסגירה). לא מפעילים
@@ -3371,7 +3530,7 @@ export default function App() {
             </button>
             {cfgDirty && (
               <span style={{ fontSize: 13, color: "var(--muted)" }}>
-                יש שינויים לא שמורים — ההגדרות יישמרו גם להפעלות הבאות
+                יש שינויים לא שמורים — ישמרו אוטומטית תוך 1.5 שניות (או לחץ שמור עכשיו)
               </span>
             )}
           </div>

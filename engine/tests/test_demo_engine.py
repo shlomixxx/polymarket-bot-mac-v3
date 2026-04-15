@@ -56,6 +56,42 @@ async def test_expire_all_outside_tokens_creates_expire_trade_and_removes_positi
     assert t.get("execution") == "live"
 
 
+@pytest.mark.asyncio
+async def test_expire_marks_reconcile_origin_when_no_session_id(tmp_path: Path):
+    """פוזיציה שנכנסה דרך reconcile (חסרה ב-_session_by_token) חייבת להיות מסומנת
+    reconcile_origin=True ב-SETTLE — כדי שה-UI לא יציג אותה כ«עסקה» ריקה של הריצה."""
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1000.0)
+    eng.state.positions = [
+        Position(side="Up", contracts=10.0, avg_cost=0.4, token_id="ghost-from-chain"),
+        Position(side="Down", contracts=5.0, avg_cost=0.2, token_id="bot-opened"),
+    ]
+    # רק הטוקן שנפתח ע״י ה-BOT — יש לו session_id
+    eng._session_by_token = {"bot-opened": "sess-abc"}
+
+    async def _px(_ep: int, _ws: int):
+        return {"start": 100.0, "end": 99.0, "source": "binance_1m_proxy"}
+
+    with patch("btc_price.fetch_window_start_end_btc_usd", AsyncMock(side_effect=_px)):
+        created = await eng.expire_all_outside_tokens(
+            ("other_up", "other_down"),
+            context={
+                "settled_epoch": 1_700_000_000,
+                "settled_window_sec": 300,
+                "execution": "live",
+            },
+        )
+
+    assert len(created) == 2
+    by_tid = {t["token_id"]: t for t in created}
+    # הפוזיציה מה-chain (ללא session_id) — מסומנת reconcile_origin
+    assert by_tid["ghost-from-chain"].get("reconcile_origin") is True
+    assert by_tid["ghost-from-chain"].get("session_id") is None
+    # הפוזיציה של ה-BOT — נשארת רגילה עם session_id
+    assert by_tid["bot-opened"].get("reconcile_origin") is None
+    assert by_tid["bot-opened"].get("session_id") == "sess-abc"
+
+
 def test_export_csv_contains_headers_and_snapshot(tmp_path: Path):
     eng = DemoEngine(state_path=tmp_path / "state.json")
     eng.state = DemoState(balance_usd=10_000.0)

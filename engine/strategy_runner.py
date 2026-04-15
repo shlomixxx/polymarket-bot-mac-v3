@@ -76,6 +76,17 @@ class StrategyConfig:
     loss_recovery_step_pct: float = 20.0
     loss_recovery_every_n_losses: int = 1
     loss_recovery_max_multiplier: float = 10.0
+    # ביצוע: "limit" (GTC קלאסי) או "market" (FOK לכניסה, FAK ליציאה + retry ladder).
+    # מטרה: להבטיח ביצוע מידי ולמנוע פוזיציה תקועה כשהשוק מדלג על יעד ה-TP.
+    order_mode: Literal["limit", "market"] = "limit"
+    entry_slippage_pct: float = 2.0  # תקרת slippage לכניסת MARKET BUY
+    exit_slippage_pct: float = 5.0   # תקרת slippage ליציאת MARKET SELL (רחבה — עדיף לצאת)
+    # Peak Watchdog: אם bid נגע פעם ב-TP ואז נפל ביותר מ-X% מהשיא, מוכר מידי
+    # (גם אם עדיין מעל entry) — מונע "עסקה שהיתה ברווח והפכה להפסד".
+    peak_watchdog_enabled: bool = True
+    peak_retreat_exit_pct: float = 2.0
+    # כמה retry לאחר FAK חלקי ביציאה (הרחבת slippage בכל retry)
+    retry_max_attempts: int = 3
 
 
 @dataclass
@@ -116,6 +127,12 @@ class StrategyRuntime:
     _last_live_auto_entry_fail_msg: str = ""
     _settled_token_ids: set = field(default_factory=set)
     _settled_token_ids_ts: float = 0.0
+    # Peak Watchdog: {token_id: {"peak_bid": float, "tp_touched": bool, "tp_target": float}}
+    # פוזיציה שעברה פעם את יעד ה-TP — אם ה-bid נופל אחורה, מוכרים מיד.
+    _peak_state: dict = field(default_factory=dict)
+    # Cooldown per-token על TP-SELL אחרי שגיאת "insufficient_onchain_balance":
+    # מונע spam של 400-errors עד ש-reconcile יתקן את פער ה-ledger/chain.
+    _tp_sell_cooldown_until: dict = field(default_factory=dict)
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -365,7 +382,15 @@ class StrategyRunner:
             if bid is None or bid <= 0:
                 no_bid_count += 1
                 continue
-            lo = await live_clob.place_limit_order(p.token_id, float(bid), float(p.contracts), "SELL")
+            cfg = self.rt.config
+            lo = await live_clob.place_exit_order(
+                p.token_id,
+                float(p.contracts),
+                float(bid),
+                order_mode=getattr(cfg, "order_mode", "limit"),
+                exit_slippage_pct=float(getattr(cfg, "exit_slippage_pct", 5.0)),
+                retry_max_attempts=int(getattr(cfg, "retry_max_attempts", 3)),
+            )
             if not lo.get("ok"):
                 err = str(lo.get("error", "כשל"))
                 if err not in sell_fail_msgs:
@@ -477,11 +502,13 @@ class StrategyRunner:
             use_live = live_request and self._live_trading_ok()
             if use_live:
                 lim = float(p.get("limit") or 1.0)
-                lo = await live_clob.place_limit_order(
+                lo = await live_clob.place_entry_order(
                     str(p["token"]),
-                    lim,
                     n_adj,
+                    lim,
                     "BUY",
+                    order_mode=getattr(cfg0, "order_mode", "limit"),
+                    entry_slippage_pct=float(getattr(cfg0, "entry_slippage_pct", 2.0)),
                 )
                 if not lo.get("ok"):
                     err = lo.get("error", "כשל לייב")
@@ -568,7 +595,15 @@ class StrategyRunner:
                     self.rt.log("גידור לייב: אין Ask")
                     return {"ok": False, "error": "אין Ask לגידור"}
                 ask_f = float(ask)
-                lo = await live_clob.place_limit_order(str(p["token"]), ask_f, n_adj, "BUY")
+                cfg_h = self.rt.config
+                lo = await live_clob.place_entry_order(
+                    str(p["token"]),
+                    n_adj,
+                    ask_f,
+                    "BUY",
+                    order_mode=getattr(cfg_h, "order_mode", "limit"),
+                    entry_slippage_pct=float(getattr(cfg_h, "entry_slippage_pct", 2.0)),
+                )
                 if not lo.get("ok"):
                     err = lo.get("error", "כשל לייב")
                     self.rt.log(f"גידור לייב נכשל: {err}")
@@ -842,6 +877,14 @@ class StrategyRunner:
         tp_allowed_base = not dca_locked or (gate_ctx == "freeze")
         if not tp_allowed_base:
             wait_parts.append(f"TP נעול עד DCA ({self.rt.dca_done_slices}/{cfg.dca_slices})")
+        # ניקוי peak_state + tp_sell_cooldown מטוקנים שאין להם פוזיציה יותר (סוגר/רה-אנטרי)
+        active_tokens_ps = {p.token_id for p in self.demo.state.positions}
+        for tok_ps in list(self.rt._peak_state.keys()):
+            if tok_ps not in active_tokens_ps:
+                self.rt._peak_state.pop(tok_ps, None)
+        for tok_cd in list(self.rt._tp_sell_cooldown_until.keys()):
+            if tok_cd not in active_tokens_ps:
+                self.rt._tp_sell_cooldown_until.pop(tok_cd, None)
         for p in list(self.demo.state.positions):
             b, _ = await fetch_best_bid_ask(p.token_id)
             if b is None:
@@ -850,6 +893,52 @@ class StrategyRunner:
             tp_allowed = tp_allowed_base or (
                 dca_locked and upnl is not None and upnl >= cfg.dca_tp_override_pct
             )
+            # ── Peak Watchdog ─────────────────────────────────────────────────
+            # מעקב אחר שיא ה-bid ודגל "נגע ב-TP". אם נגע ואז נפל X% מהשיא → trigger יציאה.
+            # מונע "פוזיציה שהייתה ברווח והפכה להפסד כי לא יצאנו ב-TP".
+            peak_trigger = False
+            peak_trigger_reason = ""
+            try:
+                tp_target_bid = float(p.avg_cost) * (
+                    1.0 + (cfg.take_profit_pct / 100.0) * (1.0 + 2 * FEE_RATE)
+                )
+            except Exception:
+                tp_target_bid = 0.0
+            ps = self.rt._peak_state.setdefault(
+                p.token_id,
+                {"peak_bid": 0.0, "tp_touched": False, "tp_target_bid": tp_target_bid},
+            )
+            # רענון תקרת TP במקרה של DCA (avg_cost השתנה אחרי סלייס נוסף)
+            ps["tp_target_bid"] = tp_target_bid
+            try:
+                b_val = float(b)
+            except (TypeError, ValueError):
+                b_val = 0.0
+            if b_val > float(ps.get("peak_bid") or 0.0):
+                ps["peak_bid"] = b_val
+            if tp_target_bid > 0 and b_val >= tp_target_bid and not ps.get("tp_touched"):
+                ps["tp_touched"] = True
+                self.rt.log(
+                    f"Peak Watchdog: {p.side} נגע ב-TP (bid {b_val:.3f} ≥ יעד {tp_target_bid:.3f}) — "
+                    f"שומר על השיא; ירידה >{cfg.peak_retreat_exit_pct:.1f}% תפעיל יציאה מידית"
+                )
+            if (
+                cfg.peak_watchdog_enabled
+                and tp_allowed
+                and ps.get("tp_touched")
+                and float(ps.get("peak_bid") or 0.0) > 0
+                and cfg.peak_retreat_exit_pct > 0
+            ):
+                retreat_trigger_bid = float(ps["peak_bid"]) * (
+                    1.0 - cfg.peak_retreat_exit_pct / 100.0
+                )
+                if b_val <= retreat_trigger_bid:
+                    peak_trigger = True
+                    peak_trigger_reason = (
+                        f"peak_retreat: bid {b_val:.3f} ≤ שיא {float(ps['peak_bid']):.3f} "
+                        f"× (1-{cfg.peak_retreat_exit_pct:.1f}%)"
+                    )
+            # ──────────────────────────────────────────────────────────────────
             if upnl is not None and tp_allowed and cfg.near_tp_pct > 0:
                 missing = cfg.take_profit_pct - upnl
                 if 0 < missing <= cfg.near_tp_pct:
@@ -857,9 +946,19 @@ class StrategyRunner:
                     label = p.side
                     if best_near_tp is None or missing < best_near_tp[0]:
                         best_near_tp = (missing, label)
-            if tp_allowed and upnl is not None and upnl >= cfg.take_profit_pct * (1 + 2 * FEE_RATE):
+            tp_trigger = (
+                tp_allowed and upnl is not None and upnl >= cfg.take_profit_pct * (1 + 2 * FEE_RATE)
+            )
+            if tp_trigger or peak_trigger:
                 tp_ctx = dict(base_ctx)
-                tp_ctx["reason"] = f"TP {p.side}: upnl={upnl:.2f}% >= {cfg.take_profit_pct:.2f}%"
+                if peak_trigger and not tp_trigger:
+                    tp_ctx["reason"] = f"PEAK_EXIT {p.side}: {peak_trigger_reason}"
+                    self.rt.log_event(
+                        f"Peak Watchdog יציאה {p.side}: {peak_trigger_reason} "
+                        f"(upnl נוכחי {upnl:.2f}%)"
+                    )
+                else:
+                    tp_ctx["reason"] = f"TP {p.side}: upnl={upnl:.2f}% >= {cfg.take_profit_pct:.2f}%"
                 pos_contracts = float(p.contracts)
                 if pos_contracts <= 1e-8:
                     continue
@@ -869,14 +968,74 @@ class StrategyRunner:
                         f"מנסה סגירה (SELL) בכל זאת — אם הבורסה תדחה, סגר ידנית או הגדל/י מינ׳ חוזים בכניסה"
                     )
                 if self._live_trading_ok():
+                    cd_until = float(self.rt._tp_sell_cooldown_until.get(p.token_id) or 0.0)
+                    now_ts = time.time()
+                    if cd_until > now_ts:
+                        # עיגול ל-ceil כדי שלא נציג "0s" בזמן שעדיין יש שבריר שנייה.
+                        remaining_s = max(1, int(math.ceil(cd_until - now_ts)))
+                        self.rt.status(
+                            f"TP {p.side}: cooldown אחרי שגיאת יתרה — ממתין לסנכרון שרשרת "
+                            f"({remaining_s}s)",
+                            key=f"tp_cooldown_{p.token_id}",
+                        )
+                        continue
                     _, bid_tp = await fetch_best_bid_ask(p.token_id)
                     if bid_tp is None:
                         continue
-                    lo = await live_clob.place_limit_order(
-                        p.token_id, float(bid_tp), pos_contracts, "SELL",
+                    lo = await live_clob.place_exit_order(
+                        p.token_id,
+                        pos_contracts,
+                        float(bid_tp),
+                        order_mode=getattr(cfg, "order_mode", "limit"),
+                        exit_slippage_pct=float(getattr(cfg, "exit_slippage_pct", 5.0)),
+                        retry_max_attempts=int(getattr(cfg, "retry_max_attempts", 3)),
                     )
                     if not lo.get("ok"):
                         self.rt.log(f"TP לייב: {lo.get('error', 'כשל')}")
+                        if lo.get("error_code") == "insufficient_onchain_balance":
+                            # יתרת שרשרת < ledger פנימי — מקור האמת היחיד הוא balance_allowance ב-CLOB,
+                            # לא Data API (שמעוכב). סנכרן p.contracts ישירות לשרשרת; אם 0 — הסר פוזיציה.
+                            chain_bal: Optional[float] = None
+                            try:
+                                chain_bal = await live_clob.fetch_chain_shares_for_token(p.token_id)
+                            except Exception as e:
+                                self.rt.log(f"TP לייב: שגיאת שליפת יתרת שרשרת — {e}")
+                            if chain_bal is not None and chain_bal < 1e-4:
+                                # אין מה למכור — הסר מהספר הפנימי לחלוטין (חוזי רפאים).
+                                idx_rm = self.demo._position_idx(p.token_id)
+                                if idx_rm >= 0:
+                                    self.demo.state.positions.pop(idx_rm)
+                                    self.demo.save()
+                                self.rt._peak_state.pop(p.token_id, None)
+                                self.rt._tp_sell_cooldown_until.pop(p.token_id, None)
+                                self.rt.log_event(
+                                    f"TP לייב: יתרת שרשרת ≈ 0 עבור {p.side} — הוסרה פוזיציה "
+                                    f"פנימית מיותמת (מיל׳וי חלקי של GTC בכניסה)"
+                                )
+                            elif chain_bal is not None and chain_bal < float(p.contracts) - 1e-6:
+                                # קצץ את הפוזיציה הפנימית לפי השרשרת — וקחו cooldown קצר
+                                # כדי לא לנסות שוב מיד על אותו bid.
+                                old_c = float(p.contracts)
+                                p.contracts = float(chain_bal)
+                                self.demo.save()
+                                self.rt._tp_sell_cooldown_until[p.token_id] = now_ts + 3.0
+                                self.rt.log(
+                                    f"TP לייב: סנכרון פוזיציה {p.side} לפי שרשרת — "
+                                    f"{old_c:.4f} → {chain_bal:.4f} חוזים (cooldown 3s)"
+                                )
+                            else:
+                                # לא ידוע או זהה — נסיון reconcile רך + cooldown 15s.
+                                self.rt._tp_sell_cooldown_until[p.token_id] = now_ts + 15.0
+                                self.rt.log(
+                                    "TP לייב: יתרת שרשרת < ledger — מפעיל reconcile מיידי + cooldown 15s"
+                                )
+                                try:
+                                    await self._live_reconcile_if_enabled(
+                                        context={"reason": "TP_BALANCE_ERROR"},
+                                        force=True,
+                                    )
+                                except Exception as e:
+                                    self.rt.log(f"reconcile מיידי נכשל: {e}")
                         continue
                     fill_sell = float(lo.get("price") or bid_tp)
                     sold_sz = float(lo.get("size") or pos_contracts)
@@ -892,6 +1051,8 @@ class StrategyRunner:
                     full_exit = bool(r.get("full_exit", True))
                     if full_exit:
                         self.rt.record_tp(cfg=cfg, side=p.side)
+                        self.rt._peak_state.pop(p.token_id, None)
+                        self.rt._tp_sell_cooldown_until.pop(p.token_id, None)
                         if cfg.loss_recovery_enabled:
                             self.demo.state.loss_recovery_streak = 0
                             self.demo.state.loss_recovery_multiplier = 1.0
@@ -1003,8 +1164,13 @@ class StrategyRunner:
                         return
                     n = n_h
                     if self._live_trading_ok():
-                        lo = await live_clob.place_limit_order(
-                            str(other_token), float(other_ask), float(n), "BUY"
+                        lo = await live_clob.place_entry_order(
+                            str(other_token),
+                            float(n),
+                            float(other_ask),
+                            "BUY",
+                            order_mode=getattr(cfg, "order_mode", "limit"),
+                            entry_slippage_pct=float(getattr(cfg, "entry_slippage_pct", 2.0)),
                         )
                         if not lo.get("ok"):
                             self.rt.log(f"גידור אוטו (לייב): {lo.get('error', 'כשל')}")
@@ -1276,7 +1442,14 @@ class StrategyRunner:
             return
 
         if self._live_trading_ok():
-            lo = await live_clob.place_limit_order(str(token), float(lim), float(n), "BUY")
+            lo = await live_clob.place_entry_order(
+                str(token),
+                float(n),
+                float(lim),
+                "BUY",
+                order_mode=getattr(cfg, "order_mode", "limit"),
+                entry_slippage_pct=float(getattr(cfg, "entry_slippage_pct", 2.0)),
+            )
             if not lo.get("ok"):
                 err = str(lo.get("error", "כשל"))
                 t_fail = time.time()

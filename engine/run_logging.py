@@ -387,6 +387,9 @@ def _group_trades_by_session(trades: list[dict]) -> list[tuple[str, list[dict]]]
     """קיבוץ עסקאות לפי session_id — כמו groupTradesBySession בפרונט."""
     by_session: dict[str, list[dict]] = {}
     for t in trades:
+        # settlements שמקורם ב-reconcile (chain) לא מיוצגים כמחזור של הריצה
+        if t.get("reconcile_origin"):
+            continue
         sid = t.get("session_id") or (t.get("id") if t.get("type") == "BUY" else None) or f"orphan-{t.get('id', '')}"
         by_session.setdefault(sid, []).append(t)
     for lst in by_session.values():

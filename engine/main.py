@@ -74,6 +74,7 @@ from run_logging import (
 from live_clob import (
     fetch_live_portfolio,
     fetch_polymarket_clob_account,
+    place_entry_order as live_place_entry_order,
     place_limit_order as live_place_limit_order,
     reset_portfolio_cache,
 )
@@ -190,6 +191,10 @@ def _bot_run_win_rate_stats() -> dict[str, Any]:
             continue
         typ = t.get("type") or ""
         styp = str(typ)
+        # פוזיציות שנטענו מה-chain דרך reconcile (reconcile_origin) לא נפתחו ב-BUY של
+        # הריצה — להוציא אותן מסטטיסטיקת win_rate כדי שלא יעוותו את המדד של הריצה.
+        if t.get("reconcile_origin"):
+            continue
         if (
             typ == "EXPIRE_0"
             or typ in ("SETTLE_WIN", "SETTLE_LOSS", "SETTLE_UNKNOWN")
@@ -332,6 +337,12 @@ def _save_persisted_config() -> None:
             "loss_recovery_step_pct": getattr(c, "loss_recovery_step_pct", 20.0),
             "loss_recovery_every_n_losses": getattr(c, "loss_recovery_every_n_losses", 1),
             "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 10.0),
+            "order_mode": getattr(c, "order_mode", "limit"),
+            "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
+            "exit_slippage_pct": getattr(c, "exit_slippage_pct", 5.0),
+            "peak_watchdog_enabled": getattr(c, "peak_watchdog_enabled", True),
+            "peak_retreat_exit_pct": getattr(c, "peak_retreat_exit_pct", 2.0),
+            "retry_max_attempts": getattr(c, "retry_max_attempts", 3),
             "mode": runner.rt.mode,
             # מצב "כסף אמיתי" נשלט מהממשק — נשמר בין הפעלות אבל נגדר ע"י POLYMARKET_LIVE env בפריסה.
             "live_trading": bool(getattr(runner.rt, "live_trading", False)),
@@ -921,6 +932,13 @@ class ConfigBody(BaseModel):
     loss_recovery_step_pct: float = 20.0
     loss_recovery_every_n_losses: int = 1
     loss_recovery_max_multiplier: float = 10.0
+    # ביצוע מובטח: "limit" (ברירת מחדל, תאימות לאחור) או "market" (FOK/FAK)
+    order_mode: str = "limit"
+    entry_slippage_pct: float = 2.0
+    exit_slippage_pct: float = 5.0
+    peak_watchdog_enabled: bool = True
+    peak_retreat_exit_pct: float = 2.0
+    retry_max_attempts: int = 3
 
 
 @app.post("/api/strategy/config")
@@ -940,6 +958,16 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "loss_recovery_every_n_losses must be >= 1")
     if float(body.loss_recovery_max_multiplier) < 1.0:
         raise HTTPException(400, "loss_recovery_max_multiplier must be >= 1")
+    if body.order_mode not in ("limit", "market"):
+        raise HTTPException(400, "order_mode must be 'limit' or 'market'")
+    if float(body.entry_slippage_pct) < 0 or float(body.entry_slippage_pct) > 50:
+        raise HTTPException(400, "entry_slippage_pct must be between 0 and 50")
+    if float(body.exit_slippage_pct) < 0 or float(body.exit_slippage_pct) > 50:
+        raise HTTPException(400, "exit_slippage_pct must be between 0 and 50")
+    if float(body.peak_retreat_exit_pct) < 0 or float(body.peak_retreat_exit_pct) > 50:
+        raise HTTPException(400, "peak_retreat_exit_pct must be between 0 and 50")
+    if int(body.retry_max_attempts) < 0 or int(body.retry_max_attempts) > 10:
+        raise HTTPException(400, "retry_max_attempts must be between 0 and 10")
     c = runner.rt.config
     for k, v in body.model_dump().items():
         if hasattr(c, k):
@@ -993,6 +1021,12 @@ async def get_strategy_config():
         "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 10.0),
         "loss_recovery_streak": demo.state.loss_recovery_streak,
         "loss_recovery_multiplier": demo.state.loss_recovery_multiplier,
+        "order_mode": getattr(c, "order_mode", "limit"),
+        "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
+        "exit_slippage_pct": getattr(c, "exit_slippage_pct", 5.0),
+        "peak_watchdog_enabled": getattr(c, "peak_watchdog_enabled", True),
+        "peak_retreat_exit_pct": getattr(c, "peak_retreat_exit_pct", 2.0),
+        "retry_max_attempts": getattr(c, "retry_max_attempts", 3),
         "mode": runner.rt.mode,
         "last_status": runner.rt.last_status,
         # מפתח אחרון מ-status() — נוח למיפוי אנגלי בדף שידור/OBS
@@ -1303,7 +1337,15 @@ async def live_order(body: TradeBody):
     if not ok_sz:
         raise HTTPException(400, verr or "גודל לא תקין")
     price = float(body.limit_price or 0.5)
-    return await live_place_limit_order(str(body.token_id), price, float(n_adj), "BUY")
+    cfg = runner.rt.config
+    return await live_place_entry_order(
+        str(body.token_id),
+        float(n_adj),
+        price,
+        "BUY",
+        order_mode=getattr(cfg, "order_mode", "limit"),
+        entry_slippage_pct=float(getattr(cfg, "entry_slippage_pct", 2.0)),
+    )
 
 
 @app.get("/api/signals")

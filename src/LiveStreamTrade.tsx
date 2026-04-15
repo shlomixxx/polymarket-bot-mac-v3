@@ -1079,12 +1079,39 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
 
   const equityBaselineUsd = useMemo(() => pickBotRunEquityBaseline(stratCfg, demo), [stratCfg, demo]);
 
+  /** Baseline נפרד ללייב — equityNow בלייב מגיע מ-Polymarket CLOB (USDC אמיתי), אבל השרת
+   *  לוכד baseline מ-demo.equity_snapshot בתחילת bot_run. התוצאה: runPnl=equityNow_live - baseline_demo
+   *  חסר כל משמעות. במקום זה: שומרים את ה-equity הראשונה שנצפתה מ-livePortfolio אחרי תחילת bot_run,
+   *  ומשתמשים בה כ-baseline לחישוב ה-PnL בלייב. מתאפס עם כל מעבר off→semi/auto (כש-bot_run_started_ts משתנה).
+   */
+  const [liveBaselineUsd, setLiveBaselineUsd] = useState<number | null>(null);
+  const liveBaselineKeyRef = useRef<string>("");
+  useEffect(() => {
+    if (!isLive || stratCfg?.mode === "off") {
+      setLiveBaselineUsd(null);
+      liveBaselineKeyRef.current = "";
+      return;
+    }
+    const key = String(stratCfg?.bot_run_started_ts ?? "");
+    if (!key || key === "null") return;
+    const eq = livePortfolio?.equity_usd ?? livePortfolio?.balance_usd;
+    if (typeof eq !== "number" || !Number.isFinite(eq) || eq < 0) return;
+    if (key !== liveBaselineKeyRef.current) {
+      liveBaselineKeyRef.current = key;
+      setLiveBaselineUsd(eq);
+    }
+  }, [isLive, livePortfolio?.equity_usd, livePortfolio?.balance_usd, stratCfg?.bot_run_started_ts, stratCfg?.mode]);
+
   const runPnlUsd = useMemo(() => {
     if (stratCfg?.mode === "off") return null;
+    if (isLive) {
+      if (liveBaselineUsd == null) return null;
+      return equityNow - liveBaselineUsd;
+    }
     const base = equityBaselineUsd;
     if (base == null) return null;
     return equityNow - base;
-  }, [stratCfg?.mode, equityBaselineUsd, equityNow]);
+  }, [stratCfg?.mode, isLive, liveBaselineUsd, equityBaselineUsd, equityNow]);
 
   /** Wall-clock since enabling semi/auto; fallback ל-ui_runtime אם אין עדיין bot_run בשרת. */
   const botRunUptimeSec = useMemo(() => {
@@ -1431,6 +1458,13 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     streamPulseSec,
     pulseRingRgb,
     chartIdleCopy,
+    isLive,
+    liveAccountUsd: isLive
+      ? (typeof livePortfolio?.equity_usd === "number"
+          ? livePortfolio.equity_usd
+          : (typeof livePortfolio?.balance_usd === "number" ? livePortfolio.balance_usd : null))
+      : null,
+    demoBalanceUsd: typeof demo?.balance_usd === "number" ? demo.balance_usd : null,
   };
 
   if (isBroadcast) {

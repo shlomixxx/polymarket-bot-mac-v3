@@ -328,6 +328,11 @@ class DemoEngine:
             }
             if sid:
                 trade["session_id"] = sid
+            else:
+                # פוזיציה שנטענה מה-chain דרך reconcile — לא נפתחה ב-BUY של הריצה הזו.
+                # מסמנים כדי שה-UI לא יציג אותה כ«עסקה» ריקה ללא צד/משך, ושהסטטיסטיקה
+                # של הריצה לא תכלול אותה ב-win_rate (היתרה עצמה מתעדכנת רגיל).
+                trade["reconcile_origin"] = True
             if tr:
                 trade["peak_unrealized_pct"] = tr.get("high_watermark_pct")
                 trade["peak_ts"] = tr.get("high_watermark_ts")

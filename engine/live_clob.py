@@ -4,7 +4,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 import time
 from typing import Any, Iterable, Literal, Optional
 
@@ -13,6 +15,8 @@ import httpx
 POLYMARKET_DATA_API = "https://data-api.polymarket.com"
 
 SideName = Literal["BUY", "SELL"]
+OrderModeName = Literal["limit", "market"]
+MarketOrderTypeName = Literal["FOK", "FAK"]
 
 
 def _live_disabled_reason() -> Optional[str]:
@@ -154,7 +158,13 @@ def _normalize_usdc_amount(val: Any) -> Optional[float]:
 
 
 def _fetch_conditional_balance_shares(client: Any, token_id: str) -> Optional[float]:
-    """יתרת חוזי תוצאה (CONDITIONAL) ב-CLOB — אותה קידוד micro כמו USDC (6 עשרוניות)."""
+    """יתרת חוזי תוצאה (CONDITIONAL) ב-CLOB — 6 עשרוניות מיקרו תמיד.
+
+    ה-CLOB מחזיר את ה-balance כמספר שלם גולמי (כמו 4083) שמייצג 0.004083 חוזים.
+    לא משתמש ב-_normalize_usdc_amount כי ההיוריסטיקה שלו (סף 1e4) מחמיצה יתרות
+    קטנות (<$0.01) ומחזירה אותן ללא חילוק — קריטי לזיהוי "חוזי רפאים" אחרי
+    mill'oy חלקי של GTC.
+    """
     try:
         from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
         pcond = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=str(token_id))
@@ -162,7 +172,30 @@ def _fetch_conditional_balance_shares(client: Any, token_id: str) -> Optional[fl
         if not isinstance(raw, dict):
             return None
         bal = raw.get("balance") if raw.get("balance") is not None else raw.get("Balance")
-        return _normalize_usdc_amount(bal)
+        if bal is None:
+            return None
+        try:
+            x = float(bal)
+        except (TypeError, ValueError):
+            return None
+        return round(x / 1e6, 6)
+    except Exception:
+        return None
+
+
+async def fetch_chain_shares_for_token(token_id: str) -> Optional[float]:
+    """מחזיר את יתרת חוזי התוצאה בשרשרת לטוקן נתון (Polymarket CLOB), או None אם לא זמין.
+
+    מקור־אמת אמיתי (bypass ל-Data API שעלול להיות מאחר). משמש לסנכרון
+    p.contracts מיידי כשמקבלים insufficient_onchain_balance, כדי לא להסתמך
+    על reconcile שעלול להחזיר ערך מיושן או אפילו לנפח חזרה את הפוזיציה."""
+    def _sync() -> Optional[float]:
+        cl, err = build_trading_client()
+        if err or cl is None:
+            return None
+        return _fetch_conditional_balance_shares(cl, str(token_id))
+    try:
+        return await asyncio.to_thread(_sync)
     except Exception:
         return None
 
@@ -231,6 +264,7 @@ async def place_limit_order(
     except Exception as e:
         err = str(e)
         low = err.lower()
+        err_code: Optional[str] = None
         if "invalid signature" in low:
             err += (
                 " — בדקו: POLYMARKET_FUNDER=כתובת ה-proxy מהאתר (לא EOA); "
@@ -242,7 +276,11 @@ async def place_limit_order(
                 " — ב־SELL: ייתכן פחות חוזי תוצאה בשרשרת מבספר הפוזיציה הפנימי; "
                 "המערכת אמורה לכווץ את ההזמנה לפי יתרת ה-CLOB — נסו שוב אחרי reconcile."
             )
-        return {"ok": False, "error": err}
+            err_code = "insufficient_onchain_balance"
+        out: dict[str, Any] = {"ok": False, "error": err}
+        if err_code:
+            out["error_code"] = err_code
+        return out
 
     oid = None
     if isinstance(resp, dict):
@@ -250,6 +288,320 @@ async def place_limit_order(
     else:
         oid = str(resp)
     return {"ok": True, "order_id": oid, "raw": resp, "price": float(price), "size": float(order_size)}
+
+
+def _clamp_slippage_price(price: float, side: SideName, slippage_pct: float) -> float:
+    """
+    ממיר slippage_pct לתקרת מחיר חוקית עבור MarketOrderArgs.price:
+    - BUY: המחיר הכי גרוע = price * (1 + slip%), מוגבל ל-0.999
+    - SELL: המחיר הכי גרוע (הנמוך ביותר שנקבל) = price * (1 - slip%), מוגבל ל-0.001
+    """
+    p = float(price)
+    s = max(0.0, float(slippage_pct)) / 100.0
+    if side == "BUY":
+        return min(0.999, max(0.001, p * (1.0 + s)))
+    return min(0.999, max(0.001, p * (1.0 - s)))
+
+
+async def place_market_order(
+    token_id: str,
+    amount: float,
+    side: SideName,
+    *,
+    order_type: MarketOrderTypeName = "FOK",
+    slippage_cap_price: Optional[float] = None,
+) -> dict[str, Any]:
+    """
+    Market order דרך MarketOrderArgs + create_market_order + post_order(orderType=FOK|FAK).
+
+    - BUY: amount = **דולרים** (Polymarket ימיר לחוזים לפי ה-book).
+    - SELL: amount = **חוזים**.
+    - FOK: או הכל או כלום (לכניסה — אין חצי פוזיציה).
+    - FAK: סוגר כמה שאפשר, מבטל שארית (ליציאה).
+    - slippage_cap_price: המחיר הגרוע ביותר שמוכן לקבל (0..1). None = לא מגביל.
+    """
+    try:
+        from py_clob_client.clob_types import (
+            MarketOrderArgs,
+            OrderType,
+            PartialCreateOrderOptions,
+        )
+        from py_clob_client.order_builder.constants import BUY, SELL
+    except ImportError:
+        return {"ok": False, "error": "חסר py-clob-client (נסה: pip install -U py-clob-client)"}
+
+    client, err = build_trading_client()
+    if err:
+        return {"ok": False, "error": err}
+
+    amt = float(amount)
+    if amt <= 0:
+        return {"ok": False, "error": f"amount לא חיובי ({amt})"}
+
+    if side == "BUY":
+        # amount כבר בדולרים. תוספת 1% שוליים לעמלות/עיגול.
+        bal_ok, bal_err = check_balance_before_order(amt * 1.01)
+        if not bal_ok:
+            return {"ok": False, "error": bal_err}
+
+    try:
+        tick_size = client.get_tick_size(token_id)
+        neg_risk = client.get_neg_risk(token_id)
+    except Exception as e:
+        return {"ok": False, "error": f"שוק/טוקן: {e}"}
+
+    use_amount = amt
+    if side == "SELL":
+        avail = _fetch_conditional_balance_shares(client, str(token_id))
+        if avail is not None and use_amount > avail + 1e-9:
+            capped = max(0.0, min(use_amount, avail * (1.0 - 1e-8)))
+            if capped < 1e-8:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"אין מספיק יתרת טוקן ב-CLOB למכירה: זמין ~{avail:.4f} חוזים, "
+                        f"ביקשת {use_amount:.4f}"
+                    ),
+                }
+            use_amount = float(f"{capped:.6f}")
+
+    side_const = BUY if side == "BUY" else SELL
+    ot_const = OrderType.FAK if str(order_type).upper() == "FAK" else OrderType.FOK
+
+    args_kwargs: dict[str, Any] = {
+        "token_id": str(token_id),
+        "amount": float(use_amount),
+        "side": side_const,
+        "order_type": ot_const,
+    }
+    if slippage_cap_price is not None:
+        sc = float(slippage_cap_price)
+        if sc > 0:
+            args_kwargs["price"] = min(0.999, max(0.001, sc))
+    args = MarketOrderArgs(**args_kwargs)
+
+    opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+    try:
+        signed = client.create_market_order(args, opts)
+    except Exception as e:
+        return {"ok": False, "error": f"create_market_order: {e}"}
+
+    try:
+        resp = client.post_order(signed, orderType=ot_const)
+    except Exception as e:
+        err = str(e)
+        low = err.lower()
+        err_code: Optional[str] = None
+        if "invalid signature" in low:
+            err += (
+                " — בדקו: POLYMARKET_FUNDER=כתובת ה-proxy מהאתר (לא EOA); "
+                "נסו POLYMARKET_SIGNATURE_TYPE=2 אם החשבון דרך Gnosis Safe."
+            )
+        if "not enough balance" in low:
+            err += " — יתרה חסרה (USDC ל-BUY או חוזים ל-SELL)."
+            err_code = "insufficient_onchain_balance"
+        if "min" in low and "size" in low:
+            err += " — מתחת למינימום השוק (order_min_size)."
+            err_code = err_code or "min_order_size"
+        out: dict[str, Any] = {"ok": False, "error": err}
+        if err_code:
+            out["error_code"] = err_code
+        return out
+
+    oid = None
+    matched: Optional[float] = None
+    if isinstance(resp, dict):
+        oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
+        # 'matched' מכאן והלאה תמיד מבוטא ב-CHOCES (shares), לא ב-USDC, גם ל-SELL וגם ל-BUY.
+        # Polymarket מחזיר:
+        #   - SELL (taker): makingAmount = חוזים שמסרנו, takingAmount = USDC שקיבלנו
+        #   - BUY  (taker): makingAmount = USDC ששילמנו,   takingAmount = חוזים שקיבלנו
+        # עד לתיקון הזה, הקוד לקח תמיד takingAmount — דבר שחישב SELL בדולרים
+        # (1 share * 0.64 = 0.64 USDC) ולא בחוזים, וגרם לפער־ספר (phantom contracts).
+        if side == "SELL":
+            matched_raw = resp.get("makingAmount")
+            if matched_raw is None:
+                matched_raw = resp.get("size_matched") or resp.get("matched")
+        else:
+            matched_raw = resp.get("takingAmount")
+            if matched_raw is None:
+                matched_raw = resp.get("size_matched") or resp.get("matched")
+        if matched_raw is not None:
+            try:
+                matched = float(matched_raw)
+            except (TypeError, ValueError):
+                matched = None
+    else:
+        oid = str(resp)
+
+    return {
+        "ok": True,
+        "order_id": oid,
+        "raw": resp,
+        "side": side,
+        "order_type": str(order_type),
+        "amount": float(use_amount),
+        "matched": matched,
+    }
+
+
+async def _retry_market_sell_ladder(
+    token_id: str,
+    remaining_contracts: float,
+    *,
+    bid: float,
+    base_slippage_pct: float,
+    max_attempts: int = 3,
+    widen_factor: float = 1.5,
+    jitter_sec: tuple[float, float] = (0.15, 0.4),
+) -> dict[str, Any]:
+    """
+    Retry ladder ליציאה: אחרי FAK חלקי, מנסה עד max_attempts פעמים עם slippage מתרחב.
+    מחזיר dict מצטבר: {ok, sold_total_contracts, attempts, last_error?}.
+    """
+    sold_total = 0.0
+    last_error: Optional[str] = None
+    attempts_log: list[dict[str, Any]] = []
+
+    remaining = float(remaining_contracts)
+    slip_pct = float(base_slippage_pct)
+
+    for attempt in range(1, max_attempts + 1):
+        if remaining <= 1e-8:
+            break
+        slip_price = _clamp_slippage_price(bid, "SELL", slip_pct)
+        r = await place_market_order(
+            token_id,
+            remaining,
+            "SELL",
+            order_type="FAK",
+            slippage_cap_price=slip_price,
+        )
+        attempts_log.append({
+            "attempt": attempt,
+            "slip_pct": slip_pct,
+            "slip_price": slip_price,
+            "ok": bool(r.get("ok")),
+            "matched": r.get("matched"),
+            "error": r.get("error"),
+        })
+        if not r.get("ok"):
+            last_error = str(r.get("error") or "")
+            low = last_error.lower()
+            if "min" in low and "size" in low:
+                # שארית < min_order_size — לא ניתן למכור יותר דרך CLOB
+                break
+            # Rate limit / transient — exponential backoff עם jitter
+            await asyncio.sleep(random.uniform(*jitter_sec) * (2 ** (attempt - 1)))
+            slip_pct *= widen_factor
+            continue
+
+        matched = r.get("matched")
+        try:
+            matched_n = float(matched) if matched is not None else 0.0
+        except (TypeError, ValueError):
+            matched_n = 0.0
+        sold_total += matched_n
+        remaining = max(0.0, remaining - matched_n)
+        if remaining <= 1e-8:
+            break
+        # חלקי — מרחיבים slippage ונסים שוב
+        slip_pct *= widen_factor
+        await asyncio.sleep(random.uniform(*jitter_sec))
+
+    return {
+        "ok": sold_total > 0,
+        "sold_total_contracts": float(sold_total),
+        "remaining_contracts": float(remaining),
+        "attempts": attempts_log,
+        "last_error": last_error,
+    }
+
+
+async def place_entry_order(
+    token_id: str,
+    contracts: float,
+    price: float,
+    side: SideName,
+    *,
+    order_mode: OrderModeName = "limit",
+    entry_slippage_pct: float = 2.0,
+) -> dict[str, Any]:
+    """
+    כניסה (BUY בדרך כלל). dispatch לפי order_mode:
+    - "limit": place_limit_order (GTC). התנהגות קודמת — לא בוצע שינוי.
+    - "market": MarketOrderArgs FOK עם amount=contracts*price (דולרים) +
+      slippage cap = price * (1 + entry_slippage_pct%). FOK מבטיח שלא תהיה חצי-כניסה.
+    """
+    if order_mode == "market":
+        amount_usd = float(contracts) * float(price)
+        slip_price = _clamp_slippage_price(price, side, entry_slippage_pct)
+        r = await place_market_order(
+            token_id,
+            amount_usd,
+            side,
+            order_type="FOK",
+            slippage_cap_price=slip_price,
+        )
+        # יישור סכימת התגובה לפורמט של place_limit_order (price+size)
+        if r.get("ok"):
+            r["price"] = float(price)
+            r["size"] = float(contracts)
+        return r
+    return await place_limit_order(token_id, float(price), float(contracts), side)
+
+
+async def place_exit_order(
+    token_id: str,
+    contracts: float,
+    bid: float,
+    *,
+    order_mode: OrderModeName = "limit",
+    exit_slippage_pct: float = 5.0,
+    retry_max_attempts: int = 3,
+) -> dict[str, Any]:
+    """
+    יציאה (SELL). dispatch לפי order_mode:
+    - "limit": place_limit_order ב-bid. התנהגות קודמת.
+    - "market": FAK אגרסיבי עם slippage רחב + retry ladder אם התמלא חלקית.
+      מחזיר price+size מותאמים לחתימה הקודמת כדי שה-caller ימשיך לרשום record_live_sell.
+    """
+    if order_mode == "market":
+        slip_price = _clamp_slippage_price(bid, "SELL", exit_slippage_pct)
+        # נסיון ראשון FAK
+        r = await place_market_order(
+            token_id,
+            float(contracts),
+            "SELL",
+            order_type="FAK",
+            slippage_cap_price=slip_price,
+        )
+        matched_n = 0.0
+        if r.get("ok"):
+            try:
+                matched_n = float(r.get("matched") or 0.0)
+            except (TypeError, ValueError):
+                matched_n = 0.0
+
+        if r.get("ok") and matched_n < float(contracts) - 1e-6:
+            # חלקי — retry ladder
+            remaining = float(contracts) - matched_n
+            ladder = await _retry_market_sell_ladder(
+                token_id,
+                remaining,
+                bid=float(bid),
+                base_slippage_pct=exit_slippage_pct,
+                max_attempts=max(0, int(retry_max_attempts) - 1),
+            )
+            matched_n += float(ladder.get("sold_total_contracts") or 0.0)
+            r["ladder"] = ladder
+
+        if r.get("ok"):
+            r["price"] = float(bid)  # לצורך record_live_sell — המחיר החוקי שקיבלנו היה >= bid*(1-slip)
+            r["size"] = float(matched_n if matched_n > 0 else contracts)
+        return r
+
+    return await place_limit_order(token_id, float(bid), float(contracts), "SELL")
 
 
 def _clob_balance_hint(
