@@ -17,12 +17,26 @@ from typing import Any, Literal, Optional
 
 import httpx
 
+from atomic_io import atomic_write_json
 from order_validation import validate_contracts_for_market
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
 
 FEE_RATE = 0.002  # 0.2% לצד כהערכה
 
 Side = Literal["Up", "Down"]
+
+# לקוח HTTP משותף ל־mark_to_market (במקום AsyncClient חדש בכל קריאה — חוסך TLS והמתנה)
+_demo_clob_httpx: Optional[httpx.AsyncClient] = None
+
+
+def _get_demo_clob_httpx() -> httpx.AsyncClient:
+    global _demo_clob_httpx
+    if _demo_clob_httpx is None:
+        _demo_clob_httpx = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=3.0, read=8.0, write=8.0, pool=8.0),
+            limits=httpx.Limits(max_connections=24, max_keepalive_connections=12),
+        )
+    return _demo_clob_httpx
 
 
 @dataclass
@@ -112,8 +126,21 @@ POSITION_TRACKING_PATH_INTERVAL = 1.0  # שניות בין דגימות (מינ�
 POSITION_TRACKING_PATH_MIN_DELTA_PCT = 0.12  # דגום גם כשהשינוי >= X% (תנועות קטנות עדיין נרשמות עם האינטרוול)
 # קפיצה חדה (למשל +30% ל־-20% בין דגימות) — תמיד לרשום דגימה נוספת
 POSITION_TRACKING_PATH_FORCE_DELTA_PCT = 0.45
-# גלילה: נשמרות ה־N האחרונות (לא מפסיקים לדגום אחרי N)
-POSITION_TRACKING_PATH_MAX = 240
+# גלילה: נשמרות ה־N האחרונות (לא מפסיקים לדגום אחרי N).
+# לא משנה את מהירות הדגימה — רק אורך ההיסטוריה בגרף. ברירת מחדל 240 (כמו לפני ההרחבה).
+def _position_tracking_path_max() -> int:
+    default = 240
+    raw = os.environ.get("POSITION_TRACKING_PATH_MAX")
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = int(str(raw).strip(), 10)
+        return max(64, min(v, 10_000))
+    except ValueError:
+        return default
+
+
+POSITION_TRACKING_PATH_MAX = _position_tracking_path_max()
 
 # תנודתיות גבוהה בין טיקי mark_to_market מלאים → חלון דגימה אגרסיבית (יותר קריאות CLOB + צפוף path)
 VOLATILE_TICK_DELTA_PCT = 4.0
@@ -193,9 +220,35 @@ class DemoEngine:
             return float(eq)
         return float(self.state.balance_usd)
 
+    def _equity_marked_consistent(self) -> float:
+        """equity נקודתי בזמן אירוע מסחר — עקבי עם mark_to_market.
+
+        הנוסחה במארק היא ``balance + sum(bid * contracts * (1-FEE_RATE))`` עם ה-bid האחרון
+        של כל leg. חישוב חלופי לפי ``avg_cost`` (ללא הוספת עמלת יציאה) יוצר פער קבוע
+        כלפי מעלה אל מול נקודות mark, ומכאן spikes מדומים בגרף Run P&L. כאן בוחרים את
+        ה-bid מ-``last_mark.legs`` אם יש; לפוזיציה טרייה שעדיין לא מסומנת משתמשים ב-avg_cost
+        (הכי טוב שיש) עם אותו פקטור ``(1-FEE_RATE)`` כדי להישאר באותו "קנה־מידה" כמו מארק.
+        """
+        lm = self.state.last_mark or {}
+        legs_by_tid: dict[str, dict] = {}
+        for leg in lm.get("legs") or []:
+            tid = leg.get("token_id") if isinstance(leg, dict) else None
+            if isinstance(tid, str):
+                legs_by_tid[tid] = leg
+        value = 0.0
+        for p in self.state.positions:
+            leg = legs_by_tid.get(p.token_id)
+            bid: Optional[float] = None
+            if leg is not None:
+                b = leg.get("mark_bid")
+                if isinstance(b, (int, float)) and math.isfinite(float(b)) and float(b) > 0:
+                    bid = float(b)
+            price = bid if bid is not None else float(p.avg_cost)
+            value += price * float(p.contracts) * (1.0 - FEE_RATE)
+        return float(self.state.balance_usd) + value
+
     def save(self) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps(self.state.to_dict(), indent=2))
+        atomic_write_json(self.state_path, self.state.to_dict(), indent=2)
 
     def reset(self, balance: float = 10_000.0) -> None:
         """איפוס חשבון: יתרה חדשה, בלי פוזיציות, בלי סימוני מחיר — עסקאות ישנות נשמרות לדיסק (ניתוח v3)."""
@@ -398,7 +451,7 @@ class DemoEngine:
             created.append(trade)
 
         self.state.positions = keep
-        eq = self.state.balance_usd + sum(x.contracts * x.avg_cost for x in self.state.positions)
+        eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
         return created
@@ -492,7 +545,7 @@ class DemoEngine:
             self._session_by_token.pop(tid, None)
 
         self.state.positions = new_positions
-        eq = self.state.balance_usd + sum(x.contracts * x.avg_cost for x in self.state.positions)
+        eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
         return reconcile_trade
@@ -708,9 +761,7 @@ class DemoEngine:
         if context:
             trade.update(context)
         self.state.trades.append(trade)
-        eq = self.state.balance_usd + sum(
-            p.contracts * p.avg_cost for p in self.state.positions
-        )
+        eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
         return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
@@ -775,9 +826,7 @@ class DemoEngine:
         if context:
             trade.update(context)
         self.state.trades.append(trade)
-        eq = self.state.balance_usd + sum(
-            p.contracts * p.avg_cost for p in self.state.positions
-        )
+        eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
         return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
@@ -971,9 +1020,7 @@ class DemoEngine:
                 "potential_high_pct": None,
                 "potential_low_pct": None,
             }
-        eq = self.state.balance_usd + sum(
-            x.contracts * x.avg_cost for x in self.state.positions
-        )
+        eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
         return {
@@ -1058,9 +1105,7 @@ class DemoEngine:
                 "potential_high_pct": None,
                 "potential_low_pct": None,
             }
-        eq = self.state.balance_usd + sum(
-            x.contracts * x.avg_cost for x in self.state.positions
-        )
+        eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
         return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
@@ -1111,142 +1156,143 @@ class DemoEngine:
         if not self.state.positions:
             self.state.last_mark = {"equity": eq, "unrealized_usd": 0.0, "ts": now, "legs": []}
 
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            if self.state.positions:
-                for p in list(self.state.positions):
-                    bid: float | None = None
-                    try:
-                        from ws_price_stream import price_stream
-                        tp = price_stream.get_price(p.token_id)
-                        if tp and tp.bid is not None and (now - tp.ts) < 30.0:
-                            bid = tp.bid
-                    except Exception:
-                        pass
-                    if bid is None:
-                        r = await client.get(
-                            "https://clob.polymarket.com/book",
-                            params={"token_id": p.token_id},
-                            timeout=8.0,
-                        )
-                        if r.status_code != 200:
-                            continue
-                        bids = list((r.json().get("bids") or []))
-                        if not bids:
-                            continue
-                        try:
-                            bids.sort(key=lambda x: float(x["price"]), reverse=True)
-                        except Exception:
-                            pass
-                        bid = float(bids[0]["price"])
-                    leg_value = bid * p.contracts * (1 - FEE_RATE)
-                    leg_cost = p.avg_cost * p.contracts * (1 + FEE_RATE)
-                    leg_unreal = leg_value - leg_cost
-                    leg_unreal_pct = (leg_unreal / leg_cost * 100.0) if leg_cost > 0 else 0.0
-                    value += leg_value
-                    unreal += leg_unreal
-                    legs.append(
-                        {
-                            "side": p.side,
-                            "token_id": p.token_id,
-                            "contracts": p.contracts,
-                            "avg_cost": p.avg_cost,
-                            "mark_bid": bid,
-                            "leg_value": leg_value,
-                            "leg_unrealized": leg_unreal,
-                            "unrealized_pct": round(leg_unreal_pct, 2),
-                        }
-                    )
-                # אם CLOB החזיר שגיאה/בלי bids לכל הפוזיציות — לא לדרוס last_mark ב־legs ריק (הגרף נעלם)
-                stale_fallback = False
-                if not legs:
-                    prev_lm = self.state.last_mark or {}
-                    pl = prev_lm.get("legs") or []
-                    pos_ids = {p.token_id for p in self.state.positions}
-                    for x in pl:
-                        tid = x.get("token_id")
-                        if tid in pos_ids:
-                            d = dict(x)
-                            d["book_stale"] = True
-                            legs.append(d)
-                    stale_fallback = bool(legs)
-
-                if legs:
-                    if stale_fallback:
-                        prev_lm = self.state.last_mark or {}
-                        eq = float(prev_lm.get("equity") or self.state.balance_usd)
-                        unreal = float(prev_lm.get("unrealized_usd") or 0.0)
-                        self.state.last_mark = {
-                            "equity": eq,
-                            "unrealized_usd": unreal,
-                            "ts": now,
-                            "legs": legs,
-                            "book_stale": True,
-                        }
-                    else:
-                        eq = self.state.balance_usd + value
-                        self.state.last_mark = {"equity": eq, "unrealized_usd": unreal, "ts": now, "legs": legs}
-                        self.state.equity_history.append((now, eq))
-
-            # מעקב שיא/שפל פוטנציאלי — מה שקרה אחרי TP עד סיום החלון
-            to_remove = []
-            for tid, pe in list(self._post_exit_tracking.items()):
-                if now >= pe["window_end_ts"]:
-                    # סיום החלון — מעדכנים את העסקה ומסירים מהמעקב
-                    done_trade: Optional[dict] = None
-                    for t in reversed(self.state.trades):
-                        if t.get("token_id") == tid and t.get("type") == "SELL_TP":
-                            if pe.get("potential_high_pct") is not None:
-                                t["potential_peak_unrealized_pct"] = pe["potential_high_pct"]
-                            if pe.get("potential_low_pct") is not None:
-                                t["potential_trough_unrealized_pct"] = pe["potential_low_pct"]
-                            done_trade = t
-                            break
-                    if done_trade is not None:
-                        if (
-                            done_trade.get("settlement_btc_start") is None
-                            or done_trade.get("settlement_btc_end") is None
-                        ):
-                            await self._attach_window_btc_to_tp_trade(
-                                done_trade, side=str(done_trade.get("side") or "Up")
-                            )
-                        try:
-                            from run_logging import log_potential_window_closed
-
-                            log_potential_window_closed(done_trade)
-                        except Exception:
-                            pass
-                    to_remove.append(tid)
-                    continue
-                r = await client.get(
-                    "https://clob.polymarket.com/book",
-                    params={"token_id": tid},
-                    timeout=15.0,
-                )
-                if r.status_code != 200:
-                    continue
-                bids = list((r.json().get("bids") or []))
-                if not bids:
-                    continue
+        client = _get_demo_clob_httpx()
+        if self.state.positions:
+            for p in list(self.state.positions):
+                bid: float | None = None
                 try:
-                    bids.sort(key=lambda x: float(x["price"]), reverse=True)
+                    from ws_price_stream import price_stream
+
+                    tp = price_stream.get_price(p.token_id)
+                    if tp and tp.bid is not None and (now - tp.ts) < 30.0:
+                        bid = tp.bid
                 except Exception:
                     pass
-                bid = float(bids[0]["price"])
-                leg_val = bid * pe["contracts"] * (1 - FEE_RATE)
-                leg_cost = pe["leg_cost"]
-                upnl_pct = (leg_val - leg_cost) / leg_cost * 100.0 if leg_cost > 0 else 0.0
-                if pe["potential_high_pct"] is None or upnl_pct > pe["potential_high_pct"]:
-                    pe["potential_high_pct"] = upnl_pct
-                if pe["potential_low_pct"] is None or upnl_pct < pe["potential_low_pct"]:
-                    pe["potential_low_pct"] = upnl_pct
-                # עדכון העסקה בזמן אמת (להצגה ב-UI)
+                if bid is None:
+                    r = await client.get(
+                        "https://clob.polymarket.com/book",
+                        params={"token_id": p.token_id},
+                        timeout=8.0,
+                    )
+                    if r.status_code != 200:
+                        continue
+                    bids = list((r.json().get("bids") or []))
+                    if not bids:
+                        continue
+                    try:
+                        bids.sort(key=lambda x: float(x["price"]), reverse=True)
+                    except Exception:
+                        pass
+                    bid = float(bids[0]["price"])
+                leg_value = bid * p.contracts * (1 - FEE_RATE)
+                leg_cost = p.avg_cost * p.contracts * (1 + FEE_RATE)
+                leg_unreal = leg_value - leg_cost
+                leg_unreal_pct = (leg_unreal / leg_cost * 100.0) if leg_cost > 0 else 0.0
+                value += leg_value
+                unreal += leg_unreal
+                legs.append(
+                    {
+                        "side": p.side,
+                        "token_id": p.token_id,
+                        "contracts": p.contracts,
+                        "avg_cost": p.avg_cost,
+                        "mark_bid": bid,
+                        "leg_value": leg_value,
+                        "leg_unrealized": leg_unreal,
+                        "unrealized_pct": round(leg_unreal_pct, 2),
+                    }
+                )
+            # אם CLOB החזיר שגיאה/בלי bids לכל הפוזיציות — לא לדרוס last_mark ב־legs ריק (הגרף נעלם)
+            stale_fallback = False
+            if not legs:
+                prev_lm = self.state.last_mark or {}
+                pl = prev_lm.get("legs") or []
+                pos_ids = {p.token_id for p in self.state.positions}
+                for x in pl:
+                    tid = x.get("token_id")
+                    if tid in pos_ids:
+                        d = dict(x)
+                        d["book_stale"] = True
+                        legs.append(d)
+                stale_fallback = bool(legs)
+
+            if legs:
+                if stale_fallback:
+                    prev_lm = self.state.last_mark or {}
+                    eq = float(prev_lm.get("equity") or self.state.balance_usd)
+                    unreal = float(prev_lm.get("unrealized_usd") or 0.0)
+                    self.state.last_mark = {
+                        "equity": eq,
+                        "unrealized_usd": unreal,
+                        "ts": now,
+                        "legs": legs,
+                        "book_stale": True,
+                    }
+                else:
+                    eq = self.state.balance_usd + value
+                    self.state.last_mark = {"equity": eq, "unrealized_usd": unreal, "ts": now, "legs": legs}
+                    self.state.equity_history.append((now, eq))
+
+        # מעקב שיא/שפל פוטנציאלי — מה שקרה אחרי TP עד סיום החלון
+        to_remove = []
+        for tid, pe in list(self._post_exit_tracking.items()):
+            if now >= pe["window_end_ts"]:
+                # סיום החלון — מעדכנים את העסקה ומסירים מהמעקב
+                done_trade: Optional[dict] = None
                 for t in reversed(self.state.trades):
                     if t.get("token_id") == tid and t.get("type") == "SELL_TP":
-                        t["potential_peak_unrealized_pct"] = pe["potential_high_pct"]
-                        t["potential_trough_unrealized_pct"] = pe["potential_low_pct"]
+                        if pe.get("potential_high_pct") is not None:
+                            t["potential_peak_unrealized_pct"] = pe["potential_high_pct"]
+                        if pe.get("potential_low_pct") is not None:
+                            t["potential_trough_unrealized_pct"] = pe["potential_low_pct"]
+                        done_trade = t
                         break
-            for tid in to_remove:
-                self._post_exit_tracking.pop(tid, None)
+                if done_trade is not None:
+                    if (
+                        done_trade.get("settlement_btc_start") is None
+                        or done_trade.get("settlement_btc_end") is None
+                    ):
+                        await self._attach_window_btc_to_tp_trade(
+                            done_trade, side=str(done_trade.get("side") or "Up")
+                        )
+                    try:
+                        from run_logging import log_potential_window_closed
+
+                        log_potential_window_closed(done_trade)
+                    except Exception:
+                        pass
+                to_remove.append(tid)
+                continue
+            r = await client.get(
+                "https://clob.polymarket.com/book",
+                params={"token_id": tid},
+                timeout=15.0,
+            )
+            if r.status_code != 200:
+                continue
+            bids = list((r.json().get("bids") or []))
+            if not bids:
+                continue
+            try:
+                bids.sort(key=lambda x: float(x["price"]), reverse=True)
+            except Exception:
+                pass
+            bid = float(bids[0]["price"])
+            leg_val = bid * pe["contracts"] * (1 - FEE_RATE)
+            leg_cost = pe["leg_cost"]
+            upnl_pct = (leg_val - leg_cost) / leg_cost * 100.0 if leg_cost > 0 else 0.0
+            if pe["potential_high_pct"] is None or upnl_pct > pe["potential_high_pct"]:
+                pe["potential_high_pct"] = upnl_pct
+            if pe["potential_low_pct"] is None or upnl_pct < pe["potential_low_pct"]:
+                pe["potential_low_pct"] = upnl_pct
+            # עדכון העסקה בזמן אמת (להצגה ב-UI)
+            for t in reversed(self.state.trades):
+                if t.get("token_id") == tid and t.get("type") == "SELL_TP":
+                    t["potential_peak_unrealized_pct"] = pe["potential_high_pct"]
+                    t["potential_trough_unrealized_pct"] = pe["potential_low_pct"]
+                    break
+        for tid in to_remove:
+            self._post_exit_tracking.pop(tid, None)
 
         # עדכון שיא/שפל ומסלול לכל פוזיציה (גם פוזיציות שנטענו מ-disk ללא tracking)
         for leg in legs:

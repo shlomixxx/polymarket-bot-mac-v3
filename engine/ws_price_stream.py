@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -21,6 +22,22 @@ POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_INTERVAL_SEC = 8
 RECONNECT_DELAY_SEC = 1.0
 RECONNECT_MAX_DELAY_SEC = 15.0
+# אם לא הגיעה הודעה בזמן הזה — נסגור את ה-WS ונפתח מחדש (defensive against half-open).
+STALE_RECONNECT_SEC = 30.0
+# מתחת לסף הזה אנחנו מסמנים מחיר WS כ-"טרי" — מעל זה צרכן צריך לעשות fallback ל-HTTP.
+FRESH_PRICE_MAX_AGE_SEC = 5.0
+
+
+def _ssl_context_for_polymarket_ws() -> ssl.SSLContext:
+    """ב-macOS/Python לעיתים חסר bundle של CA — certifi (תלות של httpx) פותר SSLCertVerificationError."""
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass
+    return ctx
 
 
 @dataclass
@@ -117,6 +134,48 @@ class TokenPrice:
         return changed
 
 
+class FrontendStreamClient:
+    """לקוח UI יחיד: שומר רק את ההודעה האחרונה לכל token_id.
+
+    מטרה: לא לאבד עדכון מחיר של טוקן אחד בגלל שטוקן אחר זרק הודעות לתור.
+    כל broadcast מחליף את המצב הקודם של אותו טוקן (ה-FE צריך תמיד את הטרי).
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[str, str] = {}
+        self._event = asyncio.Event()
+        self._closed = False
+
+    def push(self, token_id: str, msg: str) -> None:
+        if self._closed:
+            return
+        self._pending[token_id] = msg
+        self._event.set()
+
+    async def drain(self) -> list[str]:
+        """ממתין להודעה אחת לפחות, ואז מחזיר את כל המעודכנים — אחד לטוקן."""
+        await self._event.wait()
+        msgs = list(self._pending.values())
+        self._pending.clear()
+        self._event.clear()
+        return msgs
+
+    async def drain_with_timeout(self, timeout: float) -> list[str]:
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return []
+        msgs = list(self._pending.values())
+        self._pending.clear()
+        self._event.clear()
+        return msgs
+
+    def close(self) -> None:
+        self._closed = True
+        self._pending.clear()
+        self._event.set()
+
+
 class PriceStreamManager:
     """Manages WebSocket connection to Polymarket and broadcasts to frontend clients."""
 
@@ -126,9 +185,10 @@ class PriceStreamManager:
         self._ws: Any = None
         self._task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
         self._running = False
         self._reconnect_delay = RECONNECT_DELAY_SEC
-        self._frontend_clients: set[asyncio.Queue] = set()
+        self._frontend_clients: set[FrontendStreamClient] = set()
         self._on_price_change_callbacks: list[Callable[[str, TokenPrice], None]] = []
         self._connected = False
         self._last_msg_ts: float = 0.0
@@ -143,8 +203,27 @@ class PriceStreamManager:
     def last_message_ts(self) -> float:
         return self._last_msg_ts
 
+    def is_stream_fresh(self, max_age_sec: float = FRESH_PRICE_MAX_AGE_SEC) -> bool:
+        """האם ה-WS חי וקיבל הודעה לאחרונה. שימוש לוגיקת מסחר ל-fallback ל-HTTP."""
+        if not self._connected:
+            return False
+        if self._last_msg_ts <= 0:
+            return False
+        return (time.time() - self._last_msg_ts) <= max_age_sec
+
     def get_price(self, token_id: str) -> Optional[TokenPrice]:
         return self._prices.get(token_id)
+
+    def get_fresh_price(
+        self, token_id: str, max_age_sec: float = FRESH_PRICE_MAX_AGE_SEC
+    ) -> Optional[TokenPrice]:
+        """מחזיר רק אם המחיר חדש מספיק; אחרת None — צרכן יפנה ל-HTTP fallback."""
+        tp = self._prices.get(token_id)
+        if tp is None or tp.ts <= 0:
+            return None
+        if (time.time() - tp.ts) > max_age_sec:
+            return None
+        return tp
 
     def get_best_bid_ask(self, token_id: str) -> tuple[Optional[float], Optional[float]]:
         tp = self._prices.get(token_id)
@@ -152,13 +231,17 @@ class PriceStreamManager:
             return None, None
         return tp.bid, tp.ask
 
-    def register_frontend_client(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=100)
-        self._frontend_clients.add(q)
-        return q
+    def register_frontend_client(self) -> FrontendStreamClient:
+        client = FrontendStreamClient()
+        self._frontend_clients.add(client)
+        return client
 
-    def unregister_frontend_client(self, q: asyncio.Queue) -> None:
-        self._frontend_clients.discard(q)
+    def unregister_frontend_client(self, client: FrontendStreamClient) -> None:
+        try:
+            client.close()
+        except Exception:
+            pass
+        self._frontend_clients.discard(client)
 
     def _broadcast_to_frontend(self, token_id: str, tp: TokenPrice) -> None:
         side_label = self._token_to_side.get(token_id, "unknown")
@@ -171,18 +254,11 @@ class PriceStreamManager:
             "mid": tp.mid,
             "ts": tp.ts,
         })
-        dead: list[asyncio.Queue] = []
-        for q in self._frontend_clients:
+        for client in list(self._frontend_clients):
             try:
-                q.put_nowait(msg)
-            except asyncio.QueueFull:
-                try:
-                    q.get_nowait()
-                    q.put_nowait(msg)
-                except Exception:
-                    dead.append(q)
-        for q in dead:
-            self._frontend_clients.discard(q)
+                client.push(token_id, msg)
+            except Exception:
+                self._frontend_clients.discard(client)
 
     async def subscribe_tokens(
         self,
@@ -272,6 +348,7 @@ class PriceStreamManager:
             ping_interval=None,
             ping_timeout=None,
             close_timeout=5,
+            ssl=_ssl_context_for_polymarket_ws(),
         ) as ws:
             self._ws = ws
             self._connected = True
@@ -287,6 +364,9 @@ class PriceStreamManager:
                 await ws.send(sub_msg)
 
             self._ping_task = asyncio.create_task(self._ping_loop(ws))
+            self._watchdog_task = asyncio.create_task(self._watchdog_loop(ws))
+            # אתחול שעון הודעות בזמן ההתחברות כך ש-watchdog לא יסגור מיידית.
+            self._last_msg_ts = time.time()
 
             try:
                 async for raw in ws:
@@ -311,6 +391,8 @@ class PriceStreamManager:
             finally:
                 if self._ping_task:
                     self._ping_task.cancel()
+                if self._watchdog_task:
+                    self._watchdog_task.cancel()
                 self._ws = None
                 self._connected = False
 
@@ -323,6 +405,31 @@ class PriceStreamManager:
                 except Exception:
                     break
         except asyncio.CancelledError:
+            pass
+
+    async def _watchdog_loop(self, ws: Any) -> None:
+        """אם אין הודעות > STALE_RECONNECT_SEC — סוגרים את ה-WS להכריח reconnect.
+
+        חשוב במיוחד כאשר ה-TCP חי אבל הצד השני "שותק" (half-open), מצב שבו
+        קריאת `async for raw in ws` לא תקפוץ לבד וה-strategy יראה מחירים stale.
+        """
+        try:
+            while True:
+                await asyncio.sleep(5)
+                age = time.time() - self._last_msg_ts if self._last_msg_ts > 0 else 0
+                if age > STALE_RECONNECT_SEC:
+                    print(
+                        f"[ws_price_stream] watchdog: no messages for {age:.1f}s — forcing reconnect",
+                        flush=True,
+                    )
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    break
+        except asyncio.CancelledError:
+            pass
+        except Exception:
             pass
 
     async def _handle_message(self, msg: dict[str, Any]) -> None:

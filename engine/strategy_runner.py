@@ -20,6 +20,9 @@ from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
 
 Mode = Literal["off", "semi", "auto"]
 
+# המתנה בין טיקים — ברירת מחדל מהירה יותר מ־0.25; ניתן לעדכן: STRATEGY_TICK_SLEEP_SEC=0.08
+_STRATEGY_TICK_SLEEP = max(0.05, min(float(os.environ.get("STRATEGY_TICK_SLEEP_SEC", "0.12")), 2.0))
+
 
 def _fmt_px(x: Optional[float]) -> str:
     """מחיר לשורת סטטוס — בלי nan/inf."""
@@ -87,6 +90,17 @@ class StrategyConfig:
     peak_retreat_exit_pct: float = 2.0
     # כמה retry לאחר FAK חלקי ביציאה (הרחבת slippage בכל retry)
     retry_max_attempts: int = 3
+    # Hold-to-Resolution: אחרי ריבוי DCA וכאשר הכיוון ברור (bid גבוה),
+    # לא לוקחים TP חלקי — מחזיקים עד סוף החלון כדי לקבל $1.00 ולכסות הפסדי DCA.
+    # stop-loss דינמי מגן אם bid נופל מתחת לממוצע הכניסה המשוקלל.
+    hold_to_resolution_enabled: bool = False
+    hold_to_resolution_min_dca_slices: int = 2
+    hold_to_resolution_min_price: float = 0.85
+    hold_to_resolution_stop_loss_enabled: bool = True
+    # גודל השקעה: "fixed" = סכום קבוע ב-$ (investment_usd);
+    # "percent" = אחוז מגודל החשבון (equity_snapshot) כפול investment_pct_of_portfolio.
+    investment_mode: Literal["fixed", "percent"] = "fixed"
+    investment_pct_of_portfolio: float = 5.0
 
 
 @dataclass
@@ -344,13 +358,35 @@ class StrategyRunner:
         if self.rt.strategy_first_buy_ts is None:
             self.rt.strategy_first_buy_ts = time.time()
 
+    def _investment_base_usd(self, cfg: StrategyConfig) -> float:
+        mode = str(getattr(cfg, "investment_mode", "fixed") or "fixed").lower()
+        if mode == "percent":
+            pct = float(getattr(cfg, "investment_pct_of_portfolio", 0.0) or 0.0)
+            if not math.isfinite(pct) or pct <= 0:
+                pct = 0.0
+            try:
+                equity = float(self.demo.equity_snapshot_usd())
+            except Exception:
+                equity = float(self.demo.state.balance_usd)
+            return max(0.0, equity) * (pct / 100.0)
+        return float(cfg.investment_usd)
+
+    def _investment_base_label(self, cfg: StrategyConfig) -> str:
+        mode = str(getattr(cfg, "investment_mode", "fixed") or "fixed").lower()
+        base = self._investment_base_usd(cfg)
+        if mode == "percent":
+            pct = float(getattr(cfg, "investment_pct_of_portfolio", 0.0) or 0.0)
+            return f"${base:.2f} ({pct:.1f}% מהתיק)"
+        return f"${base:.2f}"
+
     def _effective_investment_usd(self, cfg: StrategyConfig) -> float:
+        base = self._investment_base_usd(cfg)
         if not cfg.loss_recovery_enabled:
-            return float(cfg.investment_usd)
+            return base
         m = float(self.demo.state.loss_recovery_multiplier)
         if not math.isfinite(m) or m < 1.0:
             m = 1.0
-        return float(cfg.investment_usd) * m
+        return base * m
 
     def _live_trading_ok(self) -> bool:
         # kill-switch לשרת/פריסה בלבד — POLYMARKET_LIVE=0 חוסם לחלוטין שליחת לייב
@@ -396,7 +432,7 @@ class StrategyRunner:
                 if err not in sell_fail_msgs:
                     sell_fail_msgs.append(err)
                 continue
-            fill_sell = float(lo.get("price") or bid)
+            fill_sell = float(lo.get("fill_price") or lo.get("price") or bid)
             close_ctx = dict(context)
             close_ctx["reason"] = "EXPIRE_ACTIVE_CLOSE"
             close_ctx["execution"] = "live"
@@ -520,7 +556,7 @@ class StrategyRunner:
                     except Exception:
                         pass
                     return {"ok": False, "error": err}
-                fill = float(lo.get("price") or lim)
+                fill = float(lo.get("fill_price") or lo.get("price") or lim)
                 r = self.demo.record_live_buy(
                     p["side"],
                     str(p["token"]),
@@ -562,7 +598,7 @@ class StrategyRunner:
                 if cfg_a.loss_recovery_enabled:
                     eff_a = self._effective_investment_usd(cfg_a)
                     m_a = float(self.demo.state.loss_recovery_multiplier)
-                    lr_a = f" | שחזור הפסד: יעד אפקטיבי ${eff_a:.2f} (מכפיל {m_a:.2f}× על בסיס ${cfg_a.investment_usd:.2f})"
+                    lr_a = f" | שחזור הפסד: יעד אפקטיבי ${eff_a:.2f} (מכפיל {m_a:.2f}× על בסיס {self._investment_base_label(cfg_a)})"
                 self.rt.log_event(
                     (f"נכנס לעסקה (חצי־אוטו): {p['side']} ×{int(n_adj)} @ {float(price):.2f}{lr_a}"
                     if price is not None
@@ -608,7 +644,7 @@ class StrategyRunner:
                     err = lo.get("error", "כשל לייב")
                     self.rt.log(f"גידור לייב נכשל: {err}")
                     return {"ok": False, "error": err}
-                fill = float(lo.get("price") or ask_f)
+                fill = float(lo.get("fill_price") or lo.get("price") or ask_f)
                 r = self.demo.record_live_buy(
                     p["side"], str(p["token"]), n_adj, fill, context=ctx
                 )
@@ -646,7 +682,7 @@ class StrategyRunner:
                     log_error(repr(e), {"context": "_tick"})
                 except Exception:
                     pass
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(_STRATEGY_TICK_SLEEP)
 
     def _prune_trade_timestamps(self, now: float) -> None:
         """שומר רק עסקאות מהשעה האחרונה (למגבלת trades/hour)."""
@@ -890,9 +926,40 @@ class StrategyRunner:
             if b is None:
                 continue
             upnl = self.demo.unrealized_pnl_pct(p.token_id, b)
+            try:
+                b_cur = float(b)
+            except (TypeError, ValueError):
+                b_cur = 0.0
+            # ── Hold-to-Resolution ────────────────────────────────────────────
+            # אחרי N סלייסי DCA וכאשר bid ≥ סף ביטחון — לא מוציאים ב-TP.
+            # מחזיקים עד סוף החלון (settle → $1.00) כדי לכסות הפסדי DCA קודמים.
+            # חריג: בדקות האחרונות (freeze) תמיד מאפשרים יציאה רגילה אם יש רווח.
+            # גם עוקפים את Peak Watchdog במצב זה (אחרת "נסיגה" תסגור מוקדם).
+            hold_active = False
+            hold_stop_trigger = False
+            hold_stop_reason = ""
+            if (
+                cfg.hold_to_resolution_enabled
+                and gate_ctx != "freeze"
+                and self.rt.dca_done_slices >= max(0, int(cfg.hold_to_resolution_min_dca_slices))
+                and b_cur >= float(cfg.hold_to_resolution_min_price)
+            ):
+                hold_active = True
+                if cfg.hold_to_resolution_stop_loss_enabled:
+                    try:
+                        avg = float(p.avg_cost)
+                    except Exception:
+                        avg = 0.0
+                    if avg > 0 and b_cur < avg:
+                        hold_stop_trigger = True
+                        hold_stop_reason = (
+                            f"hold_stop_loss: bid {b_cur:.3f} < avg_cost {avg:.3f}"
+                        )
             tp_allowed = tp_allowed_base or (
                 dca_locked and upnl is not None and upnl >= cfg.dca_tp_override_pct
             )
+            if hold_active:
+                tp_allowed = False
             # ── Peak Watchdog ─────────────────────────────────────────────────
             # מעקב אחר שיא ה-bid ודגל "נגע ב-TP". אם נגע ואז נפל X% מהשיא → trigger יציאה.
             # מונע "פוזיציה שהייתה ברווח והפכה להפסד כי לא יצאנו ב-TP".
@@ -949,9 +1016,14 @@ class StrategyRunner:
             tp_trigger = (
                 tp_allowed and upnl is not None and upnl >= cfg.take_profit_pct * (1 + 2 * FEE_RATE)
             )
-            if tp_trigger or peak_trigger:
+            if tp_trigger or peak_trigger or hold_stop_trigger:
                 tp_ctx = dict(base_ctx)
-                if peak_trigger and not tp_trigger:
+                if hold_stop_trigger:
+                    tp_ctx["reason"] = f"HOLD_STOP {p.side}: {hold_stop_reason}"
+                    self.rt.log_event(
+                        f"Hold-to-Resolution stop-loss {p.side}: {hold_stop_reason}"
+                    )
+                elif peak_trigger and not tp_trigger:
                     tp_ctx["reason"] = f"PEAK_EXIT {p.side}: {peak_trigger_reason}"
                     self.rt.log_event(
                         f"Peak Watchdog יציאה {p.side}: {peak_trigger_reason} "
@@ -1037,7 +1109,7 @@ class StrategyRunner:
                                 except Exception as e:
                                     self.rt.log(f"reconcile מיידי נכשל: {e}")
                         continue
-                    fill_sell = float(lo.get("price") or bid_tp)
+                    fill_sell = float(lo.get("fill_price") or lo.get("price") or bid_tp)
                     sold_sz = float(lo.get("size") or pos_contracts)
                     r = await self.demo.record_live_sell(
                         p.token_id,
@@ -1175,7 +1247,7 @@ class StrategyRunner:
                         if not lo.get("ok"):
                             self.rt.log(f"גידור אוטו (לייב): {lo.get('error', 'כשל')}")
                             return
-                        fill_h = float(lo.get("price") or other_ask)
+                        fill_h = float(lo.get("fill_price") or lo.get("price") or other_ask)
                         r = self.demo.record_live_buy(
                             other_side,
                             str(other_token),
@@ -1194,14 +1266,23 @@ class StrategyRunner:
             return
 
         if gate == "intermediate":
-            # גם אם יש כבר פוזיציה קיימת (לדוגמה DCA), עדיין נעדכן את last_status כדי שלא ייראה "תקוע".
-            # היומן בפועל לא יספאם בגלל key קבוע.
-            if not (pos_u or pos_d):
-                msg = f"סטטוס: אזור ביניים ({min_left:.2f} דק׳) — בלי כניסות חדשות (מוגדר)"
+            # יש פוזיציה פתוחה + DCA פעיל עם סלייסים שנותרו → ממשיכים DCA גם באזור ביניים
+            has_open_position = pos_u or pos_d
+            dca_has_remaining = cfg.dca_enabled and self.rt.dca_done_slices < cfg.dca_slices
+            if has_open_position and dca_has_remaining:
+                self.rt.status(
+                    f"סטטוס: אזור ביניים ({min_left:.2f} דק׳) — ממשיך DCA ({self.rt.dca_done_slices}/{cfg.dca_slices})",
+                    key="intermediate_dca_continue",
+                    session_id=sid,
+                )
+                # לא עושים return — ממשיכים ללוגיקת הכניסה/DCA למטה
             else:
-                msg = f"סטטוס: אזור ביניים ({min_left:.2f} דק׳) — מנהל פוזיציה קיימת (אין כניסות חדשות)"
-            self.rt.status(msg, key="intermediate", session_id=sid)
-            return
+                if not has_open_position:
+                    msg = f"סטטוס: אזור ביניים ({min_left:.2f} דק׳) — בלי כניסות חדשות (מוגדר)"
+                else:
+                    msg = f"סטטוס: אזור ביניים ({min_left:.2f} דק׳) — מנהל פוזיציה קיימת (אין כניסות חדשות)"
+                self.rt.status(msg, key="intermediate", session_id=sid)
+                return
 
         if cfg.side_preference == "Down":
             if ask_d is None:
@@ -1264,18 +1345,36 @@ class StrategyRunner:
 
         price_usd = cfg.entry_price_cents / 100.0
         if cfg.dca_enabled:
-            # cap לכניסה הבאה: לא עוברים את המחיר הרצוי,
-            # ובסלייס הבא אנחנו גם מקיימים ירידה קשיחה מהכניסה הקודמת.
-            dca_drop_factor = 1.0
-            if cfg.dca_discount_enabled and cfg.dca_discount_pct > 0:
-                dca_drop_factor = max(0.0, 1.0 - (cfg.dca_discount_pct / 100.0))
-
+            # cap לכניסה הבאה: לא עוברים את המחיר הרצוי.
+            # בדיקת DCA discount מבוססת על Bid (ירידה מול עלות הפוזיציה),
+            # לא על Ask — כי ה-PnL שהמשתמש רואה מבוסס על Bid,
+            # וב-spread רחב ה-Ask יכול להישאר גבוה גם כשה-Bid כבר ירד מספיק.
             entry_cap_price = price_usd
-            if self.rt.dca_done_slices > 0 and self.rt.dca_last_fill_price:
-                entry_cap_price = min(
-                    price_usd,
-                    float(self.rt.dca_last_fill_price) * float(dca_drop_factor),
-                )
+
+            # בדיקת DCA discount לפי Bid: אם הפוזיציה ירדה מספיק מול עלות הכניסה
+            dca_bid_ok = True  # סלייס ראשון — תמיד מותר
+            if self.rt.dca_done_slices > 0 and cfg.dca_discount_enabled and cfg.dca_discount_pct > 0:
+                dca_bid_ok = False  # ברירת מחדל: חוסם עד שה-Bid יורד מספיק
+                pos_idx = self.demo._position_idx(token)
+                if pos_idx >= 0:
+                    p_dca = self.demo.state.positions[pos_idx]
+                    # שולפים bid עדכני לטוקן
+                    bid_now, _ = await fetch_best_bid_ask(str(token))
+                    if bid_now is not None and p_dca.avg_cost > 0:
+                        drop_pct = (p_dca.avg_cost - float(bid_now)) / p_dca.avg_cost * 100.0
+                        if drop_pct >= cfg.dca_discount_pct:
+                            dca_bid_ok = True
+                        else:
+                            wp = (" · ".join(wait_parts) + " · ") if wait_parts else ""
+                            self.rt.status(
+                                f"סטטוס: {wp}DCA ממתין לירידה — Bid {float(bid_now):.2f}$ "
+                                f"(ירידה {drop_pct:.1f}% מעלות {p_dca.avg_cost:.2f}$, "
+                                f"נדרש {cfg.dca_discount_pct:.0f}%)",
+                                key=f"dca_bid_wait:{token}:{self.rt.dca_done_slices}",
+                                session_id=self.demo._session_by_token.get(token),
+                                repeat_interval_sec=6.0,
+                            )
+                            return
             if entry_cap_price < MIN_LEGIT_SHARE_PRICE_USD or entry_cap_price > MAX_LEGIT_SHARE_PRICE_USD:
                 self.rt.status(
                     f"סטטוס: DCA — cap מחיר מחוץ לטווח ({entry_cap_price:.4f}$) — לא מוסיפים סלייס "
@@ -1485,7 +1584,7 @@ class StrategyRunner:
                     f"Ask בשוק {_fmt_px(ask)} · cap כניסה {float(entry_cap_price):.4f}$"
                 )
                 return
-            fill_a = float(lo.get("price") or lim)
+            fill_a = float(lo.get("fill_price") or lo.get("price") or lim)
             r = self.demo.record_live_buy(side, str(token), float(n), fill_a, context=entry_ctx)
         else:
             r = await self.demo.simulate_market_buy(
@@ -1507,7 +1606,7 @@ class StrategyRunner:
             dca_part = f" — DCA {self.rt.dca_done_slices}/{cfg.dca_slices}" if cfg.dca_enabled else ""
             lr_part = ""
             if cfg.loss_recovery_enabled:
-                lr_part = f" | שחזור הפסד: יעד אפקטיבי ${eff_inv_snapshot:.2f} (מכפיל {lr_mult_snapshot:.2f}× על בסיס ${cfg.investment_usd:.2f})"
+                lr_part = f" | שחזור הפסד: יעד אפקטיבי ${eff_inv_snapshot:.2f} (מכפיל {lr_mult_snapshot:.2f}× על בסיס {self._investment_base_label(cfg)})"
             self.rt.log_event(
                 (f"נכנס לעסקה (אוטומטי){dca_part}: {side} ×{n} @ {float(price):.2f}{lr_part}"
                 if price is not None

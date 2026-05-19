@@ -251,8 +251,8 @@ async def place_limit_order(
     opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
     side_const = BUY if side == "BUY" else SELL
 
-    try:
-        resp = client.create_and_post_order(
+    def _post_sync() -> Any:
+        return client.create_and_post_order(
             OrderArgs(
                 token_id=token_id,
                 price=float(price),
@@ -261,6 +261,17 @@ async def place_limit_order(
             ),
             opts,
         )
+
+    try:
+        # to_thread + wait_for: לא חוסם event loop; timeout מפורש מונע הזמנה "תלויה"
+        # כשהשרת איטי. 10s גם מתחשב בכל הנט-איטרציות הפנימיות של py-clob-client.
+        resp = await asyncio.wait_for(asyncio.to_thread(_post_sync), timeout=10.0)
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "error": "CLOB post_order timeout (10s) — סטטוס לא ידוע, לא מבצעים retry אוטומטי",
+            "error_code": "post_order_timeout",
+        }
     except Exception as e:
         err = str(e)
         low = err.lower()
@@ -381,13 +392,19 @@ async def place_market_order(
     args = MarketOrderArgs(**args_kwargs)
 
     opts = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
-    try:
-        signed = client.create_market_order(args, opts)
-    except Exception as e:
-        return {"ok": False, "error": f"create_market_order: {e}"}
+
+    def _build_and_post_sync() -> Any:
+        signed_local = client.create_market_order(args, opts)
+        return client.post_order(signed_local, orderType=ot_const)
 
     try:
-        resp = client.post_order(signed, orderType=ot_const)
+        resp = await asyncio.wait_for(asyncio.to_thread(_build_and_post_sync), timeout=10.0)
+    except asyncio.TimeoutError:
+        return {
+            "ok": False,
+            "error": "CLOB market order timeout (10s) — סטטוס לא ידוע, יתבצע reconcile",
+            "error_code": "post_order_timeout",
+        }
     except Exception as e:
         err = str(e)
         low = err.lower()
@@ -410,6 +427,7 @@ async def place_market_order(
 
     oid = None
     matched: Optional[float] = None
+    fill_price: Optional[float] = None
     if isinstance(resp, dict):
         oid = resp.get("orderID") or resp.get("order_id") or resp.get("id")
         # 'matched' מכאן והלאה תמיד מבוטא ב-CHOCES (shares), לא ב-USDC, גם ל-SELL וגם ל-BUY.
@@ -418,19 +436,30 @@ async def place_market_order(
         #   - BUY  (taker): makingAmount = USDC ששילמנו,   takingAmount = חוזים שקיבלנו
         # עד לתיקון הזה, הקוד לקח תמיד takingAmount — דבר שחישב SELL בדולרים
         # (1 share * 0.64 = 0.64 USDC) ולא בחוזים, וגרם לפער־ספר (phantom contracts).
-        if side == "SELL":
-            matched_raw = resp.get("makingAmount")
-            if matched_raw is None:
-                matched_raw = resp.get("size_matched") or resp.get("matched")
-        else:
-            matched_raw = resp.get("takingAmount")
-            if matched_raw is None:
-                matched_raw = resp.get("size_matched") or resp.get("matched")
-        if matched_raw is not None:
+        making_raw = resp.get("makingAmount")
+        taking_raw = resp.get("takingAmount")
+
+        def _to_float(v: Any) -> Optional[float]:
+            if v is None:
+                return None
             try:
-                matched = float(matched_raw)
+                return float(v)
             except (TypeError, ValueError):
-                matched = None
+                return None
+
+        making = _to_float(making_raw)
+        taking = _to_float(taking_raw)
+
+        if side == "SELL":
+            matched_raw = making_raw or resp.get("size_matched") or resp.get("matched")
+            if making is not None and taking is not None and making > 1e-9:
+                fill_price = taking / making
+        else:
+            matched_raw = taking_raw or resp.get("size_matched") or resp.get("matched")
+            if making is not None and taking is not None and taking > 1e-9:
+                fill_price = making / taking
+
+        matched = _to_float(matched_raw)
     else:
         oid = str(resp)
 
@@ -442,6 +471,7 @@ async def place_market_order(
         "order_type": str(order_type),
         "amount": float(use_amount),
         "matched": matched,
+        "fill_price": fill_price,
     }
 
 

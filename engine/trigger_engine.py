@@ -24,6 +24,7 @@ from typing import Any, Literal, Optional
 
 import httpx
 
+from atomic_io import atomic_write_text
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD
 
 FEE_RATE = 0.002  # 0.2% — תואם ל-demo_engine
@@ -140,8 +141,9 @@ class TriggerEngine:
     def _save_trigger_positions(self) -> None:
         """שמירת פוזיציות פתוחות לדיסק — שורד restart."""
         try:
-            _TRIGGER_POSITIONS_PATH.write_text(
-                json.dumps(self._trigger_positions, indent=2), encoding="utf-8"
+            atomic_write_text(
+                _TRIGGER_POSITIONS_PATH,
+                json.dumps(self._trigger_positions, indent=2),
             )
         except Exception:
             pass

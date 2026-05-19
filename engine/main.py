@@ -53,6 +53,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from atomic_io import atomic_write_text
 from btc_price import (
     PriceHistoryBuffer,
     fetch_btc_spot_usdt,
@@ -61,7 +62,14 @@ from btc_price import (
     fetch_window_start_end_btc_usd,
 )
 from demo_engine import DemoEngine
-from market_discovery import discover_active_btc_window, get_clob_book, seconds_until_window_end
+from market_discovery import (
+    discover_active_btc_window,
+    discovery_warmer_loop,
+    get_clob_book,
+    peek_window_timing_for_ui,
+    seconds_until_window_end,
+)
+from request_logger import init_request_logger, log_event as log_request_event, make_request_id
 from run_logging import (
     append_event,
     append_strategy_journal,
@@ -87,6 +95,8 @@ from trigger_engine import TriggerEngine, TriggerConfig
 from strategy_runner import StrategyConfig, StrategyRunner
 from tips_v2 import delete_run_folder_by_key, generate_tips_v2, list_run_folders_detailed
 from ws_price_stream import price_stream
+from analytics.api_routes import router as analytics_router
+from analytics.db_migration import ensure_analytics_tables, migrate_json_to_sqlite
 
 def _autoload_private_key_from_store() -> None:
     """טוען מפתח שמור (Keychain / Secret Service / Credential Manager) אל os.environ
@@ -160,12 +170,17 @@ def _clear_bot_run_session() -> None:
 
 
 def _ensure_bot_run_session_if_active() -> None:
-    """אם semi/auto פעיל אבל אין סשן (מנוע הופעל לפני העדכון, או מעבר מצב שלא נרשם) — מתחילים סשן עכשיו."""
-    if runner.rt.mode == "off":
+    """אם semi/auto/trigger פעיל אבל אין סשן — מתחילים סשן עכשיו."""
+    if runner.rt.mode == "off" and not getattr(trigger.config, "active", False):
         return
     global _bot_run_started_ts
     if _bot_run_started_ts is None:
         _start_bot_run_session()
+
+
+def _any_engine_active() -> bool:
+    """True if either the strategy runner or the quick-trade trigger engine is running."""
+    return runner.rt.mode != "off" or bool(getattr(trigger.config, "active", False))
 
 
 def _bot_run_win_rate_stats() -> dict[str, Any]:
@@ -230,8 +245,9 @@ def _save_trigger_config() -> None:
         from dataclasses import asdict
         data = asdict(trigger.config)
         data.pop("active", None)  # לא שומרים active — תמיד מתחיל כבוי (אלא אם auto_start)
-        TRIGGER_CONFIG_PERSISTED_PATH.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        atomic_write_text(
+            TRIGGER_CONFIG_PERSISTED_PATH,
+            json.dumps(data, ensure_ascii=False, indent=2),
         )
     except Exception as e:
         print(f"[polymarket-bot] אזהרה: לא ניתן לשמור trigger config — {e}", flush=True)
@@ -258,6 +274,9 @@ def _load_trigger_config() -> None:
             else:
                 c.active = True
                 trigger.status = "הופעל אוטומטית"
+                # מבטיח שדף השידור יציג נתונים מיד עם עליית התהליך.
+                if _bot_run_started_ts is None:
+                    _start_bot_run_session()
     except Exception as e:
         print(f"[polymarket-bot] אזהרה: לא ניתן לטעון trigger config — {e}", flush=True)
 
@@ -343,23 +362,57 @@ def _save_persisted_config() -> None:
             "peak_watchdog_enabled": getattr(c, "peak_watchdog_enabled", True),
             "peak_retreat_exit_pct": getattr(c, "peak_retreat_exit_pct", 2.0),
             "retry_max_attempts": getattr(c, "retry_max_attempts", 3),
+            "hold_to_resolution_enabled": bool(getattr(c, "hold_to_resolution_enabled", False)),
+            "hold_to_resolution_min_dca_slices": int(getattr(c, "hold_to_resolution_min_dca_slices", 2)),
+            "hold_to_resolution_min_price": float(getattr(c, "hold_to_resolution_min_price", 0.85)),
+            "hold_to_resolution_stop_loss_enabled": bool(getattr(c, "hold_to_resolution_stop_loss_enabled", True)),
+            "investment_mode": str(getattr(c, "investment_mode", "fixed")),
+            "investment_pct_of_portfolio": float(getattr(c, "investment_pct_of_portfolio", 5.0)),
             "mode": runner.rt.mode,
             # מצב "כסף אמיתי" נשלט מהממשק — נשמר בין הפעלות אבל נגדר ע"י POLYMARKET_LIVE env בפריסה.
             "live_trading": bool(getattr(runner.rt, "live_trading", False)),
         }
-        CONFIG_PERSISTED_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(CONFIG_PERSISTED_PATH, json.dumps(data, ensure_ascii=False, indent=2))
     except Exception as e:
         print(f"[polymarket-bot] אזהרה: לא ניתן לשמור config — {e}", flush=True)
 _snapshot_task: Optional[asyncio.Task] = None
 _history_recorder_task: Optional[asyncio.Task] = None
 _ws_subscription_task: Optional[asyncio.Task] = None
+_discovery_warmer_task: Optional[asyncio.Task] = None
+
+
+async def _supervise(name: str, coro_factory, restart_delay: float = 3.0) -> None:
+    """עוטף לולאת רקע ב-restart loop. אם הלולאה קורסת — חוזרים אחרי delay במקום ליפול בשקט.
+
+    coro_factory הוא callable שמחזיר coroutine חדש בכל ריצה (כי coroutine נצרך פעם אחת).
+    """
+    while True:
+        try:
+            await coro_factory()
+            print(f"[supervise] {name} exited cleanly", flush=True)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(
+                f"[supervise] {name} crashed: {e!r} — restarting in {restart_delay}s",
+                flush=True,
+            )
+            try:
+                append_event("background_task_crash", {"name": name, "error": str(e)[:200]})
+            except Exception:
+                pass
+            try:
+                await asyncio.sleep(restart_delay)
+            except asyncio.CancelledError:
+                raise
 
 
 async def _ws_subscription_loop(interval: float = 5.0) -> None:
     """Keeps WebSocket subscriptions in sync with the active market tokens."""
     last_up = ""
     last_down = ""
-    await asyncio.sleep(2.0)
+    await asyncio.sleep(0.5)
     while True:
         try:
             m = await discover_active_btc_window(runner.rt.config.btc_window)
@@ -399,7 +452,7 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
     prev_slug: str = ""
     prev_window_sec: int = 300
 
-    await asyncio.sleep(5.0)  # המתנה קצרה לאחר עלייה
+    await asyncio.sleep(1.5)  # המתנה קצרה לאחר עלייה
 
     while True:
         try:
@@ -535,7 +588,7 @@ def _count_strategy_run_dirs() -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _history_recorder_task, _ws_subscription_task
+    global _snapshot_task, _history_recorder_task, _ws_subscription_task, _discovery_warmer_task
     _ensure_log_run_dir()
     n_snap = _count_strategy_run_dirs()
     print(
@@ -549,16 +602,29 @@ async def lifespan(app: FastAPI):
     runner.rt.mode = "off"
     # Start real-time WebSocket price stream from Polymarket CLOB
     price_stream.start()
-    _ws_subscription_task = asyncio.create_task(_ws_subscription_loop(5.0))
+    _ws_subscription_task = asyncio.create_task(
+        _supervise("ws_subscription_loop", lambda: _ws_subscription_loop(5.0))
+    )
+    # רענון רקע של גילוי שוק — דואג שהקאש לא יזדקן ושפניות UI לא ימתינו ל־Gamma איטי.
+    _discovery_warmer_task = asyncio.create_task(
+        _supervise(
+            "discovery_warmer_loop",
+            lambda: discovery_warmer_loop(lambda: runner.rt.config.btc_window, interval_sec=10.0),
+        )
+    )
     runner.start_loop()
     trigger.start_loop()
-    _history_recorder_task = asyncio.create_task(auto_history_recorder_loop(10.0))
+    _history_recorder_task = asyncio.create_task(
+        _supervise("auto_history_recorder_loop", lambda: auto_history_recorder_loop(10.0))
+    )
     if log_run_dir():
         write_engine_startup(runner, demo)
         write_strategy_journal_header(runner, demo)
         runner.rt.log_listeners.append(append_strategy_journal)
         append_event("lifespan_start", {"log_run_dir": str(log_run_dir())})
-        _snapshot_task = asyncio.create_task(periodic_snapshot_loop(runner, demo, 60.0))
+        _snapshot_task = asyncio.create_task(
+            _supervise("periodic_snapshot_loop", lambda: periodic_snapshot_loop(runner, demo, 60.0))
+        )
     yield
     if _snapshot_task:
         _snapshot_task.cancel()
@@ -581,6 +647,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         _history_recorder_task = None
+    if _discovery_warmer_task:
+        _discovery_warmer_task.cancel()
+        try:
+            await _discovery_warmer_task
+        except asyncio.CancelledError:
+            pass
+        _discovery_warmer_task = None
     price_stream.stop()
     trigger.stop_loop()
     runner.stop_loop()
@@ -599,6 +672,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Request logger: writes every HTTP request to engine/logs/requests.jsonl.
+# Disable with LOG_REQUESTS=0. Also exposes /api/_log/client-request for the frontend.
+init_request_logger(app)
+
+# ── V3 Analytics ────────────────────────────────────────────────────────────
+app.include_router(analytics_router)
+# Auto-create analytics tables on startup; migration runs on first /api/analytics/migrate call
+try:
+    ensure_analytics_tables()
+except Exception as _e:
+    print(f"[polymarket-bot] analytics tables init warning: {_e}", flush=True)
+
 
 @app.get("/api/health")
 async def health_get():
@@ -613,20 +698,41 @@ async def health_head():
 
 @app.get("/api/market/current")
 async def market_current():
-    m = await discover_active_btc_window(runner.rt.config.btc_window)
+    # ‎discover_active_btc_window כבר מבצע wait_for פנימי של 8s + stale-on-error fallback.
+    # ה־wait_for החיצוני (10s) הוא שכבת בטיחות נוספת בלבד למקרה שהלוק הפנימי תקוע.
+    try:
+        m = await asyncio.wait_for(
+            discover_active_btc_window(runner.rt.config.btc_window), timeout=10.0
+        )
+    except asyncio.TimeoutError:
+        m = None
     if not m:
-        raise HTTPException(404, "לא נמצא שוק פעיל")
+        raise HTTPException(503, "שוק פעיל לא זמין כרגע — נסה שוב בעוד מספר שניות")
     global last_epoch_for_open, cached_open, cached_ptb_source
     if m.epoch != last_epoch_for_open:
         last_epoch_for_open = m.epoch
-        # Price to Beat = מחיר בתחילת החלון — לא latestRound של האורקל (זה גרם להסטות גדולות).
-        ptb = await fetch_chainlink_btc_usd_polygon_at_window_start(m.epoch)
-        if ptb is not None:
-            cached_open = ptb
-            cached_ptb_source = "chainlink_polygon_window"
-        else:
-            cached_open = await fetch_open_price_at_window_start(m.epoch)
+        # קודם Binance (מהיר ויציב) כדי שלא לחסום את ה-endpoint; שדרוג ל-Chainlink ברקע אם יזמין.
+        try:
+            cached_open = await asyncio.wait_for(
+                fetch_open_price_at_window_start(m.epoch), timeout=3.0
+            )
             cached_ptb_source = "binance_1m_fallback"
+        except Exception:
+            cached_open = None
+            cached_ptb_source = "binance_1m_fallback"
+        # שדרוג Chainlink ברקע — לא מעכב את התשובה; אם יחזור ערך, יוחל בקריאה הבאה.
+        async def _upgrade_to_chainlink(epoch: int) -> None:
+            global cached_open, cached_ptb_source, last_epoch_for_open
+            try:
+                ptb = await asyncio.wait_for(
+                    fetch_chainlink_btc_usd_polygon_at_window_start(epoch), timeout=10.0
+                )
+            except Exception:
+                return
+            if ptb is not None and last_epoch_for_open == epoch:
+                cached_open = ptb
+                cached_ptb_source = "chainlink_polygon_window"
+        asyncio.create_task(_upgrade_to_chainlink(m.epoch))
     note_chainlink = (
         "ייחוס: סיבוב Chainlink BTC/USD על Polygon שעודכן עד לפתיחת החלון (קרוב לפיד האונ־צ׳יין). "
         "באתר Polymarket מוצג לעיתים Chainlink Data Streams — עשוי להסטות סנטים/דולרים בודדים. "
@@ -707,9 +813,19 @@ def _best_book_prices(book: Optional[dict[str, Any]]) -> dict[str, Any]:
 async def market_orderbook_summary():
     """סיכום מחירי חוזה (bid/ask/mid) לצד Up ו-Down לשוק BTC Up/Down הפעיל (לפי הגדרת btc_window)."""
     global last_orderbook_summary, last_orderbook_summary_ts
-    m = await discover_active_btc_window(runner.rt.config.btc_window)
-    if not m:
-        raise HTTPException(404, "לא נמצא שוק פעיל")
+    try:
+        m = await asyncio.wait_for(
+            discover_active_btc_window(runner.rt.config.btc_window), timeout=10.0
+        )
+    except asyncio.TimeoutError:
+        m = None
+    if m is None:
+        # נחזיר את הקאש האחרון אם יש (גם אם פג ה-TTL) — עדיף על שגיאה ל-UI.
+        if last_orderbook_summary is not None:
+            stale = dict(last_orderbook_summary)
+            stale["source"] = "stale"
+            return stale
+        raise HTTPException(503, "שוק פעיל לא זמין כרגע — נסה שוב בעוד מספר שניות")
 
     now = time.time()
     # Try WebSocket cache first — zero-latency response
@@ -752,8 +868,18 @@ async def market_orderbook_summary():
         degraded_reason: Optional[str] = None
         client = _get_shared_httpx()
         try:
-            up_book = await get_clob_book(client, m.token_up)
-            down_book = await get_clob_book(client, m.token_down)
+            # בקשות Up/Down במקביל — חוסכות חצי מזמן ה-round-trip ומונעות timeout.
+            # עטיפת asyncio.wait_for קובעת תקרה אחידה כך שה-endpoint לא יחרוג מעבר ל-10s
+            # (לקוח ב-UI מחכה עד 15s — נותר מרווח להחזרת fallback מהקאש).
+            up_book, down_book = await asyncio.wait_for(
+                asyncio.gather(
+                    get_clob_book(client, m.token_up),
+                    get_clob_book(client, m.token_down),
+                ),
+                timeout=6.0,
+            )
+        except asyncio.TimeoutError:
+            degraded_reason = "clob_timeout"
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else None
             degraded_reason = f"clob_http_{status}" if status is not None else "clob_http_error"
@@ -776,7 +902,12 @@ async def market_orderbook_summary():
                 fallback["degraded"] = True
                 fallback["degraded_reason"] = degraded_reason
                 fallback["stale"] = True
+                # מעדכנים את חותמת הזמן גם בכשל — כך בקשות מקביליות שיכנסו תוך ה-TTL
+                # יקבלו fallback מהיר במקום לשחזר מחדש את הקריאה האיטית ל-CLOB
+                last_orderbook_summary_ts = now
                 return fallback
+            # אין cache קודם — נשמור תוצאה ריקה לזמן קצר כדי למנוע thundering herd
+            last_orderbook_summary_ts = now
         else:
             last_orderbook_summary = dict(result)
             last_orderbook_summary_ts = now
@@ -799,9 +930,14 @@ async def demo_state():
 
 @app.get("/api/demo/snapshot")
 async def demo_snapshot():
-    """Lightweight snapshot — balance + last_mark + positions only, no mark_to_market call.
-    Designed for fast 500ms polling to keep P&L display fresh without heavy CLOB calls."""
+    """Lightweight snapshot — balance + last_mark + positions + recent trades/equity slices.
+    Designed for fast 500ms polling: keeps P&L display fresh and lets the broadcast chart
+    and LAST TRADES appear within 500ms of a page refresh (without heavy CLOB calls)."""
     s = demo.state
+    bw = runner.rt.config.btc_window
+    if bw not in ("5m", "15m"):
+        bw = "5m"
+    market_timing = peek_window_timing_for_ui(bw)
     return {
         "balance_usd": s.balance_usd,
         "positions": [
@@ -814,9 +950,15 @@ async def demo_snapshot():
             for p in s.positions
         ],
         "last_mark": s.last_mark,
+        "trades": s.trades[-400:],
+        "equity_history": s.equity_history[-2000:],
         "bot_run_started_ts": _bot_run_started_ts,
         "bot_run_equity_baseline_usd": _bot_run_equity_baseline_usd,
         "ui_runtime_equity_baseline_usd": float(_ui_runtime_equity_baseline_usd),
+        "bot_run_win_rate_pct": _bot_run_win_rate_stats().get("bot_run_win_rate_pct"),
+        "bot_run_exit_trades_n": _bot_run_win_rate_stats().get("bot_run_exit_trades_n"),
+        "bot_run_wins_n": _bot_run_win_rate_stats().get("bot_run_wins_n"),
+        "market_timing": market_timing,
     }
 
 
@@ -829,7 +971,7 @@ async def demo_reset(body: ResetBody):
     demo.reset(body.balance)
     runner.sync_runtime_after_demo_positions_cleared()
     _reset_ui_runtime("demo_reset")
-    if runner.rt.mode == "off":
+    if not _any_engine_active():
         _clear_bot_run_session()
     else:
         _start_bot_run_session()
@@ -843,7 +985,7 @@ async def demo_clear_stats():
     await demo.reset_stats_and_flatten_positions()
     runner.sync_runtime_after_demo_positions_cleared()
     _reset_ui_runtime("demo_clear_stats")
-    if runner.rt.mode == "off":
+    if not _any_engine_active():
         _clear_bot_run_session()
     else:
         _start_bot_run_session()
@@ -939,6 +1081,12 @@ class ConfigBody(BaseModel):
     peak_watchdog_enabled: bool = True
     peak_retreat_exit_pct: float = 2.0
     retry_max_attempts: int = 3
+    hold_to_resolution_enabled: bool = False
+    hold_to_resolution_min_dca_slices: int = 2
+    hold_to_resolution_min_price: float = 0.85
+    hold_to_resolution_stop_loss_enabled: bool = True
+    investment_mode: str = "fixed"
+    investment_pct_of_portfolio: float = 5.0
 
 
 @app.post("/api/strategy/config")
@@ -968,6 +1116,14 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "peak_retreat_exit_pct must be between 0 and 50")
     if int(body.retry_max_attempts) < 0 or int(body.retry_max_attempts) > 10:
         raise HTTPException(400, "retry_max_attempts must be between 0 and 10")
+    if body.investment_mode not in ("fixed", "percent"):
+        raise HTTPException(400, "investment_mode must be 'fixed' or 'percent'")
+    if float(body.investment_pct_of_portfolio) < 0 or float(body.investment_pct_of_portfolio) > 100:
+        raise HTTPException(400, "investment_pct_of_portfolio must be between 0 and 100")
+    if int(body.hold_to_resolution_min_dca_slices) < 0:
+        raise HTTPException(400, "hold_to_resolution_min_dca_slices must be >= 0")
+    if float(body.hold_to_resolution_min_price) < 0 or float(body.hold_to_resolution_min_price) > 1:
+        raise HTTPException(400, "hold_to_resolution_min_price must be between 0 and 1")
     c = runner.rt.config
     for k, v in body.model_dump().items():
         if hasattr(c, k):
@@ -1027,6 +1183,12 @@ async def get_strategy_config():
         "peak_watchdog_enabled": getattr(c, "peak_watchdog_enabled", True),
         "peak_retreat_exit_pct": getattr(c, "peak_retreat_exit_pct", 2.0),
         "retry_max_attempts": getattr(c, "retry_max_attempts", 3),
+        "hold_to_resolution_enabled": bool(getattr(c, "hold_to_resolution_enabled", False)),
+        "hold_to_resolution_min_dca_slices": int(getattr(c, "hold_to_resolution_min_dca_slices", 2)),
+        "hold_to_resolution_min_price": float(getattr(c, "hold_to_resolution_min_price", 0.85)),
+        "hold_to_resolution_stop_loss_enabled": bool(getattr(c, "hold_to_resolution_stop_loss_enabled", True)),
+        "investment_mode": str(getattr(c, "investment_mode", "fixed")),
+        "investment_pct_of_portfolio": float(getattr(c, "investment_pct_of_portfolio", 5.0)),
         "mode": runner.rt.mode,
         "last_status": runner.rt.last_status,
         # מפתח אחרון מ-status() — נוח למיפוי אנגלי בדף שידור/OBS
@@ -1056,9 +1218,12 @@ async def strategy_mode(body: ModeBody):
     runner.rt.mode = body.mode  # type: ignore
     if body.mode == "off":
         runner.rt.strategy_first_buy_ts = None
-        _clear_bot_run_session()
+        # שומר את הסשן אם "מסחר מהיר" עדיין פעיל — דף השידור צריך להמשיך להציג נתונים.
+        if not getattr(trigger.config, "active", False):
+            _clear_bot_run_session()
     elif prev == "off":
-        _start_bot_run_session()
+        if _bot_run_started_ts is None:
+            _start_bot_run_session()
     if body.mode == "off" and prev != "off":
         _reset_ui_runtime("strategy_mode_off")
     # כשעוברים מ-off למצב פעיל: מנקים יומן כדי שה-UI יציג "היסטוריה חדשה"
@@ -1140,9 +1305,9 @@ async def strategy_tips_v2(max_runs: int = 50, min_samples: int = 50, use_guardr
         live_trades=live_trades,
     )
     try:
-        TIPS_V2_CACHE_PATH.write_text(
+        atomic_write_text(
+            TIPS_V2_CACHE_PATH,
             json.dumps({"cached_at": now, "cache_key": cache_key, "data": data}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
     except Exception:
         pass
@@ -1570,6 +1735,9 @@ async def trigger_activate():
     # בתוך אותו epoch של חלון BTC (אחרת _dca_completed_epoch נועל את ההפעלה).
     trigger._dca_completed_epoch = -1
     trigger.status = "מופעל"
+    # מבטיח שדף השידור יציג נתונים גם כשמפעילים רק "מסחר מהיר" (בלי semi/auto).
+    if _bot_run_started_ts is None:
+        _start_bot_run_session()
     append_event("trigger_activated", {
         "mode": trigger.config.mode,
         "btc_window": trigger.config.btc_window,
@@ -1602,6 +1770,9 @@ async def trigger_deactivate():
     trigger.config.active = False
     trigger._dca_running = False
     trigger.status = "כבוי"
+    # אם גם semi/auto כבוי — סוגרים את סשן השידור.
+    if runner.rt.mode == "off":
+        _clear_bot_run_session()
     append_event("trigger_deactivated", {
         "mode": trigger.config.mode,
         "triggers_this_window": trigger.triggers_this_window,
@@ -1894,7 +2065,19 @@ async def prices_realtime():
 async def ws_prices_endpoint(websocket: WebSocket):
     """WebSocket endpoint: streams real-time price updates to the frontend."""
     await websocket.accept()
-    q = price_stream.register_frontend_client()
+    rid = make_request_id()
+    ws_start = time.time()
+    client_ip = websocket.client.host if websocket.client else None
+    msgs_sent = 0
+    log_request_event(
+        source="server",
+        kind="ws_open",
+        request_id=rid,
+        method="WS",
+        path="/ws/prices",
+        client_ip=client_ip,
+    )
+    client = price_stream.register_frontend_client()
     try:
         # Send initial snapshot
         for tid in list(price_stream._subscribed_tokens):
@@ -1910,21 +2093,35 @@ async def ws_prices_endpoint(websocket: WebSocket):
                     "mid": tp.mid,
                     "ts": tp.ts,
                 })
+                msgs_sent += 1
         while True:
-            try:
-                msg = await asyncio.wait_for(q.get(), timeout=15.0)
-                await websocket.send_text(msg)
-            except asyncio.TimeoutError:
+            msgs = await client.drain_with_timeout(15.0)
+            if not msgs:
                 try:
                     await websocket.send_json({"type": "ping"})
+                    msgs_sent += 1
                 except Exception:
                     break
+                continue
+            for msg in msgs:
+                await websocket.send_text(msg)
+                msgs_sent += 1
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
-        price_stream.unregister_frontend_client(q)
+        price_stream.unregister_frontend_client(client)
+        log_request_event(
+            source="server",
+            kind="ws_close",
+            request_id=rid,
+            method="WS",
+            path="/ws/prices",
+            duration_ms=round((time.time() - ws_start) * 1000.0, 1),
+            messages_sent=msgs_sent,
+            client_ip=client_ip,
+        )
 
 
 @app.get("/remote", include_in_schema=False)
