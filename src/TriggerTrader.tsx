@@ -320,7 +320,10 @@ export default function TriggerTrader() {
   const [err, setErr] = useState<string | null>(null);
   const [shareCopied, setShareCopied] = useState(false);
   const [expandedLog, setExpandedLog] = useState<number | null>(null);
+  const [autoSaveStatus, setAutoSaveStatus] = useState<"idle" | "saving" | "saved">("idle");
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // הסשן צריך לדעת אם cfg הגיע מהשרת (אחרי טעינה ראשונה) — רק אז מותר לבצע auto-save.
+  const initialSyncDoneRef = useRef(false);
 
   // ── Polling ──────────────────────────────────────────────────
   const poll = useCallback(async () => {
@@ -328,7 +331,13 @@ export default function TriggerTrader() {
       const s = await api<TriggerState>("/api/trigger/state");
       setState(s);
       // Sync local config from server on first load
-      setCfg(prev => prev === DEFAULT_CONFIG ? s.config : prev);
+      setCfg(prev => {
+        if (prev === DEFAULT_CONFIG) {
+          initialSyncDoneRef.current = true;
+          return s.config;
+        }
+        return prev;
+      });
       setErr(null);
     } catch (e) {
       setErr(e instanceof Error ? e.message : "שגיאת חיבור");
@@ -342,6 +351,28 @@ export default function TriggerTrader() {
     }, 2000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [poll]);
+
+  /**
+   * שמירה אוטומטית של ה-cfg לדיסק (debounced ~600ms) — כדי שכל שינוי שהמשתמש עושה
+   * ב"מסחר מהיר" ישרוד יציאה והפעלה מחדש של האפליקציה גם בלי "שמור" ידני.
+   */
+  useEffect(() => {
+    if (!initialSyncDoneRef.current) return;
+    setAutoSaveStatus("saving");
+    const handle = window.setTimeout(async () => {
+      try {
+        await api("/api/trigger/config", {
+          method: "POST", body: JSON.stringify(cfg),
+        });
+        setAutoSaveStatus("saved");
+        window.setTimeout(() => setAutoSaveStatus((s) => (s === "saved" ? "idle" : s)), 1200);
+      } catch (e) {
+        setAutoSaveStatus("idle");
+        setErr(e instanceof Error ? e.message : "שגיאה בשמירה");
+      }
+    }, 600);
+    return () => window.clearTimeout(handle);
+  }, [cfg]);
 
   // ── Actions ───────────────────────────────────────────────────
   const saveAndActivate = useCallback(async () => {
@@ -445,6 +476,22 @@ export default function TriggerTrader() {
           border: `1px solid ${isActive ? "var(--up)" : "var(--border)"}`,
         }}>
           {isActive ? "● פעיל" : "○ כבוי"}
+        </span>
+        <span
+          title="ההגדרות נשמרות אוטומטית לדיסק ומשוחזרות בהפעלה הבאה"
+          style={{
+            fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: 20,
+            color: autoSaveStatus === "saving" ? "var(--accent-bright)" : "var(--muted)",
+            background: autoSaveStatus === "saving" ? "var(--accent-muted)" : "rgba(120,130,150,0.10)",
+            border: "1px solid var(--border)",
+            transition: "color 0.18s, background 0.18s",
+          }}
+        >
+          {autoSaveStatus === "saving"
+            ? "💾 שומר…"
+            : autoSaveStatus === "saved"
+              ? "✓ נשמר"
+              : "💾 שמירה אוטומטית"}
         </span>
       </div>
 

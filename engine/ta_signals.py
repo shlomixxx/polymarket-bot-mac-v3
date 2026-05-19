@@ -11,9 +11,19 @@ import httpx
 
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
+# קאש 15s ל-fetch_btc_klines: הנרות הם 1m ולכן 15s סטליות לא משפיעה על אינדיקטורים,
+# אבל היא מבטלת קריאות חוזרות מצד /api/signals שנקרא ב-2-3s ע"י שני frontends במקביל.
+_KLINES_CACHE: dict[tuple[str, int], tuple[float, list[dict]]] = {}
+_KLINES_CACHE_TTL_SEC = 15.0
+
 
 async def fetch_btc_klines(interval: str = "1m", limit: int = 60) -> list[dict]:
-    """מושך נרות BTCUSDT מ-Binance."""
+    """מושך נרות BTCUSDT מ-Binance, עם קאש 15s לפי (interval, limit)."""
+    key = (interval, limit)
+    now = time.time()
+    cached = _KLINES_CACHE.get(key)
+    if cached is not None and (now - cached[0]) <= _KLINES_CACHE_TTL_SEC:
+        return cached[1]
     async with httpx.AsyncClient() as client:
         r = await client.get(
             BINANCE_KLINES,
@@ -22,7 +32,7 @@ async def fetch_btc_klines(interval: str = "1m", limit: int = 60) -> list[dict]:
         )
         r.raise_for_status()
         raw = r.json()
-    return [
+    result = [
         {
             "open_time": int(row[0]),
             "open": float(row[1]),
@@ -33,6 +43,8 @@ async def fetch_btc_klines(interval: str = "1m", limit: int = 60) -> list[dict]:
         }
         for row in raw
     ]
+    _KLINES_CACHE[key] = (time.time(), result)
+    return result
 
 
 def _ema(values: list[float], period: int) -> list[float]:

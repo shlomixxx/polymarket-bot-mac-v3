@@ -6,6 +6,7 @@ import {
   CartesianGrid,
   ComposedChart,
   Line,
+  ReferenceDot,
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
@@ -46,6 +47,23 @@ type OrderbookSummary = {
 type ChartIdleCopy = { headline: string; sub: string; showSpinner: boolean };
 type MoodStyle = { border: string; color: string; bg: string; shadow: string };
 type StreamMood = { label: string; hint: string; variant: string };
+
+/* ── trigger/bot activity (broadcast-only subset of /api/trigger/state) ── */
+export type StreamTriggerMode = "off" | "momentum" | "signal" | "dca_pulse";
+export type StreamTriggerState = {
+  active: boolean;
+  mode: StreamTriggerMode;
+  status: string;
+  status_log: { ts: number; msg: string }[];
+  cooldown_remaining: number | null;
+  dca_running?: boolean;
+  config?: {
+    dca_pulse_slices?: number;
+    dca_pulse_direction?: "Up" | "Down";
+    momentum_direction?: "Up" | "Down" | "auto";
+    signal_direction?: "Up" | "Down" | "auto";
+  };
+};
 
 /* ── helpers ── */
 
@@ -238,6 +256,8 @@ export type StreamLiveBroadcastLayoutProps = {
   liveAccountUsd?: number | null;
   /** יתרת דמו — מוצג כש-isLive=false */
   demoBalanceUsd?: number | null;
+  /** מצב בוט הטריגר/DCA — מוזן ע"י polling של /api/trigger/state */
+  triggerState?: StreamTriggerState | null;
 };
 
 /* ══════════════════════════════════════════════════════════════════
@@ -266,6 +286,7 @@ export function StreamLiveBroadcastLayout(
     setAudioUnlocked,
     winRatePct,
     winRateExits,
+    winRateWins,
     runPnlUsd,
     runPnlSeries,
     runUsdYDomain,
@@ -278,14 +299,33 @@ export function StreamLiveBroadcastLayout(
     isLive = false,
     liveAccountUsd = null,
     demoBalanceUsd = null,
+    triggerState = null,
   } = props;
 
+  const botEngineOn =
+    !!triggerState &&
+    (triggerState.active === true ||
+      (triggerState.mode && triggerState.mode !== "off"));
+  const botRunning = stratCfg?.mode !== "off" || botEngineOn;
+
+  /** מקפיא את הסדרה בזמן hover כדי שהעיגול/tooltip לא יקפצו כשמתווסף דגימה כל שנייה */
+  const [frozenRunPnlSeries, setFrozenRunPnlSeries] = useState<RunPnlPoint[] | null>(null);
+  const effectiveRunPnlSeries = frozenRunPnlSeries ?? runPnlSeries;
+
   const runPnlSegments = useMemo(
-    () => splitRunPnlSegments(runPnlSeries),
-    [runPnlSeries]
+    () => splitRunPnlSegments(effectiveRunPnlSeries),
+    [effectiveRunPnlSeries]
   );
 
   const [showPnl, setShowPnl] = useState(true);
+  const [showBalance, setShowBalance] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return localStorage.getItem("streamShowBalance") === "1";
+    } catch {
+      return false;
+    }
+  });
 
   const fb = fitBroadcast;
 
@@ -301,14 +341,14 @@ export function StreamLiveBroadcastLayout(
       : "—";
 
   const botRunDisplay =
-    stratCfg?.mode === "off"
-      ? "—"
-      : botRunUptimeSec != null
-        ? formatBotUptime(botRunUptimeSec)
-        : "—";
+    botRunning && botRunUptimeSec != null
+      ? formatBotUptime(botRunUptimeSec)
+      : botRunning
+        ? "—"
+        : "OFFLINE";
 
   const lastTrades = useMemo(() => {
-    return [...roundOutcomes].slice(0, 6);
+    return [...roundOutcomes];
   }, [roundOutcomes]);
 
   return (
@@ -425,6 +465,102 @@ export function StreamLiveBroadcastLayout(
         .lb-position-active {
           animation: lbPositionPulse 2s ease-in-out infinite;
         }
+        @keyframes lbBotPillPulse {
+          0%, 100% { box-shadow: 0 0 22px rgba(251, 191, 36, 0.28), inset 0 1px 0 rgba(255,255,255,0.06); }
+          50% { box-shadow: 0 0 34px rgba(251, 191, 36, 0.45), inset 0 1px 0 rgba(255,255,255,0.08); }
+        }
+        @keyframes lbTelegramBorder {
+          0%, 100% {
+            border-color: rgba(96, 165, 250, 0.55);
+            box-shadow: 0 0 28px rgba(59, 130, 246, 0.22), 0 0 14px rgba(251, 191, 36, 0.18), inset 0 1px 0 rgba(255,255,255,0.08);
+          }
+          50% {
+            border-color: rgba(251, 191, 36, 0.85);
+            box-shadow: 0 0 44px rgba(251, 191, 36, 0.45), 0 0 22px rgba(96, 165, 250, 0.35), inset 0 1px 0 rgba(255,255,255,0.12);
+          }
+        }
+        @keyframes lbChevronSlide {
+          0% { transform: translateX(-4px); opacity: 0.3; }
+          50% { transform: translateX(2px); opacity: 1; }
+          100% { transform: translateX(-4px); opacity: 0.3; }
+        }
+        @keyframes lbRibbonShine {
+          0% { background-position: -200% 0; }
+          100% { background-position: 200% 0; }
+        }
+        .lb-telegram-card {
+          position: relative;
+          display: flex;
+          align-items: center;
+          gap: 18px;
+          padding: 16px 20px;
+          border-radius: 16px;
+          border: 2px solid rgba(96, 165, 250, 0.55);
+          background:
+            linear-gradient(135deg, rgba(30, 58, 138, 0.35) 0%, rgba(10, 14, 25, 0.97) 55%, rgba(69, 26, 3, 0.4) 100%);
+          overflow: hidden;
+          animation: lbTelegramBorder 2.8s ease-in-out infinite;
+        }
+        .lb-telegram-card::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          background: linear-gradient(100deg,
+            transparent 35%,
+            rgba(251, 191, 36, 0.18) 50%,
+            transparent 65%);
+          background-size: 200% 100%;
+          animation: lbRibbonShine 3.6s linear infinite;
+          pointer-events: none;
+        }
+        .lb-telegram-ribbon {
+          position: absolute;
+          top: 26px;
+          right: -34px;
+          transform: rotate(45deg);
+          transform-origin: center center;
+          padding: 5px 38px;
+          background: linear-gradient(90deg, #dc2626, #f97316);
+          color: #fff;
+          font-size: 12px;
+          font-weight: 900;
+          letter-spacing: 0.22em;
+          text-transform: uppercase;
+          text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+          box-shadow: 0 6px 18px rgba(220, 38, 38, 0.55), 0 0 0 1px rgba(255,255,255,0.18) inset;
+          pointer-events: none;
+          z-index: 3;
+          white-space: nowrap;
+        }
+        .lb-telegram-chevron {
+          display: inline-block;
+          animation: lbChevronSlide 1.2s ease-in-out infinite;
+          color: #fbbf24;
+          font-weight: 900;
+        }
+        .lb-telegram-chevron.c2 { animation-delay: 0.15s; }
+        .lb-telegram-chevron.c3 { animation-delay: 0.3s; }
+        .lb-telegram-btn {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 8px 14px;
+          margin-top: 8px;
+          border-radius: 10px;
+          background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+          color: #fff !important;
+          text-decoration: none;
+          font-weight: 900;
+          font-size: 13px;
+          letter-spacing: 0.05em;
+          box-shadow: 0 4px 16px rgba(59, 130, 246, 0.45);
+          border: 1px solid rgba(147, 197, 253, 0.5);
+          transition: transform 0.18s ease, box-shadow 0.18s ease;
+        }
+        .lb-telegram-btn:hover {
+          transform: translateY(-1px) scale(1.02);
+          box-shadow: 0 6px 22px rgba(59, 130, 246, 0.6);
+        }
       `}</style>
 
       <BroadcastFit
@@ -469,6 +605,8 @@ export function StreamLiveBroadcastLayout(
                 letterSpacing: "0.12em",
                 color: "#fca5a5",
                 textTransform: "uppercase",
+                flexWrap: "wrap",
+                justifyContent: "center",
               }}
             >
               <span className="lb-live-dot" />
@@ -505,16 +643,77 @@ export function StreamLiveBroadcastLayout(
             </div>
             <div
               style={{
-                fontSize: 11,
-                color: "rgba(255,255,255,0.28)",
-                marginTop: 6,
-                fontWeight: 500,
-                letterSpacing: "0.03em",
-                fontVariantNumeric: "tabular-nums",
+                marginTop: 10,
+                display: "flex",
+                justifyContent: "center",
+                alignItems: "center",
+                gap: 8,
+                flexWrap: "wrap",
               }}
-              title="Wall time since semi/auto was enabled"
             >
-              Bot run · {botRunDisplay}
+              <div
+                title={
+                  botRunning
+                    ? "Wall time since the bot engine was enabled"
+                    : "Bot engine is currently idle"
+                }
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 10,
+                  padding: "7px 16px",
+                  borderRadius: 999,
+                  fontSize: fb ? 15 : 17,
+                  fontWeight: 900,
+                  letterSpacing: "0.1em",
+                  fontVariantNumeric: "tabular-nums",
+                  textTransform: "uppercase",
+                  color: botRunning ? "#fde68a" : "rgba(255,255,255,0.4)",
+                  background: botRunning
+                    ? "linear-gradient(135deg, rgba(251, 191, 36, 0.18), rgba(234, 88, 12, 0.10))"
+                    : "rgba(255,255,255,0.04)",
+                  border: botRunning
+                    ? "1.5px solid rgba(251, 191, 36, 0.55)"
+                    : "1px solid rgba(255,255,255,0.12)",
+                  boxShadow: botRunning
+                    ? "0 0 22px rgba(251, 191, 36, 0.28), inset 0 1px 0 rgba(255,255,255,0.06)"
+                    : "none",
+                  animation: botRunning
+                    ? "lbBotPillPulse 2.4s ease-in-out infinite"
+                    : undefined,
+                }}
+              >
+                <span
+                  style={{
+                    width: 10,
+                    height: 10,
+                    borderRadius: "50%",
+                    background: botRunning ? "#fbbf24" : "rgba(255,255,255,0.3)",
+                    boxShadow: botRunning
+                      ? "0 0 10px rgba(251, 191, 36, 0.9)"
+                      : "none",
+                    animation: botRunning
+                      ? "lbLivePulse 1.6s ease-in-out infinite"
+                      : undefined,
+                    flexShrink: 0,
+                  }}
+                />
+                <span>
+                  {botRunning ? "BOT RUNNING" : "BOT OFFLINE"}
+                </span>
+                <span
+                  style={{
+                    color: botRunning ? "#ffffff" : "rgba(255,255,255,0.4)",
+                    fontWeight: 900,
+                    letterSpacing: "0.04em",
+                    textShadow: botRunning
+                      ? "0 0 14px rgba(251, 191, 36, 0.5)"
+                      : "none",
+                  }}
+                >
+                  {botRunDisplay}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -665,8 +864,18 @@ export function StreamLiveBroadcastLayout(
               )}
             </div>
 
-            {/* ── LIVE / DEMO ACCOUNT BADGE ── */}
-            <div
+            {/* ── BALANCE BADGE (click to reveal amount) ── */}
+            <button
+              type="button"
+              onClick={() => {
+                setShowBalance((v) => {
+                  const next = !v;
+                  try {
+                    localStorage.setItem("streamShowBalance", next ? "1" : "0");
+                  } catch { /* private mode */ }
+                  return next;
+                });
+              }}
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -683,12 +892,10 @@ export function StreamLiveBroadcastLayout(
                   ? "0 0 14px rgba(248, 113, 113, 0.25)"
                   : "none",
                 flexShrink: 0,
+                cursor: "pointer",
+                fontFamily: "inherit",
               }}
-              title={
-                isLive
-                  ? "חשבון אמיתי (Polymarket CLOB) — ה-PnL והיתרה מייצגים USDC אמיתי"
-                  : "מצב דמו — מספרים סימולטיביים"
-              }
+              title={showBalance ? "Click to hide balance" : "Click to show balance"}
             >
               <span
                 style={{
@@ -710,23 +917,25 @@ export function StreamLiveBroadcastLayout(
                   color: isLive ? "#fca5a5" : "rgba(255,255,255,0.5)",
                 }}
               >
-                {isLive ? "LIVE" : "DEMO"}
+                BALANCE
               </span>
-              <span
-                style={{
-                  fontSize: 13,
-                  fontWeight: 900,
-                  fontVariantNumeric: "tabular-nums",
-                  color: isLive ? "#fef2f2" : "rgba(255,255,255,0.75)",
-                }}
-              >
-                {(() => {
-                  const v = isLive ? liveAccountUsd : demoBalanceUsd;
-                  if (typeof v !== "number" || !Number.isFinite(v)) return "—";
-                  return `$${v.toFixed(2)}`;
-                })()}
-              </span>
-            </div>
+              {showBalance && (
+                <span
+                  style={{
+                    fontSize: 13,
+                    fontWeight: 900,
+                    fontVariantNumeric: "tabular-nums",
+                    color: isLive ? "#fef2f2" : "rgba(255,255,255,0.75)",
+                  }}
+                >
+                  {(() => {
+                    const v = isLive ? liveAccountUsd : demoBalanceUsd;
+                    if (typeof v !== "number" || !Number.isFinite(v)) return "—";
+                    return `$${v.toFixed(2)}`;
+                  })()}
+                </span>
+              )}
+            </button>
 
             {/* Sound controls */}
             <div
@@ -829,62 +1038,149 @@ export function StreamLiveBroadcastLayout(
               alignItems: "stretch",
             }}
           >
-            {/* QR block */}
-            <div className="lb-qr-card" style={{ flex: "1.2 1 280px" }}>
-              <QRCodeSVG
-                value="https://t.me/roller000"
-                size={fb ? 88 : 110}
-                bgColor="#ffffff"
-                fgColor="#0f172a"
-                level="M"
+            {/* QR block — the single loudest CTA on the page */}
+            <a
+              href="https://t.me/roller000"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="lb-telegram-card"
+              style={{
+                flex: "1.4 1 340px",
+                textDecoration: "none",
+                color: "inherit",
+                cursor: "pointer",
+              }}
+              aria-label="Open Telegram @roller000"
+            >
+              <div className="lb-telegram-ribbon">FREE · LIVE</div>
+              <div
                 style={{
-                  borderRadius: 10,
+                  position: "relative",
+                  padding: 6,
+                  borderRadius: 12,
+                  background: "#ffffff",
+                  boxShadow: "0 6px 30px rgba(251, 191, 36, 0.35), 0 0 0 2px rgba(251, 191, 36, 0.5)",
                   flexShrink: 0,
-                  boxShadow: "0 4px 24px rgba(0,0,0,0.5)",
                 }}
-                role="img"
-                aria-label="QR code — Telegram @roller000"
-              />
-              <div style={{ flex: 1, minWidth: 0 }}>
+              >
+                <QRCodeSVG
+                  value="https://t.me/roller000"
+                  size={fb ? 110 : 128}
+                  bgColor="#ffffff"
+                  fgColor="#0f172a"
+                  level="M"
+                  role="img"
+                  aria-label="QR code — Telegram @roller000"
+                />
                 <div
                   style={{
-                    fontSize: fb ? 16 : 20,
+                    position: "absolute",
+                    bottom: -9,
+                    left: "50%",
+                    transform: "translateX(-50%)",
+                    padding: "2px 10px",
+                    borderRadius: 999,
+                    background: "linear-gradient(90deg, #fbbf24, #f97316)",
+                    fontSize: 9,
                     fontWeight: 900,
-                    letterSpacing: "0.04em",
-                    color: "#fff",
-                    marginBottom: 2,
+                    letterSpacing: "0.16em",
+                    color: "#0b0f1a",
+                    whiteSpace: "nowrap",
+                    boxShadow: "0 2px 10px rgba(249, 115, 22, 0.5)",
                   }}
                 >
-                  SCAN & JOIN TELEGRAM
+                  SCAN ME
                 </div>
-                <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
-                  <span style={{ color: "#60a5fa", marginRight: 6 }}>✈</span>
-                  <a
-                    href="https://t.me/roller000"
-                    target="_blank"
-                    rel="noopener noreferrer"
+              </div>
+              <div style={{ flex: 1, minWidth: 0, position: "relative", zIndex: 1 }}>
+                <div
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "3px 10px",
+                    borderRadius: 999,
+                    background: "rgba(220, 38, 38, 0.18)",
+                    border: "1px solid rgba(248, 113, 113, 0.45)",
+                    fontSize: 9,
+                    fontWeight: 900,
+                    letterSpacing: "0.18em",
+                    color: "#fca5a5",
+                    marginBottom: 6,
+                  }}
+                >
+                  <span
                     style={{
-                      color: "#fbbf24",
-                      textDecoration: "none",
-                      fontWeight: 800,
+                      width: 6,
+                      height: 6,
+                      borderRadius: "50%",
+                      background: "#ef4444",
+                      animation: "lbLivePulse 1.4s ease-in-out infinite",
+                    }}
+                  />
+                  SIGNALS DROPPING NOW
+                </div>
+                <div
+                  style={{
+                    fontSize: fb ? 22 : 26,
+                    fontWeight: 900,
+                    letterSpacing: "0.02em",
+                    color: "#fff",
+                    lineHeight: 1.1,
+                    textShadow: "0 0 24px rgba(251, 191, 36, 0.35)",
+                  }}
+                >
+                  CHAT WITH ME
+                  <br />
+                  ON TELEGRAM
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    marginTop: 8,
+                    fontSize: 13,
+                    fontWeight: 800,
+                    color: "#fbbf24",
+                    letterSpacing: "0.02em",
+                  }}
+                >
+                  <span className="lb-telegram-chevron">›</span>
+                  <span className="lb-telegram-chevron c2">›</span>
+                  <span className="lb-telegram-chevron c3">›</span>
+                  <span style={{ color: "#60a5fa", fontSize: 16 }}>✈</span>
+                  <span
+                    style={{
+                      color: "#fde68a",
+                      fontWeight: 900,
+                      letterSpacing: "0.04em",
                     }}
                   >
                     t.me/roller000
-                  </a>
+                  </span>
                 </div>
                 <div
                   style={{
-                    fontSize: 12,
-                    color: "rgba(255,255,255,0.6)",
-                    lineHeight: 1.5,
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: 6,
+                    marginTop: 8,
+                    padding: "7px 13px",
+                    borderRadius: 10,
+                    background: "linear-gradient(135deg, #3b82f6, #1d4ed8)",
+                    color: "#fff",
+                    fontWeight: 900,
+                    fontSize: 13,
+                    letterSpacing: "0.05em",
+                    boxShadow: "0 4px 16px rgba(59, 130, 246, 0.45)",
+                    border: "1px solid rgba(147, 197, 253, 0.5)",
                   }}
                 >
-                  <div>🚀 Join 500+ traders</div>
-                  <div>💰 Real profits. Real signals.</div>
-                  <div>⚡ Free access limited time</div>
+                  JOIN NOW · FREE →
                 </div>
               </div>
-            </div>
+            </a>
 
             {/* Stat boxes */}
             <div
@@ -897,7 +1193,7 @@ export function StreamLiveBroadcastLayout(
               }}
             >
               <div className="lb-stat-box" style={{ flex: "1 1 100px" }}>
-                <div className="lb-stat-label">PNL</div>
+                <div className="lb-stat-label">SESSION PNL</div>
                 <div
                   className="lb-stat-value"
                   style={{
@@ -911,6 +1207,21 @@ export function StreamLiveBroadcastLayout(
                     ? formatUsdSigned(runPnlUsd)
                     : "—"}
                 </div>
+                <div
+                  style={{
+                    marginTop: 4,
+                    fontSize: 9,
+                    fontWeight: 700,
+                    letterSpacing: "0.1em",
+                    textTransform: "uppercase",
+                    color: "rgba(255,255,255,0.4)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {botRunUptimeSec != null
+                    ? `Last ${formatBotUptime(botRunUptimeSec)}`
+                    : "Since bot start"}
+                </div>
               </div>
               <div className="lb-stat-box" style={{ flex: "1 1 100px" }}>
                 <div className="lb-stat-label">WIN RATE</div>
@@ -920,14 +1231,40 @@ export function StreamLiveBroadcastLayout(
                 >
                   {wrDisplay}
                 </div>
+                <div
+                  style={{
+                    marginTop: 4,
+                    fontSize: 9,
+                    fontWeight: 700,
+                    letterSpacing: "0.08em",
+                    color: "rgba(255,255,255,0.4)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {winRateExits > 0
+                    ? `${winRateWins}W · ${winRateExits - winRateWins}L · ${winRateExits} trades`
+                    : "No exits yet"}
+                </div>
               </div>
               <div className="lb-stat-box" style={{ flex: "1 1 100px" }}>
-                <div className="lb-stat-label">TIME LEFT</div>
+                <div className="lb-stat-label">ROUND ENDS IN</div>
                 <div
                   className="lb-stat-value"
                   style={{ color: "#fbbf24", textShadow: "0 0 20px rgba(251, 191, 36, 0.4)" }}
                 >
                   {timeDisplay}
+                </div>
+                <div
+                  style={{
+                    marginTop: 4,
+                    fontSize: 9,
+                    fontWeight: 700,
+                    letterSpacing: "0.1em",
+                    textTransform: "uppercase",
+                    color: "rgba(255,255,255,0.4)",
+                  }}
+                >
+                  Until next close
                 </div>
               </div>
             </div>
@@ -1099,7 +1436,7 @@ export function StreamLiveBroadcastLayout(
             <div
               style={{
                 display: "flex",
-                flexWrap: "wrap",
+                flexWrap: fb ? "nowrap" : "wrap",
                 gap: fb ? 6 : 12,
                 alignItems: "stretch",
                 ...(fb
@@ -1114,7 +1451,7 @@ export function StreamLiveBroadcastLayout(
               <div
                 className="lb-chart-shell"
                 style={{
-                  flex: fb ? "3 1 0" : "3 1 300px",
+                  flex: fb ? "2 1 0" : "3 1 300px",
                   minWidth: 0,
                   width: "100%",
                   ...(fb
@@ -1127,7 +1464,7 @@ export function StreamLiveBroadcastLayout(
                     : { height: 300 }),
                 }}
               >
-                {stratCfg?.mode === "off" && chartIdleCopy ? (
+                {stratCfg?.mode === "off" && !botRunning && chartIdleCopy ? (
                   <div
                     style={{
                       flex: fb ? 1 : undefined,
@@ -1166,7 +1503,7 @@ export function StreamLiveBroadcastLayout(
                       </div>
                     </div>
                   </div>
-                ) : stratCfg?.mode !== "off" && runPnlSeries.length === 0 ? (
+                ) : botRunning && runPnlSeries.length === 0 ? (
                   <div
                     style={{
                       flex: fb ? 1 : undefined,
@@ -1199,10 +1536,12 @@ export function StreamLiveBroadcastLayout(
                         ? { flex: 1, minHeight: 0, width: "100%", minWidth: 0 }
                         : { width: "100%", height: "100%" }
                     }
+                    onMouseEnter={() => setFrozenRunPnlSeries(runPnlSeries)}
+                    onMouseLeave={() => setFrozenRunPnlSeries(null)}
                   >
                   <ResponsiveContainer width="100%" height="100%">
                     <ComposedChart
-                      data={runPnlSeries}
+                      data={effectiveRunPnlSeries}
                       margin={{ top: 8, right: 6, bottom: 4, left: 4 }}
                     >
                       <CartesianGrid
@@ -1213,7 +1552,19 @@ export function StreamLiveBroadcastLayout(
                       <XAxis
                         dataKey="t"
                         type="number"
-                        domain={["dataMin", "dataMax"]}
+                        domain={[
+                          "dataMin",
+                          (dataMax: number) => {
+                            const first = effectiveRunPnlSeries[0]?.t;
+                            const last = effectiveRunPnlSeries[effectiveRunPnlSeries.length - 1]?.t;
+                            const span =
+                              typeof first === "number" && typeof last === "number" && last > first
+                                ? last - first
+                                : 0;
+                            const pad = Math.max(span * 0.03, 3);
+                            return dataMax + pad;
+                          },
+                        ]}
                         tick={{
                           fill: "rgba(255,255,255,0.3)",
                           fontSize: 10,
@@ -1348,11 +1699,28 @@ export function StreamLiveBroadcastLayout(
                           pointerEvents="none"
                         />
                       ))}
+                      {(() => {
+                        const last = effectiveRunPnlSeries[effectiveRunPnlSeries.length - 1];
+                        if (!last) return null;
+                        const c = last.usd >= 0 ? RUN_PNL_GREEN : RUN_PNL_RED;
+                        return (
+                          <ReferenceDot
+                            x={last.t}
+                            y={last.usd}
+                            r={5}
+                            fill={c}
+                            stroke="rgba(255,255,255,0.55)"
+                            strokeWidth={1.5}
+                            isFront
+                            ifOverflow="extendDomain"
+                          />
+                        );
+                      })()}
                       {/* Single invisible series: full series so Tooltip/activeDot work on entire curve (not only green fill). */}
                       <Line
                         name="runPnlHit"
                         type="monotone"
-                        data={runPnlSeries}
+                        data={effectiveRunPnlSeries}
                         dataKey="usd"
                         stroke="transparent"
                         strokeWidth={20}
@@ -1390,17 +1758,17 @@ export function StreamLiveBroadcastLayout(
                 aria-label="Last trades"
                 style={{
                   flex: fb ? "1 1 0" : "1 1 200px",
-                  minWidth: 180,
+                  minWidth: fb ? 0 : 180,
                   maxWidth: fb ? "none" : 300,
                   ...(fb
                     ? {
                         minHeight: 0,
                         alignSelf: "stretch",
-                        maxHeight: "none",
-                        height: "auto",
+                        height: "100%",
                       }
                     : { maxHeight: 300 }),
-                  overflow: "auto",
+                  overflowY: "auto",
+                  overflowX: "hidden",
                   padding: "12px 14px",
                   borderRadius: 10,
                   border: "1px solid rgba(251, 191, 36, 0.3)",
@@ -1416,6 +1784,18 @@ export function StreamLiveBroadcastLayout(
                     alignItems: "center",
                     justifyContent: "space-between",
                     marginBottom: 10,
+                    position: "sticky",
+                    top: -12,
+                    zIndex: 2,
+                    paddingTop: 12,
+                    paddingBottom: 8,
+                    marginTop: -12,
+                    marginLeft: -14,
+                    marginRight: -14,
+                    paddingLeft: 14,
+                    paddingRight: 14,
+                    background:
+                      "linear-gradient(165deg, rgba(10, 14, 25, 0.98), rgba(20, 22, 38, 0.95))",
                   }}
                 >
                   <div
@@ -1447,7 +1827,7 @@ export function StreamLiveBroadcastLayout(
                       borderRadius: 5,
                       padding: "2px 7px",
                       cursor: "pointer",
-                      transition: "all 0.18s",
+                      transition: "background 0.08s ease, border-color 0.08s ease, color 0.08s ease",
                       lineHeight: 1.6,
                     }}
                     title={showPnl ? "Hide P&L" : "Show P&L"}
@@ -1455,6 +1835,7 @@ export function StreamLiveBroadcastLayout(
                     {showPnl ? "Hide" : "Show"} P&L
                   </button>
                 </div>
+
                 {lastTrades.length === 0 ? (
                   <div
                     style={{
@@ -1540,3 +1921,4 @@ export function StreamLiveBroadcastLayout(
     </div>
   );
 }
+

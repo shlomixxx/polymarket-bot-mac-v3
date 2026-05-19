@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LineChart, Line, XAxis, YAxis, Tooltip, ReferenceLine, ResponsiveContainer } from "recharts";
-import { api, engineUrl, isPageHidden } from "./api";
+import {
+  api,
+  engineUrl,
+  isPageHidden,
+  TIMEOUT_MS_MARKET_CURRENT,
+  TIMEOUT_MS_ORDERBOOK_SUMMARY,
+  TIMEOUT_MS_DEMO_STATE,
+} from "./api";
 import {
   chartAxisTick,
   chartTooltipStyle,
@@ -19,6 +26,7 @@ import { PnlOpenAreaChart, PnlClosedAreaChart } from "./ui/PnlSessionAreaCharts"
 import TipsV2 from "./TipsV2";
 import SignalsPanel from "./SignalsPanel";
 import TriggerTrader from "./TriggerTrader";
+import AnalyticsV3 from "./AnalyticsV3";
 
 type Market = {
   slug: string;
@@ -47,7 +55,7 @@ type OrderbookSummary = {
   down: SideSummary;
 };
 
-type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "help";
+type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "analytics_v3" | "help";
 
 type Trade = {
   id?: string;
@@ -1670,6 +1678,35 @@ export default function App() {
   const [ob, setOb] = useState<OrderbookSummary | null>(null);
   const priceStream = usePriceStream();
 
+  /** טיק שנייה — מונה «נותרו…» בלוח הבקרה מתעדכן כל שנייה, לא רק כשמגיע refresh מהשרת */
+  const [clock, setClock] = useState(0);
+  useEffect(() => {
+    const id = window.setInterval(() => setClock((c) => c + 1), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  /** עוגן ל־seconds_left מהשרת; בין רענונים מפחיתים לפי שעון קיר (כמו LiveStreamTrade). */
+  const windowSecondsLeftAnchorRef = useRef<{ left: number; atMs: number } | null>(null);
+  useEffect(() => {
+    if (!market) {
+      windowSecondsLeftAnchorRef.current = null;
+      return;
+    }
+    windowSecondsLeftAnchorRef.current = {
+      left: market.seconds_left,
+      atMs: Date.now(),
+    };
+  }, [market?.seconds_left, market?.epoch, market?.slug]);
+
+  const effectiveWindowSecondsLeft = useMemo(() => {
+    void clock;
+    if (!market) return null;
+    const a = windowSecondsLeftAnchorRef.current;
+    if (!a) return market.seconds_left;
+    const driftSec = Math.floor((Date.now() - a.atMs) / 1000);
+    return Math.max(0, a.left - driftSec);
+  }, [market, clock]);
+
   useEffect(() => {
     if (!priceStream.lastUpdateTs) return;
     setOb((prev) => {
@@ -1732,6 +1769,12 @@ export default function App() {
   const [peakWatchdogEnabled, setPeakWatchdogEnabled] = useState(true);
   const [peakRetreatExitPct, setPeakRetreatExitPct] = useState(2);
   const [retryMaxAttempts, setRetryMaxAttempts] = useState(3);
+  const [holdToResolutionEnabled, setHoldToResolutionEnabled] = useState(false);
+  const [holdToResolutionMinDcaSlices, setHoldToResolutionMinDcaSlices] = useState(2);
+  const [holdToResolutionMinPrice, setHoldToResolutionMinPrice] = useState(0.85);
+  const [holdToResolutionStopLoss, setHoldToResolutionStopLoss] = useState(true);
+  const [investmentMode, setInvestmentMode] = useState<"fixed" | "percent">("fixed");
+  const [investmentPctOfPortfolio, setInvestmentPctOfPortfolio] = useState(5);
   /** מצב ריצה מהשרת (תמיד מסונכרן) */
   const [lossRecoveryStreak, setLossRecoveryStreak] = useState(0);
   const [lossRecoveryMultLive, setLossRecoveryMultLive] = useState(1);
@@ -1787,19 +1830,20 @@ export default function App() {
   }, [inv, entryCents, effectiveMinContracts]);
 
   const refreshInFlight = useRef(false);
+  const refreshFailCount = useRef(0);
+  const REFRESH_FAIL_THRESHOLD = 3; // show error only after N consecutive failures
   const refresh = useCallback(async () => {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     try {
-      setErr("");
       const [m, b, st, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw] = await Promise.all([
-        api<Market>("/api/market/current"),
+        api<Market>("/api/market/current", { timeoutMs: TIMEOUT_MS_MARKET_CURRENT }),
         api<{ price: number; history: { t: number; p: number }[] }>("/api/btc/live"),
-        api<Record<string, unknown>>("/api/demo/state"),
+        api<Record<string, unknown>>("/api/demo/state", { timeoutMs: TIMEOUT_MS_DEMO_STATE }),
         api<{ lines: string[] }>("/api/strategy/logs"),
         api<{ pending: unknown }>("/api/strategy/pending"),
         api<Record<string, unknown>>("/api/strategy/config"),
-        api<OrderbookSummary>("/api/market/orderbook-summary"),
+        api<OrderbookSummary>("/api/market/orderbook-summary", { timeoutMs: TIMEOUT_MS_ORDERBOOK_SUMMARY }),
         api<{ entries: { ts: number; msg: string; type: string; session_id?: string }[] }>("/api/strategy/log-entries").catch(() => ({ entries: [] })),
         api<{ enabled: boolean; effective: boolean; reason_blocked: string | null; persisted_in_keychain?: boolean }>("/api/live/mode").catch(() => null),
         api<{
@@ -1903,14 +1947,25 @@ export default function App() {
         if (typeof c.peak_watchdog_enabled === "boolean") setPeakWatchdogEnabled(c.peak_watchdog_enabled);
         if (typeof c.peak_retreat_exit_pct === "number") setPeakRetreatExitPct(c.peak_retreat_exit_pct);
         if (typeof c.retry_max_attempts === "number") setRetryMaxAttempts(c.retry_max_attempts);
+        if (typeof c.hold_to_resolution_enabled === "boolean") setHoldToResolutionEnabled(c.hold_to_resolution_enabled);
+        if (typeof c.hold_to_resolution_min_dca_slices === "number") setHoldToResolutionMinDcaSlices(c.hold_to_resolution_min_dca_slices);
+        if (typeof c.hold_to_resolution_min_price === "number") setHoldToResolutionMinPrice(c.hold_to_resolution_min_price);
+        if (typeof c.hold_to_resolution_stop_loss_enabled === "boolean") setHoldToResolutionStopLoss(c.hold_to_resolution_stop_loss_enabled);
+        if (c.investment_mode === "fixed" || c.investment_mode === "percent") setInvestmentMode(c.investment_mode);
+        if (typeof c.investment_pct_of_portfolio === "number") setInvestmentPctOfPortfolio(c.investment_pct_of_portfolio);
       }
       setOb(obSummary);
+      refreshFailCount.current = 0;
+      setErr("");
     } catch (e: unknown) {
-      setErr(
-        e instanceof Error
-          ? e.message
-          : "שגיאת רשת. יש לוודא שהמנוע פעיל (למשל: npm run engine מתוך תיקיית הפרויקט).",
-      );
+      refreshFailCount.current += 1;
+      if (refreshFailCount.current >= REFRESH_FAIL_THRESHOLD) {
+        setErr(
+          e instanceof Error
+            ? e.message
+            : "שגיאת רשת. יש לוודא שהמנוע פעיל (למשל: npm run engine מתוך תיקיית הפרויקט).",
+        );
+      }
     } finally {
       refreshInFlight.current = false;
     }
@@ -1934,7 +1989,7 @@ export default function App() {
       while (!cancelled) {
         if (!isPageHidden()) await refresh();
         if (cancelled) break;
-        const ms = isPageHidden() ? 10_000 : hasOpenDemoPositionsRef.current ? 1500 : 3000;
+        const ms = isPageHidden() ? 10_000 : hasOpenDemoPositionsRef.current ? 800 : 1500;
         await sleep(ms);
       }
     })();
@@ -1965,7 +2020,7 @@ export default function App() {
         // silent — full refresh will recover
       }
     };
-    const id = window.setInterval(pollSnapshot, 500);
+    const id = window.setInterval(pollSnapshot, 250);
     return () => { cancelled = true; window.clearInterval(id); };
   }, []);
 
@@ -1994,51 +2049,61 @@ export default function App() {
   }, [liveModeEffective]);
 
   const pushConfig = async () => {
-    await api("/api/strategy/config", {
-      method: "POST",
-      body: JSON.stringify({
-        investment_usd: inv,
-        entry_price_cents: entryCents,
-        min_contracts: minContracts,
-        btc_window: btcWindow,
-        take_profit_pct: tp,
-        min_minutes_for_entry: minMin,
-        freeze_last_minutes: freezeMin,
-        intermediate_block_new_entries: interBlock,
-        dca_enabled: dca,
-        dca_slices: dcaSlices,
-        dca_interval_sec: dcaInt,
-        dca_discount_enabled: dcaDiscountEnabled,
-        dca_discount_pct: dcaDiscountPct,
-        hedge_enabled: hedge,
-        hedge_combined_ask_max: hedgeMax,
-        side_preference: side,
-        auto_reenter_after_tp: autoReenter,
-        reenter_cooldown_sec: reenterCooldown,
-        max_entries_per_window: maxEntriesPerWindow,
-        max_notional_per_window_usd: maxNotionalPerWindow,
-        max_trades_per_hour: maxTradesPerHour,
-        near_entry_pct: nearEntryPct,
-        near_tp_pct: nearTpPct,
-        dca_tp_override_pct: dcaTpOverridePct,
-        book_log_interval_sec: bookLogIntervalSec,
-        loss_recovery_enabled: lossRecoveryEnabled,
-        loss_recovery_step_pct: lossRecoveryStepPct,
-        loss_recovery_every_n_losses: Math.max(1, Math.floor(lossRecoveryEveryN)),
-        loss_recovery_max_multiplier: Math.max(1, lossRecoveryMaxMult),
-        order_mode: orderMode,
-        entry_slippage_pct: Math.max(0, entrySlippagePct),
-        exit_slippage_pct: Math.max(0, exitSlippagePct),
-        peak_watchdog_enabled: peakWatchdogEnabled,
-        peak_retreat_exit_pct: Math.max(0, peakRetreatExitPct),
-        retry_max_attempts: Math.max(0, Math.floor(retryMaxAttempts)),
-      }),
-    });
-    cfgDirtyRef.current = false;
-    setCfgDirty(false);
-    setSaveFeedback("saved");
-    setTimeout(() => setSaveFeedback(null), 3000);
-    await refresh();
+    try {
+      await api("/api/strategy/config", {
+        method: "POST",
+        body: JSON.stringify({
+          investment_usd: inv,
+          entry_price_cents: entryCents,
+          min_contracts: minContracts,
+          btc_window: btcWindow,
+          take_profit_pct: tp,
+          min_minutes_for_entry: minMin,
+          freeze_last_minutes: freezeMin,
+          intermediate_block_new_entries: interBlock,
+          dca_enabled: dca,
+          dca_slices: dcaSlices,
+          dca_interval_sec: dcaInt,
+          dca_discount_enabled: dcaDiscountEnabled,
+          dca_discount_pct: dcaDiscountPct,
+          hedge_enabled: hedge,
+          hedge_combined_ask_max: hedgeMax,
+          side_preference: side,
+          auto_reenter_after_tp: autoReenter,
+          reenter_cooldown_sec: reenterCooldown,
+          max_entries_per_window: maxEntriesPerWindow,
+          max_notional_per_window_usd: maxNotionalPerWindow,
+          max_trades_per_hour: maxTradesPerHour,
+          near_entry_pct: nearEntryPct,
+          near_tp_pct: nearTpPct,
+          dca_tp_override_pct: dcaTpOverridePct,
+          book_log_interval_sec: bookLogIntervalSec,
+          loss_recovery_enabled: lossRecoveryEnabled,
+          loss_recovery_step_pct: lossRecoveryStepPct,
+          loss_recovery_every_n_losses: Math.max(1, Math.floor(lossRecoveryEveryN)),
+          loss_recovery_max_multiplier: Math.max(1, lossRecoveryMaxMult),
+          order_mode: orderMode,
+          entry_slippage_pct: Math.max(0, entrySlippagePct),
+          exit_slippage_pct: Math.max(0, exitSlippagePct),
+          peak_watchdog_enabled: peakWatchdogEnabled,
+          peak_retreat_exit_pct: Math.max(0, peakRetreatExitPct),
+          retry_max_attempts: Math.max(0, Math.floor(retryMaxAttempts)),
+          hold_to_resolution_enabled: holdToResolutionEnabled,
+          hold_to_resolution_min_dca_slices: Math.max(0, Math.floor(holdToResolutionMinDcaSlices)),
+          hold_to_resolution_min_price: Math.max(0, Math.min(1, holdToResolutionMinPrice)),
+          hold_to_resolution_stop_loss_enabled: holdToResolutionStopLoss,
+          investment_mode: investmentMode,
+          investment_pct_of_portfolio: Math.max(0, investmentPctOfPortfolio),
+        }),
+      });
+      cfgDirtyRef.current = false;
+      setCfgDirty(false);
+      setSaveFeedback("saved");
+      setTimeout(() => setSaveFeedback(null), 3000);
+      void refresh();
+    } catch {
+      // silent — auto-save will retry on next config change
+    }
   };
 
   /** Auto-save: אם המשתמש ערך ערך בלשונית אסטרטגיה — שמור אוטומטית 1.5s אחרי הקלדה אחרונה
@@ -2059,14 +2124,24 @@ export default function App() {
       nearEntryPct, nearTpPct, dcaTpOverridePct, bookLogIntervalSec,
       lossRecoveryEnabled, lossRecoveryStepPct, lossRecoveryEveryN, lossRecoveryMaxMult,
       orderMode, entrySlippagePct, exitSlippagePct, peakWatchdogEnabled, peakRetreatExitPct,
-      retryMaxAttempts]);
+      retryMaxAttempts, holdToResolutionEnabled, holdToResolutionMinDcaSlices,
+      holdToResolutionMinPrice, holdToResolutionStopLoss,
+      investmentMode, investmentPctOfPortfolio]);
 
-  const setMode = async (m: "off" | "semi" | "auto") => {
-    await pushConfig();
-    await api("/api/strategy/mode", { method: "POST", body: JSON.stringify({ mode: m }) });
+  const setMode = (m: "off" | "semi" | "auto") => {
+    const prevMode = botMode;
+    const prevRequireApproval = requireApproval;
     setBotMode(m);
     setRequireApproval(m === "semi");
-    await refresh();
+    void (async () => {
+      try {
+        await api("/api/strategy/mode", { method: "POST", body: JSON.stringify({ mode: m }) });
+        void refresh();
+      } catch {
+        setBotMode(prevMode);
+        setRequireApproval(prevRequireApproval);
+      }
+    })();
   };
 
   const chartData = useMemo(() => {
@@ -2404,6 +2479,7 @@ export default function App() {
             ["stats", "סטטיסטיקה (דמו)"],
             ["stats_live", "סטטיסטיקה לייב"],
             ["tips_v2", "ניתוח v3"],
+            ["analytics_v3", "📊 אנליטיקס V3"],
             ["help", "עזרה ותיעוד"],
           ] as const
         ).map(([k, l]) => (
@@ -2434,8 +2510,8 @@ export default function App() {
             <Card padding="md" style={{ marginBottom: "var(--s-4)" }}>
               <div style={{ color: "var(--muted)", fontSize: 14 }}>{market.title}</div>
               <div style={{ fontSize: 13, marginTop: 4 }}>
-                נותרו {Math.floor(market.seconds_left / 60)}:
-                {String(Math.floor(market.seconds_left % 60)).padStart(2, "0")} עד סיום החלון · אורך החלון{" "}
+                נותרו {Math.floor((effectiveWindowSecondsLeft ?? market.seconds_left) / 60)}:
+                {String(Math.floor((effectiveWindowSecondsLeft ?? market.seconds_left) % 60)).padStart(2, "0")} עד סיום החלון · אורך החלון{" "}
                 {market.window_sec != null
                   ? `${Math.round(market.window_sec / 60)} דקות`
                   : "—"}{" "}
@@ -2903,26 +2979,65 @@ export default function App() {
             ))}
           </div>
 
-          <label>
-            סכום השקעה ($) <span title="תקציב לעסקה">?</span>
-            <input
-              type="number"
-              step="0.5"
-              value={inv}
+          <label style={{ display: "block", marginBottom: 8 }}>
+            מצב סכום השקעה{" "}
+            <span title="קבוע: סכום ב-$ לכל עסקה. אחוז מתיק: % מה-equity הנוכחי (demo balance + שווי פוזיציות)">?</span>
+            <select
+              value={investmentMode}
               onChange={(e) => {
-                setInv(Number(e.target.value));
+                setInvestmentMode(e.target.value as "fixed" | "percent");
                 markCfgDirty();
               }}
-              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
-            />
-            {lossRecoveryEnabled && (
-              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
-                יעד השקעה אצל המנוע כרגע:{" "}
-                <strong className="tabular-nums">${(inv * lossRecoveryMultLive).toFixed(2)}</strong> (בסיס × מכפיל{" "}
-                {lossRecoveryMultLive.toFixed(2)}) · הפסדים רצופים: {lossRecoveryStreak}
-              </div>
-            )}
+              style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 4, padding: 8 }}
+            >
+              <option value="fixed">סכום קבוע ($)</option>
+              <option value="percent">אחוז מגודל התיק (%)</option>
+            </select>
           </label>
+          {investmentMode === "fixed" ? (
+            <label>
+              סכום השקעה ($) <span title="תקציב לעסקה">?</span>
+              <input
+                type="number"
+                step="0.5"
+                value={inv}
+                onChange={(e) => {
+                  setInv(Number(e.target.value));
+                  markCfgDirty();
+                }}
+                style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+              />
+              {lossRecoveryEnabled && (
+                <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
+                  יעד השקעה אצל המנוע כרגע:{" "}
+                  <strong className="tabular-nums">${(inv * lossRecoveryMultLive).toFixed(2)}</strong> (בסיס × מכפיל{" "}
+                  {lossRecoveryMultLive.toFixed(2)}) · הפסדים רצופים: {lossRecoveryStreak}
+                </div>
+              )}
+            </label>
+          ) : (
+            <label>
+              אחוז מגודל התיק (%){" "}
+              <span title="סכום לעסקה = equity × אחוז / 100. loss recovery חל על זה כמו על סכום קבוע.">?</span>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                step="0.5"
+                value={investmentPctOfPortfolio}
+                onChange={(e) => {
+                  setInvestmentPctOfPortfolio(Number(e.target.value));
+                  markCfgDirty();
+                }}
+                style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
+              />
+              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
+                מחושב דינמית כל כניסה מול שווי התיק (equity snapshot){lossRecoveryEnabled
+                  ? ` · מכפיל loss recovery ×${lossRecoveryMultLive.toFixed(2)}`
+                  : ""}
+              </div>
+            </label>
+          )}
           <label>
             כניסה במחיר (¢){" "}
             <span title="Polymarket: בדרך כלל 1¢–99¢ לחוזה (0.01$–0.99$)">?</span>
@@ -3397,6 +3512,65 @@ export default function App() {
                   }}
                   style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
                 />
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12, marginBottom: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={holdToResolutionEnabled}
+                  onChange={(e) => {
+                    setHoldToResolutionEnabled(e.target.checked);
+                    markCfgDirty();
+                  }}
+                />
+                החזק עד סוף החלון (Hold-to-Resolution) — אחרי DCA, אל תצא ב-TP אם הכיוון ברור
+              </label>
+              <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 10px", lineHeight: 1.55 }}>
+                מטרה: אחרי כמה סלייסי DCA עם הפסדים, רווח קטן ב-TP לא מכסה. אם הבוט בכיוון הנכון (bid ≥ סף),
+                מחזיקים עד סגירת החלון ומקבלים ~$1.00 לחוזה. stop-loss דינמי (אופציונלי) סוגר אם bid נופל
+                מתחת לממוצע הכניסה המשוקלל. בדקה האחרונה (freeze) חוזרים להתנהגות רגילה.
+              </p>
+              <label>
+                הפעלה רק אם בוצעו לפחות N סלייסי DCA (0 = להחזיק כבר מכניסה ראשונה)
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  disabled={!holdToResolutionEnabled}
+                  value={holdToResolutionMinDcaSlices}
+                  onChange={(e) => {
+                    setHoldToResolutionMinDcaSlices(Math.max(0, Math.floor(Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label>
+                סף ביטחון: הפעלה רק כש-bid ≥ (0.00–1.00)
+                <input
+                  type="number"
+                  step="0.01"
+                  min={0}
+                  max={1}
+                  disabled={!holdToResolutionEnabled}
+                  value={holdToResolutionMinPrice}
+                  onChange={(e) => {
+                    setHoldToResolutionMinPrice(Math.max(0, Math.min(1, Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                <input
+                  type="checkbox"
+                  disabled={!holdToResolutionEnabled}
+                  checked={holdToResolutionStopLoss}
+                  onChange={(e) => {
+                    setHoldToResolutionStopLoss(e.target.checked);
+                    markCfgDirty();
+                  }}
+                />
+                stop-loss דינמי — מכירה מידית אם bid יורד מתחת לממוצע הכניסה המשוקלל
               </label>
             </div>
             <div
@@ -4038,6 +4212,7 @@ export default function App() {
         </Card>
       )}
       {tab === "tips_v2" && <TipsV2 />}
+      {tab === "analytics_v3" && <AnalyticsV3 />}
       {tab === "signals" && <SignalsPanel />}
       {tab === "trigger" && <TriggerTrader />}
       </main>

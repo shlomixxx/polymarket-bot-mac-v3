@@ -64,21 +64,43 @@ def _encode_get_round_data(round_id: int) -> str:
     return GET_ROUND_DATA_SELECTOR + rid.to_bytes(32, "big").hex()
 
 
+_POLYGON_CLIENT: Optional[httpx.AsyncClient] = None
+_POLYGON_RPC_PREFER_IDX: int = 0
+
+
+def _get_polygon_client() -> httpx.AsyncClient:
+    global _POLYGON_CLIENT
+    if _POLYGON_CLIENT is None:
+        _POLYGON_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=2.0, read=3.0, write=3.0, pool=3.0),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        )
+    return _POLYGON_CLIENT
+
+
 async def _polygon_eth_call(data: str) -> Optional[str]:
+    """eth_call חוזר עם timeout קצר ו-RPC נדבק (sticky) לזה שעבד אחרון — לא נחסם על RPC איטי."""
+    global _POLYGON_RPC_PREFER_IDX
     payload = {
         "jsonrpc": "2.0",
         "method": "eth_call",
         "params": [{"to": CHAINLINK_BTC_USD_POLYGON, "data": data}, "latest"],
         "id": 1,
     }
-    async with httpx.AsyncClient() as client:
-        for rpc in POLYGON_PUBLIC_RPCS:
-            try:
-                r = await client.post(rpc, json=payload, timeout=8.0)
-                r.raise_for_status()
-                return r.json().get("result")
-            except Exception:
-                continue
+    client = _get_polygon_client()
+    n = len(POLYGON_PUBLIC_RPCS)
+    for i in range(n):
+        idx = (_POLYGON_RPC_PREFER_IDX + i) % n
+        rpc = POLYGON_PUBLIC_RPCS[idx]
+        try:
+            r = await client.post(rpc, json=payload, timeout=3.0)
+            r.raise_for_status()
+            res = r.json().get("result")
+            if res:
+                _POLYGON_RPC_PREFER_IDX = idx
+                return res
+        except Exception:
+            continue
     return None
 
 
@@ -98,6 +120,9 @@ async def fetch_chainlink_btc_usd_polygon_get_round(round_id: int) -> Optional[t
     return _decode_v3_round_full(res)
 
 
+_CHAINLINK_AT_WINDOW_CACHE: dict[int, float] = {}
+
+
 async def fetch_chainlink_btc_usd_polygon_at_window_start(window_epoch_sec: int) -> Optional[float]:
     """
     מחיר הייחוס לפי פיד Chainlink על Polygon בתחילת החלון — לא latestRoundData.
@@ -105,6 +130,10 @@ async def fetch_chainlink_btc_usd_polygon_at_window_start(window_epoch_sec: int)
     לוקחים את ערך הסיבוב האחרון ש־updatedAt <= זמן פתיחת החלון.
     (מזהי סיבוב גדולים מאוד — לכן חיפוש אחורה לינארי מהאחרון, לא בינארי על כל הטווח.)
     """
+    cached = _CHAINLINK_AT_WINDOW_CACHE.get(window_epoch_sec)
+    if cached is not None:
+        return cached
+
     now = int(time.time())
     if window_epoch_sec > now + 120:
         return await fetch_chainlink_btc_usd_polygon_latest()
@@ -114,11 +143,13 @@ async def fetch_chainlink_btc_usd_polygon_at_window_start(window_epoch_sec: int)
         return None
     hi_id, _ans, _st, hi_upd = latest
     if hi_upd <= window_epoch_sec:
+        _CHAINLINK_AT_WINDOW_CACHE[window_epoch_sec] = latest[1]
         return latest[1]
 
     rid = hi_id
-    # עד כ־15 דק׳ בין עדכוני אורקל לעיתים — אלפי סיבובים אחורה מכסים גם חלון ארוך
-    max_steps = 8000
+    # אורקל מתעדכן בערך כל heartbeat (כמה דקות) — 200 סיבובים כיסוי בטוח לחלון 5/15 דק׳.
+    # קודם עברנו על 8000 — חסם את ה-event loop לעשרות שניות כשרשת RPC איטית.
+    max_steps = 200
     for _ in range(max_steps):
         if rid <= 0:
             break
@@ -128,6 +159,7 @@ async def fetch_chainlink_btc_usd_polygon_at_window_start(window_epoch_sec: int)
             continue
         _r, ans, _st2, upd = rd
         if upd <= window_epoch_sec:
+            _CHAINLINK_AT_WINDOW_CACHE[window_epoch_sec] = ans
             return ans
         rid -= 1
     return None
@@ -163,11 +195,30 @@ async def fetch_chainlink_btc_usd_polygon_latest() -> Optional[float]:
     return None
 
 
+_BTC_SPOT_CACHE: dict[str, Any] = {"price": None, "ts": 0.0}
+_BTC_SPOT_CACHE_TTL_SEC = 1.0
+_BTC_SPOT_STALE_TTL_SEC = 30.0
+
+
 async def fetch_btc_spot_usdt() -> float:
-    async with httpx.AsyncClient() as client:
-        r = await client.get(BINANCE_TICKER, params={"symbol": "BTCUSDT"}, timeout=10.0)
-        r.raise_for_status()
-        return float(r.json()["price"])
+    """מחיר BTC ספוט מ-Binance עם קאש 1s ו-fallback למחיר אחרון תקף עד 30s במקרה כשל."""
+    now = time.time()
+    cached_price = _BTC_SPOT_CACHE.get("price")
+    cached_ts = float(_BTC_SPOT_CACHE.get("ts") or 0.0)
+    if cached_price is not None and (now - cached_ts) <= _BTC_SPOT_CACHE_TTL_SEC:
+        return float(cached_price)
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(BINANCE_TICKER, params={"symbol": "BTCUSDT"}, timeout=4.0)
+            r.raise_for_status()
+            price = float(r.json()["price"])
+        _BTC_SPOT_CACHE["price"] = price
+        _BTC_SPOT_CACHE["ts"] = time.time()
+        return price
+    except Exception:
+        if cached_price is not None and (now - cached_ts) <= _BTC_SPOT_STALE_TTL_SEC:
+            return float(cached_price)
+        raise
 
 
 async def fetch_open_price_at_window_start(window_epoch_sec: int) -> Optional[float]:

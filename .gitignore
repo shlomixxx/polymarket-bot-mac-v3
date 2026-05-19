@@ -10,3 +10,7 @@ tips_v2_cache.json
 
 # מצב דמו (יתרה, פוזיציות, היסטוריית equity) — מתעדכן כל הזמן; לא קוד
 **/demo_state.json
+
+# SQLite journal files (transient; נוצרים בזמן ריצה ולא לקומיט)
+*.db-shm
+*.db-wal
