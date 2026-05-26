@@ -177,6 +177,59 @@ def get_recent_windows(limit: int = 20, window_sec: int = 300) -> list[dict]:
         return []
 
 
+def get_last_window_winners(
+    window_sec: int = 300,
+    limit: int = 5,
+    min_drift_pct: float = 0.0,
+) -> list[dict[str, Any]]:
+    """N חלונות אחרונים שנסגרו עם תוצאה ידועה (פיצ'ר Follow Last Winner).
+
+    - window_sec: סינון לפי 5m / 15m.
+    - limit: כמה חלונות אחרונים להחזיר אחרי הסינון.
+    - min_drift_pct: אם > 0, מסנן חלונות שהזזת BTC בהם < X% (רעש).
+      0 = ללא סינון. אחוז מוחלט: |btc_close-btc_open|/btc_open*100.
+
+    הסידור: epoch DESC — הראשון ברשימה הוא החלון העדכני ביותר.
+    """
+    try:
+        conn = _get_conn()
+        # שולפים יותר מהרצוי אם יש סינון drift — כדי שנוכל לחתוך אחרי הסינון.
+        fetch_limit = max(limit * 6, limit) if min_drift_pct > 0 else limit
+        cur = conn.execute(
+            """
+            SELECT epoch, slug, window_sec, side_won, btc_open, btc_close, ts_recorded
+            FROM window_results
+            WHERE window_sec = ? AND side_won IS NOT NULL
+            ORDER BY epoch DESC LIMIT ?
+            """,
+            (window_sec, fetch_limit),
+        )
+        rows = [dict(row) for row in cur.fetchall()]
+    except Exception:
+        return []
+    if min_drift_pct <= 0:
+        return rows[:limit]
+    filtered: list[dict[str, Any]] = []
+    for r in rows:
+        bo = r.get("btc_open")
+        bc = r.get("btc_close")
+        if bo is None or bc is None:
+            continue
+        try:
+            bof = float(bo)
+            bcf = float(bc)
+        except (TypeError, ValueError):
+            continue
+        if bof <= 0:
+            continue
+        drift = abs(bcf - bof) / bof * 100.0
+        if drift >= min_drift_pct:
+            filtered.append(r)
+        if len(filtered) >= limit:
+            break
+    return filtered
+
+
 def get_hourly_breakdown(window_sec: int = 300) -> list[dict]:
     """פירוט win rate לכל שעה (0-23 UTC)."""
     try:

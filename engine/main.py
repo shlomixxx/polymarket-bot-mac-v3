@@ -90,7 +90,12 @@ import secret_store
 from order_validation import validate_contracts_for_market
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
 from signal_engine import CONFIDENCE_THRESHOLD, compute_signals
-from history_tracker import record_window_result, get_recent_windows, get_hourly_breakdown
+from history_tracker import (
+    record_window_result,
+    get_recent_windows,
+    get_hourly_breakdown,
+    get_last_window_winners,
+)
 from trigger_engine import TriggerEngine, TriggerConfig
 from strategy_runner import StrategyConfig, StrategyRunner
 from tips_v2 import delete_run_folder_by_key, generate_tips_v2, list_run_folders_detailed
@@ -368,6 +373,10 @@ def _save_persisted_config() -> None:
             "hold_to_resolution_stop_loss_enabled": bool(getattr(c, "hold_to_resolution_stop_loss_enabled", True)),
             "investment_mode": str(getattr(c, "investment_mode", "fixed")),
             "investment_pct_of_portfolio": float(getattr(c, "investment_pct_of_portfolio", 5.0)),
+            "follow_last_winner_enabled": bool(getattr(c, "follow_last_winner_enabled", False)),
+            "follow_last_winner_lookback": int(getattr(c, "follow_last_winner_lookback", 1)),
+            "follow_last_winner_mode": str(getattr(c, "follow_last_winner_mode", "forward")),
+            "follow_last_winner_min_btc_drift_pct": float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0)),
             "mode": runner.rt.mode,
             # מצב "כסף אמיתי" נשלט מהממשק — נשמר בין הפעלות אבל נגדר ע"י POLYMARKET_LIVE env בפריסה.
             "live_trading": bool(getattr(runner.rt, "live_trading", False)),
@@ -1087,6 +1096,11 @@ class ConfigBody(BaseModel):
     hold_to_resolution_stop_loss_enabled: bool = True
     investment_mode: str = "fixed"
     investment_pct_of_portfolio: float = 5.0
+    # Follow Last Winner (FLW)
+    follow_last_winner_enabled: bool = False
+    follow_last_winner_lookback: int = 1
+    follow_last_winner_mode: str = "forward"
+    follow_last_winner_min_btc_drift_pct: float = 0.0
 
 
 @app.post("/api/strategy/config")
@@ -1124,6 +1138,12 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "hold_to_resolution_min_dca_slices must be >= 0")
     if float(body.hold_to_resolution_min_price) < 0 or float(body.hold_to_resolution_min_price) > 1:
         raise HTTPException(400, "hold_to_resolution_min_price must be between 0 and 1")
+    if int(body.follow_last_winner_lookback) < 1 or int(body.follow_last_winner_lookback) > 5:
+        raise HTTPException(400, "follow_last_winner_lookback must be between 1 and 5")
+    if body.follow_last_winner_mode not in ("forward", "reverse"):
+        raise HTTPException(400, "follow_last_winner_mode must be 'forward' or 'reverse'")
+    if float(body.follow_last_winner_min_btc_drift_pct) < 0 or float(body.follow_last_winner_min_btc_drift_pct) > 10:
+        raise HTTPException(400, "follow_last_winner_min_btc_drift_pct must be between 0 and 10")
     c = runner.rt.config
     for k, v in body.model_dump().items():
         if hasattr(c, k):
@@ -1189,6 +1209,10 @@ async def get_strategy_config():
         "hold_to_resolution_stop_loss_enabled": bool(getattr(c, "hold_to_resolution_stop_loss_enabled", True)),
         "investment_mode": str(getattr(c, "investment_mode", "fixed")),
         "investment_pct_of_portfolio": float(getattr(c, "investment_pct_of_portfolio", 5.0)),
+        "follow_last_winner_enabled": bool(getattr(c, "follow_last_winner_enabled", False)),
+        "follow_last_winner_lookback": int(getattr(c, "follow_last_winner_lookback", 1)),
+        "follow_last_winner_mode": str(getattr(c, "follow_last_winner_mode", "forward")),
+        "follow_last_winner_min_btc_drift_pct": float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0)),
         "mode": runner.rt.mode,
         "last_status": runner.rt.last_status,
         # מפתח אחרון מ-status() — נוח למיפוי אנגלי בדף שידור/OBS
@@ -1667,6 +1691,76 @@ async def history_hourly(window_sec: int = 300):
     """פירוט win rate לפי שעה (0-23 UTC)."""
     rows = get_hourly_breakdown(window_sec=int(window_sec))
     return {"hourly": rows}
+
+
+@app.get("/api/history/last-window-outcome")
+async def history_last_window_outcome():
+    """תוצאת חלון/ות אחרונים + תצוגה מקדימה של בחירת FLW (לתצוגת UI).
+
+    מחזיר:
+    - last: החלון האחרון שנסגר (epoch, side_won, btc_open/close, drift_pct).
+    - flw_preview: לאיזה צד FLW היה נכנס עכשיו לפי הקונפיג הנוכחי. None אם
+      FLW כבוי או שאין מספיק history.
+    """
+    c = runner.rt.config
+    try:
+        from market_discovery import window_step_sec
+        ws = window_step_sec(getattr(c, "btc_window", "5m"))
+    except Exception:
+        ws = 300
+    # תמיד לוקחים את החלון האחרון (ללא סינון drift) לתצוגה
+    latest = get_last_window_winners(window_sec=ws, limit=1, min_drift_pct=0.0)
+    last_out: Optional[dict[str, Any]] = None
+    if latest:
+        r = latest[0]
+        bo = r.get("btc_open")
+        bc = r.get("btc_close")
+        drift_pct: Optional[float] = None
+        if bo is not None and bc is not None:
+            try:
+                bof = float(bo)
+                bcf = float(bc)
+                if bof > 0:
+                    drift_pct = round((bcf - bof) / bof * 100.0, 4)
+            except (TypeError, ValueError):
+                pass
+        last_out = {
+            "epoch": r.get("epoch"),
+            "slug": r.get("slug"),
+            "side_won": r.get("side_won"),
+            "btc_open": bo,
+            "btc_close": bc,
+            "drift_pct": drift_pct,
+            "window_sec": ws,
+            "ts_recorded": r.get("ts_recorded"),
+        }
+    # תצוגה מקדימה של FLW לפי הקונפיג הנוכחי
+    flw_preview: Optional[dict[str, Any]] = None
+    if getattr(c, "follow_last_winner_enabled", False):
+        try:
+            side = runner._resolve_follow_winner_side(c)
+            lookback = int(getattr(c, "follow_last_winner_lookback", 1) or 1)
+            min_drift = float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0) or 0.0)
+            sample = get_last_window_winners(window_sec=ws, limit=lookback, min_drift_pct=min_drift)
+            flw_preview = {
+                "side": side,  # None אם אין history → fallback ל-side_preference
+                "lookback": lookback,
+                "mode": str(getattr(c, "follow_last_winner_mode", "forward")),
+                "min_drift_pct": min_drift,
+                "fallback_side_preference": getattr(c, "side_preference", "Up"),
+                "samples": [
+                    {
+                        "epoch": s.get("epoch"),
+                        "side_won": s.get("side_won"),
+                        "btc_open": s.get("btc_open"),
+                        "btc_close": s.get("btc_close"),
+                    }
+                    for s in sample
+                ],
+            }
+        except Exception:
+            flw_preview = None
+    return {"last": last_out, "flw_preview": flw_preview, "window_sec": ws}
 
 
 # ── Trigger API ────────────────────────────────────────────────────────────────

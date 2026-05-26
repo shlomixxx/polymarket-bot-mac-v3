@@ -101,6 +101,14 @@ class StrategyConfig:
     # "percent" = אחוז מגודל החשבון (equity_snapshot) כפול investment_pct_of_portfolio.
     investment_mode: Literal["fixed", "percent"] = "fixed"
     investment_pct_of_portfolio: float = 5.0
+    # Follow Last Winner (FLW): כיוון הכניסה נגזר מתוצאת חלון/ות הקודמים.
+    # forward = ממשיכים עם הצד שניצח; reverse = הופכים (mean reversion).
+    # min_btc_drift_pct: אם הזזת BTC בחלון הקודם הייתה < X%, מתעלמים מהחלון (רעש).
+    # אם אין history (חלון ראשון) או תיקו ב-lookback>1 → fallback ל-side_preference.
+    follow_last_winner_enabled: bool = False
+    follow_last_winner_lookback: int = 1
+    follow_last_winner_mode: Literal["forward", "reverse"] = "forward"
+    follow_last_winner_min_btc_drift_pct: float = 0.0
 
 
 @dataclass
@@ -754,6 +762,51 @@ class StrategyRunner:
             return "intermediate"
         return "ok"
 
+    def _resolve_follow_winner_side(self, cfg: StrategyConfig) -> Optional[str]:
+        """מחזיר 'Up'/'Down' לפי תוצאת חלון/ות קודמים. None = fallback ל-side_preference.
+
+        כללים:
+        - lookback מנורמל ל-[1, 5].
+        - אם lookback>1 לוקחים רוב; תיקו → None (fallback).
+        - mode='reverse' הופך את התוצאה (mean reversion).
+        - min_btc_drift_pct מסנן חלונות עם תזוזת BTC חלשה (רעש).
+        - בלי history → None (fallback).
+        """
+        from history_tracker import get_last_window_winners
+        from market_discovery import window_step_sec
+
+        try:
+            window_sec = window_step_sec(cfg.btc_window)
+        except Exception:
+            window_sec = 300
+        lookback = int(getattr(cfg, "follow_last_winner_lookback", 1) or 1)
+        lookback = max(1, min(5, lookback))
+        min_drift = float(getattr(cfg, "follow_last_winner_min_btc_drift_pct", 0.0) or 0.0)
+        winners = get_last_window_winners(
+            window_sec=window_sec, limit=lookback, min_drift_pct=min_drift
+        )
+        if not winners:
+            self.rt.status(
+                "FLW: אין חלונות סגורים שעומדים בתנאים — fallback ל-side_preference",
+                key="flw_no_history",
+                repeat_interval_sec=60.0,
+            )
+            return None
+        up_count = sum(1 for w in winners if w.get("side_won") == "Up")
+        down_count = sum(1 for w in winners if w.get("side_won") == "Down")
+        if up_count == down_count:
+            self.rt.status(
+                f"FLW: תיקו ב-{len(winners)} חלונות — fallback ל-side_preference",
+                key="flw_tie",
+                repeat_interval_sec=60.0,
+            )
+            return None
+        direction = "Up" if up_count > down_count else "Down"
+        mode = getattr(cfg, "follow_last_winner_mode", "forward")
+        if mode == "reverse":
+            direction = "Down" if direction == "Up" else "Up"
+        return direction
+
     async def _settle_stale_positions_when_off(self) -> None:
         """Housekeeping ל-mode=='off' בלבד: סגירת פוזיציות תקועות מחלונות שהסתיימו.
 
@@ -1342,7 +1395,25 @@ class StrategyRunner:
                 self.rt.status(msg, key="intermediate", session_id=sid)
                 return
 
-        if cfg.side_preference == "Down":
+        # Follow Last Winner (FLW): מעקף את side_preference אם פעיל ויש history.
+        # אם DCA רץ ויש כבר פוזיציה — נוותר ונמשיך עם הצד הקיים (לא לקטוע סלייסים).
+        flw_side: Optional[str] = None
+        if (
+            getattr(cfg, "follow_last_winner_enabled", False)
+            and not (pos_u or pos_d)  # רק לעסקה חדשה, לא בתוך DCA רץ
+        ):
+            flw_side = self._resolve_follow_winner_side(cfg)
+        if flw_side == "Up":
+            if ask_u is None:
+                self.rt.status("סטטוס: Ask חסר ל-Up (FLW) — לא ניתן להיכנס", key="book_missing_entry_up")
+                return
+            side, token, ask = "Up", token_up, ask_u
+        elif flw_side == "Down":
+            if ask_d is None:
+                self.rt.status("סטטוס: Ask חסר ל-Down (FLW) — לא ניתן להיכנס", key="book_missing_entry_down")
+                return
+            side, token, ask = "Down", token_down, ask_d
+        elif cfg.side_preference == "Down":
             if ask_d is None:
                 self.rt.status("סטטוס: Ask חסר ל-Down — לא ניתן להיכנס", key="book_missing_entry_down")
                 return

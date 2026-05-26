@@ -1775,6 +1775,16 @@ export default function App() {
   const [holdToResolutionStopLoss, setHoldToResolutionStopLoss] = useState(true);
   const [investmentMode, setInvestmentMode] = useState<"fixed" | "percent">("fixed");
   const [investmentPctOfPortfolio, setInvestmentPctOfPortfolio] = useState(5);
+  // Follow Last Winner (FLW)
+  const [flwEnabled, setFlwEnabled] = useState(false);
+  const [flwLookback, setFlwLookback] = useState(1);
+  const [flwMode, setFlwMode] = useState<"forward" | "reverse">("forward");
+  const [flwMinDrift, setFlwMinDrift] = useState(0);
+  // תצוגת תוצאות חלון אחרון + תצוגה מקדימה של בחירת FLW
+  const [lastWindowOutcome, setLastWindowOutcome] = useState<{
+    last: { side_won?: string | null; btc_open?: number | null; btc_close?: number | null; drift_pct?: number | null; epoch?: number | null } | null;
+    flw_preview: { side?: string | null; lookback?: number; mode?: string; min_drift_pct?: number; fallback_side_preference?: string; samples?: Array<{ epoch: number; side_won: string; btc_open?: number; btc_close?: number }> } | null;
+  } | null>(null);
   /** מצב ריצה מהשרת (תמיד מסונכרן) */
   const [lossRecoveryStreak, setLossRecoveryStreak] = useState(0);
   const [lossRecoveryMultLive, setLossRecoveryMultLive] = useState(1);
@@ -1836,7 +1846,7 @@ export default function App() {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     try {
-      const [m, b, st, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw] = await Promise.all([
+      const [m, b, st, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw, lwo] = await Promise.all([
         api<Market>("/api/market/current", { timeoutMs: TIMEOUT_MS_MARKET_CURRENT }),
         api<{ price: number; history: { t: number; p: number }[] }>("/api/btc/live"),
         api<Record<string, unknown>>("/api/demo/state", { timeoutMs: TIMEOUT_MS_DEMO_STATE }),
@@ -1853,6 +1863,10 @@ export default function App() {
           allowance_usd?: number | null;
           address?: string | null;
         }>("/api/live/polymarket-clob-account").catch(() => ({ ok: false, error: "לא ניתן לטעון" })),
+        api<{
+          last: { side_won?: string | null; btc_open?: number | null; btc_close?: number | null; drift_pct?: number | null; epoch?: number | null } | null;
+          flw_preview: { side?: string | null; lookback?: number; mode?: string; min_drift_pct?: number; fallback_side_preference?: string; samples?: Array<{ epoch: number; side_won: string; btc_open?: number; btc_close?: number }> } | null;
+        }>("/api/history/last-window-outcome").catch(() => null),
       ]);
       if (lm) {
         setLiveMode(Boolean(lm.enabled));
@@ -1953,8 +1967,13 @@ export default function App() {
         if (typeof c.hold_to_resolution_stop_loss_enabled === "boolean") setHoldToResolutionStopLoss(c.hold_to_resolution_stop_loss_enabled);
         if (c.investment_mode === "fixed" || c.investment_mode === "percent") setInvestmentMode(c.investment_mode);
         if (typeof c.investment_pct_of_portfolio === "number") setInvestmentPctOfPortfolio(c.investment_pct_of_portfolio);
+        if (typeof c.follow_last_winner_enabled === "boolean") setFlwEnabled(c.follow_last_winner_enabled);
+        if (typeof c.follow_last_winner_lookback === "number") setFlwLookback(c.follow_last_winner_lookback);
+        if (c.follow_last_winner_mode === "forward" || c.follow_last_winner_mode === "reverse") setFlwMode(c.follow_last_winner_mode);
+        if (typeof c.follow_last_winner_min_btc_drift_pct === "number") setFlwMinDrift(c.follow_last_winner_min_btc_drift_pct);
       }
       setOb(obSummary);
+      if (lwo) setLastWindowOutcome(lwo as typeof lastWindowOutcome);
       refreshFailCount.current = 0;
       setErr("");
     } catch (e: unknown) {
@@ -2094,6 +2113,10 @@ export default function App() {
           hold_to_resolution_stop_loss_enabled: holdToResolutionStopLoss,
           investment_mode: investmentMode,
           investment_pct_of_portfolio: Math.max(0, investmentPctOfPortfolio),
+          follow_last_winner_enabled: flwEnabled,
+          follow_last_winner_lookback: Math.max(1, Math.min(5, Math.floor(flwLookback))),
+          follow_last_winner_mode: flwMode,
+          follow_last_winner_min_btc_drift_pct: Math.max(0, Math.min(10, flwMinDrift)),
         }),
       });
       cfgDirtyRef.current = false;
@@ -2126,7 +2149,8 @@ export default function App() {
       orderMode, entrySlippagePct, exitSlippagePct, peakWatchdogEnabled, peakRetreatExitPct,
       retryMaxAttempts, holdToResolutionEnabled, holdToResolutionMinDcaSlices,
       holdToResolutionMinPrice, holdToResolutionStopLoss,
-      investmentMode, investmentPctOfPortfolio]);
+      investmentMode, investmentPctOfPortfolio,
+      flwEnabled, flwLookback, flwMode, flwMinDrift]);
 
   const setMode = (m: "off" | "semi" | "auto") => {
     const prevMode = botMode;
@@ -2583,6 +2607,51 @@ export default function App() {
                       </span>
                     )}
                   </span>
+                </div>
+              )}
+              {/* תוצאת חלון קודם — לתצוגה ולפיצ'ר Follow Last Winner */}
+              {lastWindowOutcome?.last && lastWindowOutcome.last.side_won && (
+                <div style={{ marginTop: 10, fontSize: 12, color: "var(--muted)", lineHeight: 1.5 }}>
+                  <strong>חלון קודם:</strong>{" "}
+                  <span
+                    style={{
+                      color: lastWindowOutcome.last.side_won === "Up" ? "var(--up)" : "var(--down)",
+                      fontWeight: 600,
+                    }}
+                  >
+                    {lastWindowOutcome.last.side_won} ניצח
+                  </span>
+                  {lastWindowOutcome.last.btc_open != null && lastWindowOutcome.last.btc_close != null && (
+                    <>
+                      {" · "}BTC ${Number(lastWindowOutcome.last.btc_open).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                      {" → "}${Number(lastWindowOutcome.last.btc_close).toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                      {lastWindowOutcome.last.drift_pct != null && (
+                        <span
+                          style={{
+                            color:
+                              (lastWindowOutcome.last.drift_pct ?? 0) >= 0 ? "var(--up)" : "var(--down)",
+                            marginRight: 4,
+                          }}
+                        >
+                          {" "}({(lastWindowOutcome.last.drift_pct as number) >= 0 ? "+" : ""}
+                          {(lastWindowOutcome.last.drift_pct as number).toFixed(3)}%)
+                        </span>
+                      )}
+                    </>
+                  )}
+                  {flwEnabled && lastWindowOutcome?.flw_preview?.side && (
+                    <span style={{ marginRight: 8 }}>
+                      {" · "}FLW יבחר:{" "}
+                      <strong
+                        style={{
+                          color:
+                            lastWindowOutcome.flw_preview.side === "Up" ? "var(--up)" : "var(--down)",
+                        }}
+                      >
+                        {lastWindowOutcome.flw_preview.side}
+                      </strong>
+                    </span>
+                  )}
                 </div>
               )}
             </Card>
@@ -3687,6 +3756,129 @@ export default function App() {
               <option value="signal">אוטו (הצד הזול מ-Ask)</option>
             </select>
           </label>
+
+          {/* Follow Last Winner — כיוון לפי תוצאת חלון/ות קודמים */}
+          <div
+            style={{
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-sm)",
+              padding: 12,
+              marginBottom: 16,
+              background: "var(--bg-elevated)",
+            }}
+          >
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}>
+              <input
+                type="checkbox"
+                checked={flwEnabled}
+                onChange={(e) => {
+                  setFlwEnabled(e.target.checked);
+                  markCfgDirty();
+                }}
+              />
+              כניסה לפי החלון המנצח (Follow Last Winner)
+            </label>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, lineHeight: 1.55 }}>
+              כשמסומן: כיוון הכניסה נגזר מתוצאת החלון/ות הקודמים, ועוקף את "צד" למעלה.
+              כל שאר ההגדרות (DCA, TP, slippage, גידור) נשארות זהות. אם אין מספיק היסטוריה או יש תיקו — חוזרים לבחירה ב"צד".
+            </div>
+
+            {flwEnabled && (
+              <div style={{ marginTop: 10, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
+                <label style={{ fontSize: 13 }}>
+                  מספר חלונות לבדוק{" "}
+                  <span title="1 = רק האחרון; 3 = רוב של 3 אחרונים; וכו'">?</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={5}
+                    step={1}
+                    value={flwLookback}
+                    onChange={(e) => {
+                      setFlwLookback(Math.max(1, Math.min(5, Math.floor(Number(e.target.value) || 1))));
+                      markCfgDirty();
+                    }}
+                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
+                  />
+                </label>
+
+                <label style={{ fontSize: 13 }}>
+                  כיוון{" "}
+                  <span title="forward = הצד שניצח חוזר; reverse = הימור הפוך (mean reversion)">?</span>
+                  <select
+                    value={flwMode}
+                    onChange={(e) => {
+                      setFlwMode(e.target.value as "forward" | "reverse");
+                      markCfgDirty();
+                    }}
+                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
+                  >
+                    <option value="forward">בכיוון המנצח (forward)</option>
+                    <option value="reverse">בכיוון הפוך (reverse)</option>
+                  </select>
+                </label>
+
+                <label style={{ fontSize: 13 }}>
+                  מינ׳ תזוזת BTC (%) {" "}
+                  <span title="חלון שתזוזת BTC בו קטנה מהסף נחשב 'רעש' ולא נחשב בבחירה. 0 = ללא סינון">?</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={10}
+                    step={0.01}
+                    value={flwMinDrift}
+                    onChange={(e) => {
+                      setFlwMinDrift(Math.max(0, Math.min(10, Number(e.target.value) || 0)));
+                      markCfgDirty();
+                    }}
+                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
+                  />
+                </label>
+              </div>
+            )}
+
+            {flwEnabled && lastWindowOutcome?.flw_preview && (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: 10,
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--bg)",
+                  fontSize: 12,
+                  lineHeight: 1.6,
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                  תצוגה מקדימה (לפי המצב הנוכחי):
+                </div>
+                {lastWindowOutcome.flw_preview.side ? (
+                  <div>
+                    הכניסה הבאה תהיה{" "}
+                    <strong
+                      style={{
+                        color: lastWindowOutcome.flw_preview.side === "Up" ? "var(--up)" : "var(--down)",
+                      }}
+                    >
+                      {lastWindowOutcome.flw_preview.side}
+                    </strong>{" "}
+                    (lookback={lastWindowOutcome.flw_preview.lookback}, mode={lastWindowOutcome.flw_preview.mode})
+                  </div>
+                ) : (
+                  <div style={{ color: "var(--muted)" }}>
+                    אין מספיק היסטוריה / תיקו → fallback ל"צד"=<strong>{lastWindowOutcome.flw_preview.fallback_side_preference || side}</strong>
+                  </div>
+                )}
+                {lastWindowOutcome.flw_preview.samples && lastWindowOutcome.flw_preview.samples.length > 0 && (
+                  <div style={{ marginTop: 6, color: "var(--muted)" }}>
+                    דגימות:{" "}
+                    {lastWindowOutcome.flw_preview.samples
+                      .map((s) => `${s.side_won === "Up" ? "↑" : "↓"} ${s.side_won}`)
+                      .join(" · ")}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
             <button
