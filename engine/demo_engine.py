@@ -127,20 +127,71 @@ POSITION_TRACKING_PATH_MIN_DELTA_PCT = 0.12  # דגום גם כשהשינוי >=
 # קפיצה חדה (למשל +30% ל־-20% בין דגימות) — תמיד לרשום דגימה נוספת
 POSITION_TRACKING_PATH_FORCE_DELTA_PCT = 0.45
 # גלילה: נשמרות ה־N האחרונות (לא מפסיקים לדגום אחרי N).
-# לא משנה את מהירות הדגימה — רק אורך ההיסטוריה בגרף. ברירת מחדל 240 (כמו לפני ההרחבה).
+# לא משנה את מהירות הדגימה — רק אורך ההיסטוריה בגרף.
+# ברירת מחדל הועלתה ל-5000: מספיק ל-15 דק׳ בקצב volatile מלא (5/שנ' × 900 = 4500),
+# כך שב-99% מהמקרים אין trim — המשתמש רואה את כל ההיסטוריה כולל peaks מוקדמים.
+# כש-cap כן נחרג (חלון 30 דק׳, volatility אקסטרים) — _smart_trim_path משמר את הכניסה,
+# peak, trough והדגימות האחרונות, ודוגם מהאמצע אחיד.
 def _position_tracking_path_max() -> int:
-    default = 240
+    default = 5000
     raw = os.environ.get("POSITION_TRACKING_PATH_MAX")
     if raw is None or not str(raw).strip():
         return default
     try:
         v = int(str(raw).strip(), 10)
-        return max(64, min(v, 10_000))
+        return max(64, min(v, 50_000))
     except ValueError:
         return default
 
 
 POSITION_TRACKING_PATH_MAX = _position_tracking_path_max()
+
+
+def _smart_trim_path(path: list, max_len: int, peak_ts: Optional[float], trough_ts: Optional[float]) -> list:
+    """מקצץ את ה-path בצורה חכמה: שומר entry / peak / trough / recent, ומדגם מהאמצע אחיד.
+
+    קריטריוני שמירה (לפי סדר עדיפות):
+    1. הדגימה הראשונה (נקודת כניסה).
+    2. הדגימה האחרונה (תמיד עדכנית).
+    3. דגימה תואמת ל-high_watermark_ts (peak).
+    4. דגימה תואמת ל-low_watermark_ts (trough).
+    5. min(100, max_len/4) הדגימות האחרונות (פעילות עדכנית).
+    6. דגימה אחידה (step uniform) מתוך הנותרות.
+
+    O(n) בזיכרון ובזמן. מחזיר רשימה חדשה.
+    """
+    n = len(path)
+    if n <= max_len:
+        return path
+    must_keep: set[int] = {0, n - 1}
+    # peak / trough — מזהים לפי ts בדיוק של 1ms
+    if peak_ts is not None:
+        for i, s in enumerate(path):
+            sts = s.get("ts")
+            if isinstance(sts, (int, float)) and abs(float(sts) - float(peak_ts)) < 0.001:
+                must_keep.add(i)
+                break
+    if trough_ts is not None:
+        for i, s in enumerate(path):
+            sts = s.get("ts")
+            if isinstance(sts, (int, float)) and abs(float(sts) - float(trough_ts)) < 0.001:
+                must_keep.add(i)
+                break
+    # שומרים את N הדגימות האחרונות לפעילות עדכנית בגרף
+    recent_n = min(100, max(1, max_len // 4))
+    for i in range(max(0, n - recent_n), n):
+        must_keep.add(i)
+    # דגימה אחידה מהנותרות
+    remaining_target = max_len - len(must_keep)
+    if remaining_target > 0:
+        candidates = [i for i in range(n) if i not in must_keep]
+        if candidates:
+            step = max(1.0, len(candidates) / remaining_target)
+            for k in range(remaining_target):
+                idx = int(k * step)
+                if idx < len(candidates):
+                    must_keep.add(candidates[idx])
+    return [path[i] for i in sorted(must_keep)]
 
 # תנודתיות גבוהה בין טיקי mark_to_market מלאים → חלון דגימה אגרסיבית (יותר קריאות CLOB + צפוף path)
 VOLATILE_TICK_DELTA_PCT = 4.0
@@ -1362,8 +1413,16 @@ class DemoEngine:
                     "balance": round(self.state.balance_usd, 2),
                     "equity": round(eq, 2),
                 })
-                while len(path) > POSITION_TRACKING_PATH_MAX:
-                    path.pop(0)
+                if len(path) > POSITION_TRACKING_PATH_MAX:
+                    # Smart trim: שומר peak/trough/entry/recent במקום למחוק עיוור.
+                    new_path = _smart_trim_path(
+                        path,
+                        POSITION_TRACKING_PATH_MAX,
+                        tr.get("high_watermark_ts"),
+                        tr.get("low_watermark_ts"),
+                    )
+                    path.clear()
+                    path.extend(new_path)
                 tr["_last_path_ts"] = now
                 tr["_last_path_upnl"] = upnl_pct
             tr["_prev_tick_upnl"] = upnl_pct
