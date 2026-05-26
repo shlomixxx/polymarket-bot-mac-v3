@@ -754,9 +754,66 @@ class StrategyRunner:
             return "intermediate"
         return "ok"
 
+    async def _settle_stale_positions_when_off(self) -> None:
+        """Housekeeping ל-mode=='off' בלבד: סגירת פוזיציות תקועות מחלונות שהסתיימו.
+
+        רקע: ב-_tick הרגיל יש בלוק rollover (line ~787) שמטפל בפוזיציות מחלון
+        שעבר. הוא רץ רק כשmode!='off'. אם המשתמש כיבה את המנוע (או הבוט הופעל
+        מחדש) בזמן שיש פוזיציה פתוחה, הפוזיציה נשארת תקועה ב-state בלי שאיש
+        יסגור אותה — bug שגרם ל-trade #90 להישאר פתוח 153 שעות.
+
+        הפונקציה הזו רצה רק כשmode=='off' (קוראים לה לפני return early של _tick),
+        ומסדרת את המקרה הזה. אם mode!='off', הקוד המקורי יטפל ברגיל ויפעיל גם
+        loss_recovery, reset של dca counters וכו'. לכן לא לקרוא לפונקציה הזו
+        כשmode!='off' (כפילות).
+        """
+        if not self.demo.state.positions:
+            return
+        try:
+            m = await discover_active_btc_window(self.rt.config.btc_window)
+        except Exception:
+            return
+        if not m:
+            return
+        # יש פוזיציות. נבדוק אם token_id שלהן עדיין מתאים לשוק הפעיל. אם לא — לסגור.
+        valid_tokens = {m.token_up, m.token_down}
+        stale = [p for p in self.demo.state.positions if p.token_id not in valid_tokens]
+        if not stale:
+            return
+        from market_discovery import window_step_sec
+
+        rollover_ctx = {
+            "settled_epoch": self.rt.current_epoch or None,
+            "settled_window_sec": window_step_sec(self.rt.config.btc_window),
+            "epoch": m.epoch,
+            "slug": m.slug,
+            "reason": "EXPIRE_0 stale_cleanup_while_off",
+        }
+        try:
+            settlement_trades = await self.demo.expire_all_outside_tokens(
+                (m.token_up, m.token_down),
+                context=rollover_ctx,
+            )
+        except Exception as e:
+            self.rt.log(f"stale_cleanup: {e!r}")
+            return
+        if settlement_trades:
+            settled_tids = {t.get("token_id") or "" for t in settlement_trades}
+            settled_tids.discard("")
+            self.rt._settled_token_ids.update(settled_tids)
+            self.rt._settled_token_ids_ts = time.time()
+            self.rt.log(
+                f"ניקוי תקופתי (mode=off): סגרתי {len(settlement_trades)} פוזיציות מחלון ישן"
+            )
+
     async def _tick(self) -> None:
         mode = self.rt.mode
         if mode == "off":
+            # mode כבוי — אבל פוזיציות מחלון ישן חייבות עדיין להיסגר.
+            try:
+                await self._settle_stale_positions_when_off()
+            except Exception as e:
+                self.rt.log(f"housekeeping_off: {e!r}")
             return
         try:
             import main as _engine_main
@@ -764,6 +821,7 @@ class StrategyRunner:
             _engine_main._ensure_bot_run_session_if_active()
         except Exception:
             pass
+
         # Heartbeat שמראה שהמנוע ממשיך לרוץ גם אם בינתיים אין status מפורש.
         self.rt.last_tick_ts = time.time()
         # Reconcile קבוע (לא יותר מ-1 ל-120 שניות) כדי לתפוס drift בין הספר הפנימי
