@@ -149,6 +149,9 @@ class StrategyRuntime:
     _last_live_auto_entry_fail_msg: str = ""
     _settled_token_ids: set = field(default_factory=set)
     _settled_token_ids_ts: float = 0.0
+    # FLW: decision metadata של הבחירה האחרונה — להחתמה ב-trade context.
+    # נקבע ב-_tick לפני הכניסה; מתאפס אחרי שימוש.
+    _last_flw_decision: Optional[dict] = None
     # Peak Watchdog: {token_id: {"peak_bid": float, "tp_touched": bool, "tp_target": float}}
     # פוזיציה שעברה פעם את יעד ה-TP — אם ה-bid נופל אחורה, מוכרים מיד.
     _peak_state: dict = field(default_factory=dict)
@@ -954,6 +957,12 @@ class StrategyRunner:
             self.rt.log(
                 f"ניקוי תקופתי (mode=off): סגרתי {len(settlement_trades)} פוזיציות מחלון ישן"
             )
+            # עקביות עם נתיב ה-rollover הראשי: גם כש-mode=off נכתב ל-history.db.
+            # כך אם המשתמש מדליק auto אחרי כן, FLW יקבל את הנתון העדכני מיד.
+            try:
+                self._record_settlement_to_history(settlement_trades, rollover_ctx)
+            except Exception as e:
+                self.rt.log(f"רישום היסטוריה (off): {e!r}")
 
     async def _tick(self) -> None:
         mode = self.rt.mode
@@ -1517,6 +1526,22 @@ class StrategyRunner:
             and not (pos_u or pos_d)  # רק לעסקה חדשה, לא בתוך DCA רץ
         ):
             flw_side = self._resolve_follow_winner_side(cfg)
+            if flw_side is not None:
+                # Observability: לוג חיובי כש-FLW בחר. נחתם בעמדת ה-trade context מאוחר יותר.
+                self.rt.status(
+                    f"FLW: עוקב אחרי המנצח → {flw_side} "
+                    f"(lookback={int(getattr(cfg, 'follow_last_winner_lookback', 1) or 1)}, "
+                    f"mode={getattr(cfg, 'follow_last_winner_mode', 'forward')})",
+                    key="flw_active",
+                    repeat_interval_sec=30.0,
+                )
+                # סימון לרישום ב-trade context שעסקה זו נבחרה ע"י FLW.
+                self.rt._last_flw_decision = {
+                    "side": flw_side,
+                    "lookback": int(getattr(cfg, "follow_last_winner_lookback", 1) or 1),
+                    "mode": str(getattr(cfg, "follow_last_winner_mode", "forward")),
+                    "ts": time.time(),
+                }
         if flw_side == "Up":
             if ask_u is None:
                 self.rt.status("סטטוס: Ask חסר ל-Up (FLW) — לא ניתן להיכנס", key="book_missing_entry_up")
@@ -1769,6 +1794,15 @@ class StrategyRunner:
         if cfg.loss_recovery_enabled:
             entry_ctx["effective_investment_usd"] = eff_inv_snapshot
             entry_ctx["loss_recovery_multiplier"] = lr_mult_snapshot
+        # FLW: חתימה ב-trade context אם הכניסה נבחרה ע"י FLW. ה-UI/אנליטיקס יוכלו
+        # לסנן או להציג "כניסה זו הגיעה מ-FLW: side=X, lookback=N, mode=Y".
+        flw_dec = getattr(self.rt, "_last_flw_decision", None)
+        if isinstance(flw_dec, dict) and flw_dec.get("side") == side:
+            entry_ctx["flw_chosen"] = True
+            entry_ctx["flw_lookback"] = flw_dec.get("lookback")
+            entry_ctx["flw_mode"] = flw_dec.get("mode")
+            # מאפסים אחרי שימוש כדי לא לסמן שוב אם כניסה זו נדחית/חוזרת
+            self.rt._last_flw_decision = None
         if mode == "semi":
             if not self.rt.pending_approval:
                 self.rt.pending_approval = {
