@@ -62,6 +62,13 @@ class DemoState:
     loss_recovery_multiplier: float = 1.0
     # מסמן «סשן» אחרי איפוס לוח/סטטיסטיקה — רק עסקאות מ-ts זה והלאה נכללות בתצוגה ובמיזוג חי ל-v3
     stats_epoch_ts: Optional[float] = None
+    # FIX #22: DCA counters persisted לדיסק — שורדים restart של השרת.
+    # קודם היו רק ב-StrategyRuntime (זיכרון), והבוט "שכח" איפה היה ב-DCA אחרי קריסה,
+    # מה שיכל לגרום לכפילות slice (לקנות פעמיים את אותה רמת מחיר).
+    dca_done_slices_persisted: int = 0
+    dca_last_dca_ts_persisted: float = 0.0
+    dca_last_fill_price_persisted: Optional[float] = None
+    dca_active_epoch_persisted: int = 0  # ה-epoch של החלון שבו נמצא ה-DCA
 
     def next_trade_num(self) -> int:
         """מחזיר מספר מחזור הבא (מונוטוני, לא מתאפס)."""
@@ -79,6 +86,11 @@ class DemoState:
             "loss_recovery_streak": self.loss_recovery_streak,
             "loss_recovery_multiplier": self.loss_recovery_multiplier,
             "stats_epoch_ts": self.stats_epoch_ts,
+            # FIX #22: DCA counters persisted
+            "dca_done_slices_persisted": self.dca_done_slices_persisted,
+            "dca_last_dca_ts_persisted": self.dca_last_dca_ts_persisted,
+            "dca_last_fill_price_persisted": self.dca_last_fill_price_persisted,
+            "dca_active_epoch_persisted": self.dca_active_epoch_persisted,
         }
 
     @classmethod
@@ -90,6 +102,14 @@ class DemoState:
                 _se = float(_raw_se)
             except (TypeError, ValueError):
                 _se = None
+        # FIX #22: DCA counters from disk
+        dca_lp = d.get("dca_last_fill_price_persisted")
+        dca_lp_val: Optional[float] = None
+        if dca_lp is not None:
+            try:
+                dca_lp_val = float(dca_lp)
+            except (TypeError, ValueError):
+                dca_lp_val = None
         st = cls(
             balance_usd=float(d.get("balance_usd", 10_000)),
             trades=list(d.get("trades") or []),
@@ -98,6 +118,10 @@ class DemoState:
             loss_recovery_streak=int(d.get("loss_recovery_streak", 0) or 0),
             loss_recovery_multiplier=float(d.get("loss_recovery_multiplier", 1.0) or 1.0),
             stats_epoch_ts=_se,
+            dca_done_slices_persisted=int(d.get("dca_done_slices_persisted", 0) or 0),
+            dca_last_dca_ts_persisted=float(d.get("dca_last_dca_ts_persisted", 0.0) or 0.0),
+            dca_last_fill_price_persisted=dca_lp_val,
+            dca_active_epoch_persisted=int(d.get("dca_active_epoch_persisted", 0) or 0),
         )
         # שחזור trade_seq מה-trades עצמם אם חסר (תאימות אחורה)
         if st.trade_seq == 0 and st.trades:
@@ -405,10 +429,18 @@ class DemoEngine:
         price_cache: dict[tuple[int, int], dict[str, Any]] = {}
 
         async def _prices_for(ep: int, ws: int) -> dict[str, Any]:
+            """FIX #26: לא לשמור ב-cache ערך עם None — אם kline עדיין לא זמין
+            (קריאה מיד אחרי סגירת חלון), הקריאה הבאה תנסה שוב במקום להחזיר None.
+            """
             key = (ep, ws)
-            if key not in price_cache:
-                price_cache[key] = await fetch_window_start_end_btc_usd(ep, ws)
-            return price_cache[key]
+            cached = price_cache.get(key)
+            if cached is not None and cached.get("start") is not None and cached.get("end") is not None:
+                return cached
+            fresh = await fetch_window_start_end_btc_usd(ep, ws)
+            # רק אם שני המחירים תקפים — שמור ב-cache
+            if fresh.get("start") is not None and fresh.get("end") is not None:
+                price_cache[key] = fresh
+            return fresh
 
         created: list[dict[str, Any]] = []
         for p in to_settle:

@@ -58,6 +58,7 @@ from btc_price import (
     PriceHistoryBuffer,
     fetch_btc_spot_usdt,
     fetch_chainlink_btc_usd_polygon_at_window_start,
+    fetch_close_price_at_window_end,
     fetch_open_price_at_window_start,
     fetch_window_start_end_btc_usd,
 )
@@ -445,6 +446,74 @@ cached_ptb_source: str = "binance_1m"
 _last_recorded_epoch: int = 0  # epoch of the last window we recorded
 
 
+async def _backfill_missing_history_windows(
+    *, lookback_windows: int = 60, window_secs: tuple[int, ...] = (300, 900)
+) -> None:
+    """FIX #5: ב-startup, בודק אם חסרים חלונות אחרונים ב-history.db ומשלים אותם
+    מ-Binance klines. מועיל אם השרת היה כבוי כשחלון נסגר.
+
+    lookback_windows: כמה חלונות אחורה לבדוק לכל window_sec (default 60 = ~5 שעות ב-5m).
+    """
+    await asyncio.sleep(8.0)  # המתנה ל-event loop להתייצב + WS להתחבר
+    now = time.time()
+    total_filled = 0
+    for ws in window_secs:
+        # epoch אחרון שכבר הסתיים (הקודם של החלון הפעיל)
+        current_window_open_epoch = int(now // ws) * ws
+        last_finished = current_window_open_epoch - ws
+        epochs_to_check = [last_finished - i * ws for i in range(lookback_windows)]
+        for ep in epochs_to_check:
+            if ep <= 0:
+                continue
+            # האם כבר רשום עם side_won?
+            try:
+                conn = _history_get_conn_safe()
+                if conn is None:
+                    break
+                cur = conn.execute(
+                    "SELECT side_won FROM window_results WHERE epoch = ? AND window_sec = ?",
+                    (int(ep), int(ws)),
+                )
+                row = cur.fetchone()
+                if row is not None and row[0] is not None:
+                    continue  # כבר רשום
+            except Exception:
+                break
+            # נסה לאחזר את המחירים מ-Binance ולמלא
+            try:
+                btc_open = await fetch_open_price_at_window_start(ep)
+                btc_close = await fetch_close_price_at_window_end(ep, ws)
+                if btc_open is None or btc_close is None:
+                    continue
+                side_won = "Up" if btc_close >= btc_open else "Down"
+                window_label = "5m" if ws == 300 else "15m"
+                slug = f"btc-updown-{window_label}-{ep}"
+                record_window_result(
+                    epoch=int(ep),
+                    slug=slug,
+                    window_sec=int(ws),
+                    side_won=side_won,
+                    btc_open=btc_open,
+                    btc_close=btc_close,
+                )
+                total_filled += 1
+                # קצב — לא להכריח את Binance עם 60+ בקשות במכה
+                await asyncio.sleep(0.15)
+            except Exception:
+                continue
+    if total_filled > 0:
+        print(f"[history] backfill ב-startup: השלים {total_filled} חלונות חסרים", flush=True)
+
+
+def _history_get_conn_safe() -> Optional[Any]:
+    """גישה ל-history.db connection (private API של history_tracker) לבדיקה מקדימה."""
+    try:
+        from history_tracker import _get_conn
+        return _get_conn()
+    except Exception:
+        return None
+
+
 async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
     """
     רץ ברקע — מזהה מתי חלון נסגר ומתעד אוטומטית מי ניצח.
@@ -486,27 +555,39 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
             # חלון חדש זוהה — נרשום את הקודם
             if current_epoch != prev_epoch and prev_epoch != _last_recorded_epoch:
                 try:
+                    # FIX #1: שימוש ב-kline close של החלון (לא spot חי) — זהה ל-settlement
+                    # של expire_all_outside_tokens, כך ש-FLW יקבל את אותה תוצאה שהבוט "חי"
+                    # בה. spot חי יכול לזוז 0-10s אחרי סוף החלון ולתת מנצח שונה.
                     btc_open = await fetch_open_price_at_window_start(prev_epoch)
-                    btc_close = await fetch_btc_spot_usdt()
+                    btc_close = await fetch_close_price_at_window_end(prev_epoch, prev_window_sec)
 
-                    side_won: Optional[str] = None
                     if btc_open is not None and btc_close is not None:
-                        side_won = "Up" if btc_close > btc_open else "Down"
-
-                    record_window_result(
-                        epoch=prev_epoch,
-                        slug=prev_slug,
-                        window_sec=prev_window_sec,
-                        side_won=side_won,
-                        btc_open=btc_open,
-                        btc_close=btc_close,
-                    )
-                    _last_recorded_epoch = prev_epoch
-                    print(
-                        f"[history] חלון {prev_slug} נרשם: {side_won} "
-                        f"(open={btc_open:.2f}, close={btc_close:.2f})",
-                        flush=True,
-                    )
+                        # FIX #2: tie ⇒ Up (זהה ל-demo_engine.py:482 ול-Dashboard text).
+                        side_won = "Up" if btc_close >= btc_open else "Down"
+                        record_window_result(
+                            epoch=prev_epoch,
+                            slug=prev_slug,
+                            window_sec=prev_window_sec,
+                            side_won=side_won,
+                            btc_open=btc_open,
+                            btc_close=btc_close,
+                        )
+                        _last_recorded_epoch = prev_epoch
+                        print(
+                            f"[history] חלון {prev_slug} נרשם: {side_won} "
+                            f"(open={btc_open:.2f}, close={btc_close:.2f}, source=kline_1m_close)",
+                            flush=True,
+                        )
+                    else:
+                        # kline עדיין לא זמין (lag של Binance) — לא רושמים, נסיון חוזר בסיבוב הבא.
+                        # _last_recorded_epoch לא מתעדכן, prev_epoch נשאר אותו דבר.
+                        print(
+                            f"[history] חלון {prev_slug}: kline לא זמין עדיין — retry בסיבוב הבא ({interval_sec}s)",
+                            flush=True,
+                        )
+                        # ❗ חשוב: לא לקדם prev_epoch! נתאר את החלון הקודם שוב בסיבוב הבא.
+                        await asyncio.sleep(interval_sec)
+                        continue
                 except Exception as exc:
                     print(f"[history] שגיאה בתיעוד חלון {prev_slug}: {exc}", flush=True)
 
@@ -609,6 +690,9 @@ async def lifespan(app: FastAPI):
     _load_trigger_config()
     _reset_ui_runtime("lifespan_start")
     runner.rt.mode = "off"
+    # FIX #5: backfill חלונות חסרים ב-history.db (אם השרת היה כבוי כשחלון נסגר).
+    # רץ כ-task כדי לא לחסום lifespan.
+    asyncio.create_task(_backfill_missing_history_windows())
     # Start real-time WebSocket price stream from Polymarket CLOB
     price_stream.start()
     _ws_subscription_task = asyncio.create_task(

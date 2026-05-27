@@ -341,6 +341,37 @@ class StrategyRunner:
         self.rt = StrategyRuntime()
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # FIX #24: guard נגד זיהוי rollover כפול אם _tick רץ פעמיים בתוך אותה שנייה.
+        self._rollover_lock: asyncio.Lock = asyncio.Lock()
+        # FIX #22: שחזור DCA counters מ-state אם השרת קם אחרי קריסה באמצע DCA
+        self._restore_dca_counters_from_state()
+
+    def _restore_dca_counters_from_state(self) -> None:
+        """משחזר את ה-DCA counters מ-DemoState (persisted) ל-StrategyRuntime (memory).
+
+        אם השרת קם אחרי קריסה באמצע DCA, ה-counters בזיכרון אופסו ל-0 ב-__init__,
+        אבל ה-state נשמר. שחזור מהדיסק מבטיח שלא נקנה את אותו slice פעמיים.
+        """
+        try:
+            self.rt.dca_done_slices = int(getattr(self.demo.state, "dca_done_slices_persisted", 0) or 0)
+            self.rt.last_dca_ts = float(getattr(self.demo.state, "dca_last_dca_ts_persisted", 0.0) or 0.0)
+            self.rt.dca_last_fill_price = getattr(self.demo.state, "dca_last_fill_price_persisted", None)
+            self.rt.current_epoch = int(getattr(self.demo.state, "dca_active_epoch_persisted", 0) or 0)
+        except AttributeError:
+            # state ישן ללא השדות החדשים — לא נורא, מתחילים מ-0
+            pass
+
+    def _persist_dca_counters(self) -> None:
+        """שומר את ה-DCA counters ל-DemoState ולדיסק. נקרא אחרי כל מוטציה."""
+        try:
+            self.demo.state.dca_done_slices_persisted = int(self.rt.dca_done_slices or 0)
+            self.demo.state.dca_last_dca_ts_persisted = float(self.rt.last_dca_ts or 0.0)
+            self.demo.state.dca_last_fill_price_persisted = self.rt.dca_last_fill_price
+            self.demo.state.dca_active_epoch_persisted = int(self.rt.current_epoch or 0)
+            self.demo.save()
+        except Exception:
+            # שמירה לא אטומית — לא לעצור את המנוע בגלל זה
+            pass
 
     def start_loop(self) -> None:
         if self._task and not self._task.done():
@@ -587,6 +618,8 @@ class StrategyRunner:
                 tr = (r.get("trade") or {}) if isinstance(r.get("trade"), dict) else {}
                 fill = float(tr.get("price") or 0.0)
                 self.rt.dca_last_fill_price = fill if fill > 0 else None
+                # FIX #22: שמור ל-state אחרי כל DCA slice — שורד restart
+                self._persist_dca_counters()
             if r.get("ok"):
                 self._mark_first_strategy_buy_if_needed()
                 # עדכון מונים/מגבלות (בכניסה בפועל)
@@ -762,6 +795,69 @@ class StrategyRunner:
             return "intermediate"
         return "ok"
 
+    def _record_settlement_to_history(
+        self,
+        settlement_trades: list[dict[str, Any]],
+        rollover_ctx: dict[str, Any],
+    ) -> None:
+        """כותב את תוצאת החלון ל-history.db מיד עם זיהוי rollover.
+
+        משתמש בנתוני ה-settlement שכבר חושבו (resolved_outcome + settlement_btc_start/end),
+        כך שאין צורך בקריאת רשת נוספת ואין סיכון לתוצאה שונה מ-auto_history_recorder.
+        אם UPSERT (fix #18) פוגש record קיים — מעדכן רק שדות NULL (idempotent).
+        """
+        if not settlement_trades:
+            return
+        from history_tracker import record_window_result
+
+        ep = rollover_ctx.get("settled_epoch")
+        ws = rollover_ctx.get("settled_window_sec") or 300
+        slug = rollover_ctx.get("slug") or ""
+        if ep is None or not slug:
+            # context לא שלם — לא נכשל, פשוט לא נרשום (recorder ירשום מאוחר).
+            return
+        # מצא את הראשון עם resolved_outcome (כל ה-settlement trades לאותו חלון יסכימו)
+        resolved: Optional[str] = None
+        btc_start: Optional[float] = None
+        btc_end: Optional[float] = None
+        for t in settlement_trades:
+            ro = t.get("resolved_outcome")
+            if ro in ("Up", "Down"):
+                resolved = ro
+                btc_start = t.get("settlement_btc_start")
+                btc_end = t.get("settlement_btc_end")
+                break
+        if resolved is None:
+            # אין settlement עם תוצאה ידועה — דחיה ל-auto_history_recorder
+            return
+        # epoch של החלון שהסתיים = settled_epoch מה-rollover_ctx. נשתמש ב-prev_slug
+        # אבל ה-slug ב-rollover_ctx הוא של החלון החדש; נשנה אותו לפי epoch הישן.
+        # פורמט slug: "btc-updown-5m-<epoch>" — אפשר לבנות אותו מחדש.
+        # פשוט יותר: לוקח את ה-slug מהעסקה (היא נסגרה ביחס לחלון הישן).
+        for t in settlement_trades:
+            t_slug = t.get("slug")
+            if t_slug:
+                slug = t_slug
+                break
+        # אם slug עדיין לא נכון (slug חדש), נבנה אותו מתבנית
+        if str(ep) not in slug:
+            window_label = "5m" if int(ws) == 300 else "15m"
+            slug = f"btc-updown-{window_label}-{ep}"
+        try:
+            saved = record_window_result(
+                epoch=int(ep),
+                slug=str(slug),
+                window_sec=int(ws),
+                side_won=resolved,
+                btc_open=btc_start,
+                btc_close=btc_end,
+            )
+            self.rt.log(
+                f"היסטוריה: חלון {slug} נרשם={resolved} (settlement source) — UPSERT={saved}"
+            )
+        except Exception as e:
+            self.rt.log(f"היסטוריה: כשל ברישום — {e!r}")
+
     def _resolve_follow_winner_side(self, cfg: StrategyConfig) -> Optional[str]:
         """מחזיר 'Up'/'Down' לפי תוצאת חלון/ות קודמים. None = fallback ל-side_preference.
 
@@ -896,6 +992,12 @@ class StrategyRunner:
             self.rt.log(f"לא נמצא שוק BTC Up/Down חלון {self.rt.config.btc_window} פעיל")
             return
         if m.epoch != self.rt.current_epoch:
+            # FIX #24: lock + double-check pattern — אם _tick רץ פעמיים בתוך מילישנייה
+            # (race ב-async scheduler), רק הראשון יבצע את ה-rollover.
+            async with self._rollover_lock:
+                if m.epoch == self.rt.current_epoch:
+                    # rollover כבר בוצע בקריאה אחרת. דלג.
+                    return
             # לפני מעבר חלון: פירוק פוזיציות מחלון קודם (SETTLE_WIN / SETTLE_LOSS / …)
             settlement_trades: list[dict[str, Any]] = []
             if self.rt.current_epoch != 0:
@@ -924,6 +1026,16 @@ class StrategyRunner:
                     (m.token_up, m.token_down),
                     context=rollover_ctx,
                 )
+                # FIX #3: כתיבה מיידית ל-history.db מתוך נתוני ה-settlement.
+                # זה מבטל את ה-race עם auto_history_recorder_loop (10s):
+                # FLW יקרא את היסטוריה מעודכנת מיד בכניסה הבאה.
+                # אנחנו לוקחים את ה-resolved_outcome וה-btc prices ש-settlement חישב,
+                # אז שני המקורות תמיד יסכימו. UPSERT (history_tracker fix #18)
+                # ימנע התנגשות אם recorder כבר רשם משהו.
+                try:
+                    self._record_settlement_to_history(settlement_trades, rollover_ctx)
+                except Exception as e:
+                    self.rt.log(f"רישום היסטוריה: {e!r}")
                 # אסוף token_ids שפורקו — לא להחזיר ב-reconcile (Data API עלול
                 # עדיין להחזיר אותם → כפילות SETTLE + שחזור הפסד שגוי).
                 settled_tids: set[str] = set()
@@ -975,6 +1087,8 @@ class StrategyRunner:
             self.rt.last_tp_ts = 0.0
             self.rt.last_tp_side = None
             self.rt._last_book_log_ts = 0.0
+            # FIX #22: גם persistence מתאפס ל-epoch החדש (לא להציל DCA ישן)
+            self._persist_dca_counters()
 
         sec_left = seconds_until_window_end(m.epoch, m.window_sec)
         min_left = sec_left / 60.0

@@ -237,28 +237,58 @@ async def fetch_open_price_at_window_start(window_epoch_sec: int) -> Optional[fl
         return float(data[0][1])
 
 
-async def fetch_close_price_at_window_end(window_epoch_sec: int, window_sec: int) -> Optional[float]:
-    """סגירת נר ה-1m האחרון בטווח [epoch, epoch+window_sec) — מתאים לסוף חלון Up/Down (פרוקסי Binance)."""
+async def fetch_close_price_at_window_end(
+    window_epoch_sec: int,
+    window_sec: int,
+    *,
+    max_retries: int = 3,
+    retry_sleep_sec: float = 1.0,
+) -> Optional[float]:
+    """סגירת נר ה-1m האחרון בטווח [epoch, epoch+window_sec) — מתאים לסוף חלון Up/Down (פרוקסי Binance).
+
+    FIX #4: retry קצר אם Binance עדיין לא פרסם את הנר (נקרא מיד אחרי סגירת החלון).
+    הנר נסגר ב-epoch + window_sec; Binance בדרך כלל מפרסם אותו תוך 0.5-2 שניות.
+    אנחנו מנסים עד max_retries פעמים עם הפסקה של retry_sleep_sec בין נסיונות.
+    """
+    import asyncio as _asyncio
+
     if window_sec < 60:
         return None
     # הנר האחרון מתחיל ב-epoch + window_sec - 60 ונסגר ב-epoch + window_sec
     last_candle_open_ms = (window_epoch_sec + window_sec - 60) * 1000
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            BINANCE_KLINES,
-            params={
-                "symbol": "BTCUSDT",
-                "interval": "1m",
-                "startTime": last_candle_open_ms,
-                "limit": 1,
-            },
-            timeout=10.0,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    BINANCE_KLINES,
+                    params={
+                        "symbol": "BTCUSDT",
+                        "interval": "1m",
+                        "startTime": last_candle_open_ms,
+                        "limit": 1,
+                    },
+                    timeout=10.0,
+                )
+                r.raise_for_status()
+                data = r.json()
+                if data:
+                    # שדה [6] = closeTime במילי-שניות; אם closeTime > now → הנר עדיין פתוח.
+                    close_time_ms = int(data[0][6]) if len(data[0]) > 6 else 0
+                    if close_time_ms and close_time_ms > int(time.time() * 1000):
+                        # הנר עדיין פתוח — לא לקחת את ה-close שלו (זמני).
+                        if attempt < max_retries:
+                            await _asyncio.sleep(retry_sleep_sec)
+                            continue
+                        return None
+                    return float(data[0][4])
+        except Exception:
+            if attempt >= max_retries:
+                raise
+        if attempt >= max_retries:
             return None
-        return float(data[0][4])
+        await _asyncio.sleep(retry_sleep_sec)
 
 
 async def fetch_window_start_end_btc_usd(

@@ -46,16 +46,39 @@ def record_window_result(
     btc_close: Optional[float] = None,
     window_sec: int = 300,
 ) -> bool:
-    """שומר תוצאת חלון. מחזיר True אם נשמר בהצלחה."""
+    """שומר תוצאת חלון. מחזיר True אם נשמר בהצלחה.
+
+    FIX #18: UPSERT אינטליגנטי — אם כבר קיים record עבור (epoch, slug) אבל side_won=NULL
+    (חלון שלא קיבל מחירים בעת רישום קודם), אז מותר לעדכן אותו. אם side_won כבר קיים
+    באותו record — לא לדרוס (idempotent: שני הנתיבים שיקרא את אותם kline יחזירו אותו
+    תוצאה). זה מאפשר ל-strategy_runner ול-auto_history_recorder לרשום את אותו חלון
+    בלי שאחד "מנצח" את השני, וגם מתקן רישומים חלקיים.
+    """
     try:
         import datetime
         conn = _get_conn()
-        dt = datetime.datetime.utcfromtimestamp(epoch)
+        # שימוש ב-aware UTC datetime (replaces deprecated utcfromtimestamp)
+        try:
+            dt = datetime.datetime.fromtimestamp(epoch, datetime.UTC)
+        except AttributeError:
+            # Python < 3.11 fallback
+            dt = datetime.datetime.utcfromtimestamp(epoch)
+        # UPSERT: אם כבר קיים, רק מעדכן side_won/btc_open/btc_close אם הקיים NULL.
+        # תנאי COALESCE: שומר את הערך הקיים אם הוא לא NULL; אחרת לוקח את הערך החדש.
         conn.execute(
             """
-            INSERT OR IGNORE INTO window_results
+            INSERT INTO window_results
               (epoch, slug, window_sec, side_won, btc_open, btc_close, ts_recorded, hour_utc, weekday)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(epoch, slug) DO UPDATE SET
+              side_won = COALESCE(side_won, excluded.side_won),
+              btc_open = COALESCE(btc_open, excluded.btc_open),
+              btc_close = COALESCE(btc_close, excluded.btc_close),
+              window_sec = excluded.window_sec,
+              ts_recorded = CASE
+                WHEN side_won IS NULL AND excluded.side_won IS NOT NULL THEN excluded.ts_recorded
+                ELSE ts_recorded
+              END
             """,
             (epoch, slug, window_sec, side_won, btc_open, btc_close, time.time(), dt.hour, dt.weekday()),
         )
