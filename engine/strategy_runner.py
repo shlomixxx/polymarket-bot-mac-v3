@@ -1001,19 +1001,27 @@ class StrategyRunner:
             self.rt.log(f"לא נמצא שוק BTC Up/Down חלון {self.rt.config.btc_window} פעיל")
             return
         if m.epoch != self.rt.current_epoch:
-            # FIX #24: lock + double-check pattern — אם _tick רץ פעמיים בתוך מילישנייה
-            # (race ב-async scheduler), רק הראשון יבצע את ה-rollover.
+            # FIX #24 (v2): lock + sentinel pattern.
+            # ה-v1 הראשון רק עטף את ה-double-check וזה לא הספיק — בין שחרור ה-lock
+            # לבין עדכון current_epoch ב-end של ה-rollover (שורה ~1087), קריאה
+            # מקבילה הייתה יכולה להיכנס שוב. עכשיו: בתוך ה-lock אנחנו מעדכנים
+            # IMMEDIATELY את current_epoch ל-m.epoch (סנטינל). כל tick אחר יראה
+            # epoch == current_epoch וייצא בדלת. את ה-epoch הישן שומרים ב-local
+            # variable כדי להעביר ל-rollover_ctx ולשאר הפעולות.
             async with self._rollover_lock:
                 if m.epoch == self.rt.current_epoch:
                     # rollover כבר בוצע בקריאה אחרת. דלג.
                     return
+                prev_epoch = self.rt.current_epoch
+                # סנטינל: כל קריאה מקבילה ל-_tick תראה equal ותחזור.
+                self.rt.current_epoch = m.epoch
             # לפני מעבר חלון: פירוק פוזיציות מחלון קודם (SETTLE_WIN / SETTLE_LOSS / …)
             settlement_trades: list[dict[str, Any]] = []
-            if self.rt.current_epoch != 0:
+            if prev_epoch != 0:
                 from market_discovery import window_step_sec
 
                 rollover_ctx = {
-                    "settled_epoch": self.rt.current_epoch,
+                    "settled_epoch": prev_epoch,
                     "settled_window_sec": window_step_sec(self.rt.config.btc_window),
                     "epoch": m.epoch,
                     "slug": m.slug,
@@ -1084,7 +1092,7 @@ class StrategyRunner:
                             "הפעל «שחזור אחרי הפסד», לחץ שמור הגדרות, והפעל מחדש את המנוע אם צריך לטעון config מהדיסק."
                         )
             self.rt.log(f"מעבר חלון → {m.slug}")
-            self.rt.current_epoch = m.epoch
+            # current_epoch כבר עודכן בתוך ה-lock כסנטינל — לא לעדכן שוב.
             self.rt.dca_done_slices = 0
             self.rt.last_dca_ts = 0.0
             self.rt.dca_last_fill_price = None

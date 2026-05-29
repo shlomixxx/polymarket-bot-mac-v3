@@ -755,15 +755,80 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Polymarket Bot Engine", lifespan=lifespan)
-# לא משלבים allow_origins=["*"] עם allow_credentials=True — הדפדפן לא מקבל
-# Access-Control-Allow-Origin בקריאות cross-origin (למשל Vite :5175 → API :8767).
+
+# ── FIX QA#1: CORS allowlist (ENV-configurable) ────────────────────────────────
+# BOT_ALLOWED_ORIGINS=comma,separated,origins → רשימה מסוננת.
+# לא הוגדר / ריק → "*" (תאימות אחורה, מצב dev). יצור כסף אמיתי דורש להגדיר ENV.
+def _parse_allowed_origins() -> list[str]:
+    raw = (os.environ.get("BOT_ALLOWED_ORIGINS") or "").strip()
+    if not raw:
+        return ["*"]
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+_ALLOWED_ORIGINS = _parse_allowed_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Bot-Token"],
 )
+
+# ── FIX QA#1: bot auth token middleware ────────────────────────────────────────
+# כל POST/PUT/DELETE/PATCH ל-/api/* דורש header X-Bot-Token שתואם ל-BOT_API_TOKEN
+# ב-ENV. אם BOT_API_TOKEN לא הוגדר → מצב dev (פתוח), עם warning בלוגים.
+# Whitelist: paths שלא דורשים auth (logging, health, OPTIONS).
+_AUTH_WHITELIST_PATHS: set[str] = {
+    "/api/_log/client-request",
+    "/api/health",
+}
+
+
+@app.middleware("http")
+async def bot_auth_middleware(request, call_next):
+    # רק לכתיבות
+    method = request.method.upper()
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return await call_next(request)
+    path = request.url.path
+    # רק תחת /api/*
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    if path in _AUTH_WHITELIST_PATHS:
+        return await call_next(request)
+    expected = (os.environ.get("BOT_API_TOKEN") or "").strip()
+    if not expected:
+        # מצב dev — אין token מוגדר. מתועד פעם אחת בלוג, ממשיכים.
+        global _AUTH_WARNED_NO_TOKEN
+        if not _AUTH_WARNED_NO_TOKEN:
+            print(
+                "[polymarket-bot] ⚠ אזהרה: BOT_API_TOKEN לא מוגדר — כל הכתיבות פתוחות "
+                "לכל אחד. הגדר ENV עבור deploy ייצור.",
+                flush=True,
+            )
+            _AUTH_WARNED_NO_TOKEN = True
+        return await call_next(request)
+    got = request.headers.get("x-bot-token") or request.headers.get("X-Bot-Token") or ""
+    if got != expected:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Unauthorized — חסר/לא תואם X-Bot-Token"},
+        )
+    return await call_next(request)
+
+
+_AUTH_WARNED_NO_TOKEN: bool = False
+
+
+@app.get("/api/_auth/required")
+async def auth_required() -> dict[str, Any]:
+    """מודיע ל-frontend האם השרת דורש X-Bot-Token. ה-frontend ישתמש כדי להציע
+    שדה קלט למשתמש אם True. לא חושף את ה-token עצמו (רק boolean)."""
+    return {
+        "token_required": bool((os.environ.get("BOT_API_TOKEN") or "").strip()),
+    }
 
 # Request logger: writes every HTTP request to engine/logs/requests.jsonl.
 # Disable with LOG_REQUESTS=0. Also exposes /api/_log/client-request for the frontend.
@@ -1609,7 +1674,15 @@ async def live_order(body: TradeBody):
     )
     if not ok_sz:
         raise HTTPException(400, verr or "גודל לא תקין")
+    # FIX QA#3: clamp מחיר ל-[MIN, MAX] כדי שתוקף לא יכפה $10/חוזה או $0/חוזה.
+    # 0 → קנייה "חינם" (נדחה ע"י פולימרקט אבל מבזבז API); >0.99 → תוקף יכול לשלם
+    # סכום אבסורדי אם המנוע מאשר. אפס/שלילי = 0.5 (ברירת מחדל מקורית).
     price = float(body.limit_price or 0.5)
+    if not (MIN_LEGIT_SHARE_PRICE_USD <= price <= MAX_LEGIT_SHARE_PRICE_USD):
+        raise HTTPException(
+            400,
+            f"limit_price חייב להיות בין {MIN_LEGIT_SHARE_PRICE_USD} ל-{MAX_LEGIT_SHARE_PRICE_USD} (קיבלת {price})",
+        )
     cfg = runner.rt.config
     return await live_place_entry_order(
         str(body.token_id),

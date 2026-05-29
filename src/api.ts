@@ -188,7 +188,15 @@ async function _executeFetch<T>(
     const r = await fetch(`${BASE}${path}`, {
       ...fetchOpt,
       signal: controller.signal,
-      headers: { "Content-Type": "application/json", ...fetchOpt?.headers },
+      headers: {
+        "Content-Type": "application/json",
+        // FIX QA#1: שולח X-Bot-Token אם המשתמש שמר אותו ב-localStorage.
+        // השרת דורש אותו לכל POST/PUT/DELETE כש-BOT_API_TOKEN ב-ENV.
+        ...(typeof localStorage !== "undefined" && localStorage.getItem("bot_api_token")
+          ? { "X-Bot-Token": localStorage.getItem("bot_api_token") as string }
+          : {}),
+        ...fetchOpt?.headers,
+      },
     });
     logStatus = r.status;
     logRequestId = r.headers.get("x-request-id") ?? undefined;

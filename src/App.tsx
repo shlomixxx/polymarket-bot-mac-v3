@@ -1622,6 +1622,26 @@ export default function App() {
   const [showOnboard, setShowOnboard] = useState(
     () => typeof localStorage !== "undefined" && !localStorage.getItem("pm_onboard_done")
   );
+  // FIX QA#1: שרת בייצור דורש X-Bot-Token. נחזיק את ה-token ב-localStorage.
+  // את ה-prompt מציגים רק כש-/api/_auth/required מחזיר {token_required: true}
+  // וה-token לא שמור.
+  const [botTokenRequired, setBotTokenRequired] = useState(false);
+  const [botToken, setBotTokenState] = useState<string>(() =>
+    typeof localStorage !== "undefined" ? localStorage.getItem("bot_api_token") || "" : ""
+  );
+  const setBotToken = useCallback((t: string) => {
+    setBotTokenState(t);
+    if (typeof localStorage !== "undefined") {
+      if (t) localStorage.setItem("bot_api_token", t);
+      else localStorage.removeItem("bot_api_token");
+    }
+  }, []);
+  // טעינת דרישת ה-token פעם אחת ב-mount
+  useEffect(() => {
+    void api<{ token_required: boolean }>("/api/_auth/required")
+      .then((r) => setBotTokenRequired(Boolean(r?.token_required)))
+      .catch(() => setBotTokenRequired(false));
+  }, []);
   const [liveMode, setLiveMode] = useState(false);
   /** מצב "כסף אמיתי" בפועל מצד המנוע (לאחר kill-switch/מפתח) — לצגת חסימה אם יש */
   const [liveModeEffective, setLiveModeEffective] = useState(false);
@@ -2489,6 +2509,51 @@ export default function App() {
           <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 8, lineHeight: 1.45 }}>
             המפתח נשמר רק במחשב המקומי דרך Keychain/Secret Service/Credential Manager של מערכת ההפעלה —{" "}
             לא נשלח לשום שרת ולא נכתב ללוגים. אבדן המחשב = סיכון לכסף.
+          </div>
+        </div>
+      )}
+
+      {botTokenRequired && !botToken && (
+        <div
+          className="alert-error"
+          role="alert"
+          style={{ marginBottom: 12, padding: 12, lineHeight: 1.5 }}
+        >
+          <strong>🔒 השרת דורש Bot Token לכתיבות.</strong>{" "}
+          הזן את ה-<code>BOT_API_TOKEN</code> שהוגדר ב-Railway/שרת:
+          <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+            <input
+              type="password"
+              placeholder="X-Bot-Token"
+              autoComplete="off"
+              style={{ padding: 6, flex: 1, minWidth: 240, fontFamily: "monospace" }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const v = (e.target as HTMLInputElement).value.trim();
+                  if (v) {
+                    setBotToken(v);
+                    setTimeout(() => window.location.reload(), 100);
+                  }
+                }
+              }}
+            />
+            <button
+              type="button"
+              onClick={(e) => {
+                const inp = (e.currentTarget.previousElementSibling as HTMLInputElement);
+                const v = inp?.value?.trim() || "";
+                if (v) {
+                  setBotToken(v);
+                  setTimeout(() => window.location.reload(), 100);
+                }
+              }}
+            >
+              שמור
+            </button>
+          </div>
+          <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6 }}>
+            ה-token נשמר ב-localStorage בלבד (לא נשלח לשום שירות חיצוני). קריאות{" "}
+            <code>GET</code> ממשיכות לעבוד גם בלי token; רק POST/PUT/DELETE דורשים.
           </div>
         </div>
       )}
