@@ -1785,6 +1785,8 @@ export default function App() {
   /** ביצוע: "limit" = GTC קלאסי (תאימות לאחור); "market" = FOK לכניסה, FAK+retry ליציאה */
   const [orderMode, setOrderMode] = useState<"limit" | "market">("limit");
   const [entrySlippagePct, setEntrySlippagePct] = useState(2);
+  /** תקרת מחיר שפויה למצב market (סנט). 0/100 = ללא תקרה (כניסה בכל מחיר). */
+  const [marketMaxEntryPriceCents, setMarketMaxEntryPriceCents] = useState(80);
   const [exitSlippagePct, setExitSlippagePct] = useState(5);
   const [peakWatchdogEnabled, setPeakWatchdogEnabled] = useState(true);
   const [peakRetreatExitPct, setPeakRetreatExitPct] = useState(2);
@@ -1977,6 +1979,7 @@ export default function App() {
         if (typeof c.loss_recovery_max_multiplier === "number") setLossRecoveryMaxMult(c.loss_recovery_max_multiplier);
         if (c.order_mode === "limit" || c.order_mode === "market") setOrderMode(c.order_mode);
         if (typeof c.entry_slippage_pct === "number") setEntrySlippagePct(c.entry_slippage_pct);
+        if (typeof c.market_max_entry_price_cents === "number") setMarketMaxEntryPriceCents(c.market_max_entry_price_cents);
         if (typeof c.exit_slippage_pct === "number") setExitSlippagePct(c.exit_slippage_pct);
         if (typeof c.peak_watchdog_enabled === "boolean") setPeakWatchdogEnabled(c.peak_watchdog_enabled);
         if (typeof c.peak_retreat_exit_pct === "number") setPeakRetreatExitPct(c.peak_retreat_exit_pct);
@@ -2123,6 +2126,7 @@ export default function App() {
           loss_recovery_max_multiplier: Math.max(1, lossRecoveryMaxMult),
           order_mode: orderMode,
           entry_slippage_pct: Math.max(0, entrySlippagePct),
+          market_max_entry_price_cents: Math.max(0, Math.min(100, marketMaxEntryPriceCents)),
           exit_slippage_pct: Math.max(0, exitSlippagePct),
           peak_watchdog_enabled: peakWatchdogEnabled,
           peak_retreat_exit_pct: Math.max(0, peakRetreatExitPct),
@@ -2166,7 +2170,7 @@ export default function App() {
       autoReenter, reenterCooldown, maxEntriesPerWindow, maxNotionalPerWindow, maxTradesPerHour,
       nearEntryPct, nearTpPct, dcaTpOverridePct, bookLogIntervalSec,
       lossRecoveryEnabled, lossRecoveryStepPct, lossRecoveryEveryN, lossRecoveryMaxMult,
-      orderMode, entrySlippagePct, exitSlippagePct, peakWatchdogEnabled, peakRetreatExitPct,
+      orderMode, entrySlippagePct, marketMaxEntryPriceCents, exitSlippagePct, peakWatchdogEnabled, peakRetreatExitPct,
       retryMaxAttempts, holdToResolutionEnabled, holdToResolutionMinDcaSlices,
       holdToResolutionMinPrice, holdToResolutionStopLoss,
       investmentMode, investmentPctOfPortfolio,
@@ -3583,6 +3587,22 @@ export default function App() {
                   value={entrySlippagePct}
                   onChange={(e) => {
                     setEntrySlippagePct(Math.max(0, Number(e.target.value) || 0));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label>
+                תקרת מחיר כניסה (סנט — במצב market בלבד; 0 או 100 = ללא תקרה, כניסה בכל מחיר)
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  max={100}
+                  disabled={orderMode !== "market"}
+                  value={marketMaxEntryPriceCents}
+                  onChange={(e) => {
+                    setMarketMaxEntryPriceCents(Math.max(0, Math.min(100, Number(e.target.value) || 0)));
                     markCfgDirty();
                   }}
                   style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}

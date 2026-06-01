@@ -84,6 +84,10 @@ class StrategyConfig:
     order_mode: Literal["limit", "market"] = "limit"
     entry_slippage_pct: float = 2.0  # תקרת slippage לכניסת MARKET BUY
     exit_slippage_pct: float = 5.0   # תקרת slippage ליציאת MARKET SELL (רחבה — עדיף לצאת)
+    # תקרת מחיר שפויה למצב market בלבד: לא נכנסים אם ה-Ask של הצד הנבחר עולה על
+    # הסנטים האלה (מונע קניית "פייבוריט" יקר ב-0.85–0.95). 0 או 100 = ללא תקרה
+    # (כניסה בכל מחיר). במצב limit אין השפעה — שם entry_price_cents הוא ה-cap.
+    market_max_entry_price_cents: float = 80.0
     # Peak Watchdog: אם bid נגע פעם ב-TP ואז נפל ביותר מ-X% מהשיא, מוכר מידי
     # (גם אם עדיין מעל entry) — מונע "עסקה שהיתה ברווח והפכה להפסד".
     peak_watchdog_enabled: bool = True
@@ -317,6 +321,54 @@ def dca_ref_price_from_ask(ask: float, entry_target_usd: float, cfg: StrategyCon
     if ref > ask:
         ref = ask
     return max(ref, 0.0)
+
+
+def entry_limit_price(
+    ask: float,
+    entry_cap_price: float,
+    *,
+    order_mode: str = "limit",
+    entry_slippage_pct: float = 2.0,
+) -> float:
+    """מחיר ה-limit הביצועי לכניסה (ה-price שנשלח ל-CLOB / לסימולציה).
+
+    - order_mode="market" («כניסה בכל חלון»): מחיר marketable שמתמלא מיד —
+      ‎ask × (1 + סליפג׳)‎, מוגבל רק לתקרת המחיר החוקית (0.99). ‎entry_cap_price‎
+      משמש כאן רק לחישוב גודל הפוזיציה (ראה effective_price_for_contract_qty)
+      ולא חוסם את הכניסה. כך הבוט נכנס לכל חלון 5/15 דק׳ כמו בפולימרקט גם
+      כשהצד הנבחר (למשל ע"י FLW) יקר מ-entry_cap_price.
+    - order_mode="limit" (משמעת מחיר): כמו קודם — ‎min(ask × 1.01, entry_cap_price)‎.
+      לא משלמים מעל הסנטים שביקשת, אבל אם ה-Ask נשאר מעל ה-cap לכל אורך החלון
+      ההזמנה לא תתמלא והחלון ידולג.
+    """
+    a = float(ask)
+    if order_mode == "market":
+        slip = max(0.0, float(entry_slippage_pct)) / 100.0
+        return min(a * (1.0 + slip), MAX_LEGIT_SHARE_PRICE_USD)
+    return min(a * 1.01, float(entry_cap_price))
+
+
+def market_entry_price_too_high(
+    ask: Optional[float],
+    order_mode: str,
+    market_max_entry_price_cents: float,
+) -> bool:
+    """האם לדלג על כניסה בגלל תקרת המחיר השפויה של מצב market?
+
+    מחזיר True רק כאשר: order_mode="market", יש Ask תקין, התקרה בטווח (0,100),
+    וה-Ask גבוה ממנה. ‎0 או ≥100 = ללא תקרה‎ (כניסה בכל מחיר). במצב limit תמיד
+    False — שם entry_price_cents הוא ה-cap דרך entry_limit_price.
+    """
+    if order_mode != "market" or ask is None:
+        return False
+    try:
+        cents = float(market_max_entry_price_cents)
+        a = float(ask)
+    except (TypeError, ValueError):
+        return False
+    if not (0.0 < cents < 100.0):
+        return False
+    return a > cents / 100.0
 
 
 async def fetch_best_bid_ask(token_id: str) -> tuple[Optional[float], Optional[float]]:
@@ -1619,6 +1671,23 @@ class StrategyRunner:
             if math.isfinite(ae) and MIN_LEGIT_SHARE_PRICE_USD <= ae <= MAX_LEGIT_SHARE_PRICE_USD:
                 ask = ask_entry
 
+        # תקרת מחיר שפויה למצב market בלבד: אם הצד הנבחר יקר מהתקרה — מדלגים על
+        # החלון (לא קונים "פייבוריט" יקר). 0 או ≥100 = ללא תקרה (כניסה בכל מחיר).
+        # במצב limit אין השפעה — שם entry_price_cents הוא ה-cap.
+        if market_entry_price_too_high(
+            ask,
+            getattr(cfg, "order_mode", "limit"),
+            getattr(cfg, "market_max_entry_price_cents", 0.0),
+        ):
+            mmax_cents = float(getattr(cfg, "market_max_entry_price_cents", 0.0) or 0.0)
+            self.rt.status(
+                f"סטטוס: צד {side} יקר מדי ({_fmt_px(ask)} > תקרת market {mmax_cents:.0f}¢) — מדלג על החלון",
+                key="market_price_cap_skip",
+                session_id=self.demo._session_by_token.get(token),
+                repeat_interval_sec=10.0,
+            )
+            return
+
         price_usd = cfg.entry_price_cents / 100.0
         if cfg.dca_enabled:
             # cap לכניסה הבאה: לא עוברים את המחיר הרצוי.
@@ -1727,8 +1796,9 @@ class StrategyRunner:
         # cap בדולרים הוא entry_cap_price (ב-DCA יכול להיות נמוך מ-entry_price_cents); הסנטים בטקסט חייבים להתאים.
         cap_display_cents = entry_cap_price * 100.0
         prefix = (" · ".join(wait_parts) + " · ") if wait_parts else ""
-        if ask > entry_cap_price:
-            # לא נחסום כניסות: אנחנו נצמיד limit ל־entry_cap_price כך שה-fill לא יהיה מעל המחיר שביקשת.
+        if ask > entry_cap_price and getattr(cfg, "order_mode", "limit") != "market":
+            # מצב limit בלבד: ה-Ask מעל ה-cap → נצמיד limit ל-entry_cap_price (עלול לא להתמלא).
+            # במצב market אין cap חוסם — נכנסים מיד, אז לא מציגים הודעת "ממתין".
             if cfg.near_entry_pct > 0:
                 over_pct = ((ask / entry_cap_price) - 1.0) * 100.0 if entry_cap_price > 0 else 999.0
                 if 0 < over_pct <= cfg.near_entry_pct:
@@ -1784,9 +1854,16 @@ class StrategyRunner:
             )
             return
 
-        # ה-limit תמיד לא עובר את הסנטים שביקשת (או פחות),
-        # וב-DCA הוא גם מקיים drop קשיח מהכניסה הקודמת בפועל.
-        lim = min(ask * 1.01, entry_cap_price)
+        # ה-limit: במצב "limit" לא עובר את הסנטים שביקשת (או פחות), וב-DCA מקיים
+        # drop קשיח. במצב "market" — מחיר marketable שמתמלא מיד (ask × (1+סליפג׳)),
+        # בלי חסימה ל-entry_cap_price, כדי שהבוט ייכנס לכל חלון 5/15 דק׳ כמו פולימרקט
+        # גם כשהצד הנבחר יקר מה-cap (entry_cap_price נשאר רק לחישוב גודל הפוזיציה).
+        lim = entry_limit_price(
+            ask,
+            entry_cap_price,
+            order_mode=getattr(cfg, "order_mode", "limit"),
+            entry_slippage_pct=float(getattr(cfg, "entry_slippage_pct", 2.0)),
+        )
         planned_cost = lim * float(n) * (1 + FEE_RATE)
         if not self._entry_limits_ok(now=now, cfg=cfg, planned_cost_usd=planned_cost):
             return

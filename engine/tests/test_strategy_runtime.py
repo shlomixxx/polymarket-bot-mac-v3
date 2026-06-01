@@ -1,4 +1,5 @@
 import time
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -9,8 +10,10 @@ from strategy_runner import (
     contracts_from_investment,
     dca_ref_price_from_ask,
     effective_price_for_contract_qty,
+    entry_limit_price,
+    market_entry_price_too_high,
 )
-from demo_engine import DemoEngine
+from demo_engine import DemoEngine, DemoState
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
 
 
@@ -143,5 +146,89 @@ def test_dca_ref_price_from_ask_discount_capped_by_entry_target():
     # ref=0.6*(1-0.01)=0.594, אבל cap=entry*1.05=0.525 => cap wins
     ref = dca_ref_price_from_ask(ask=0.60, entry_target_usd=0.50, cfg=cfg)
     assert ref == 0.525
+
+
+# ── entry_limit_price: "כניסה בכל חלון" (market) מול משמעת מחיר (limit) ──────────
+
+def test_entry_limit_price_limit_mode_clamps_to_cap():
+    """מצב limit: ה-limit לא עובר את ה-cap, גם אם ה-Ask גבוה ממנו (התנהגות קודמת)."""
+    # Ask 0.55 מעל cap 0.51 → נחסם ל-0.51 (עלול לא להתמלא ולדלג על החלון)
+    assert entry_limit_price(0.55, 0.51, order_mode="limit") == pytest.approx(0.51)
+    # Ask 0.30 מתחת ל-cap 0.51 → ask*1.01 (marketable מתחת ל-cap)
+    assert entry_limit_price(0.30, 0.51, order_mode="limit") == pytest.approx(0.303)
+
+
+def test_entry_limit_price_market_mode_is_marketable_above_cap():
+    """מצב market: ה-limit עוקב אחרי ה-Ask (+סליפג׳) ולא נחסם ל-cap — כך נכנסים לכל חלון."""
+    lim = entry_limit_price(0.55, 0.51, order_mode="market", entry_slippage_pct=2.0)
+    assert lim == pytest.approx(0.55 * 1.02)  # 0.561 — מעל ה-Ask → מתמלא מיד
+    assert lim >= 0.55  # marketable: לא נחסם ל-cap 0.51
+
+
+def test_entry_limit_price_market_mode_capped_at_legit_ceiling():
+    """מצב market: גם עם Ask גבוה+סליפג׳ גדול, ה-limit לא עובר את תקרת המחיר החוקית (0.99)."""
+    lim = entry_limit_price(0.98, 0.51, order_mode="market", entry_slippage_pct=50.0)
+    assert lim == pytest.approx(MAX_LEGIT_SHARE_PRICE_USD)
+
+
+@pytest.mark.asyncio
+async def test_market_mode_fills_when_ask_above_cap_but_limit_mode_skips(tmp_path):
+    """שחזור הבאג + התיקון ברמת מנוע הדמו:
+
+    כש-Ask (0.55) מעל ה-cap (entry_price_cents=51 → 0.51):
+    - מצב limit: lim נחסם ל-0.51 → simulate_market_buy דוחה (Ask מעל הלימיט) → דילוג על החלון.
+    - מצב market: lim = ask*(1+סליפג׳) = 0.561 → simulate_market_buy מתמלא → כניסה לחלון.
+    """
+    ask = 0.55
+    cap = 0.51  # entry_price_cents=51
+    ctx = {"order_min_size": 5}
+
+    # --- מצב limit: דילוג (הבאג) ---
+    eng_limit = DemoEngine(state_path=tmp_path / "limit.json")
+    eng_limit.state = DemoState(balance_usd=1000.0)
+    lim_limit = entry_limit_price(ask, cap, order_mode="limit")
+    assert lim_limit == pytest.approx(0.51)
+    with patch.object(eng_limit, "best_ask", AsyncMock(return_value=ask)):
+        r_limit = await eng_limit.simulate_market_buy(
+            "Up", "tok", 10.0, limit_price=lim_limit, context=ctx
+        )
+    assert r_limit["ok"] is False  # נדחה — החלון מדולג
+
+    # --- מצב market: כניסה (התיקון) ---
+    eng_market = DemoEngine(state_path=tmp_path / "market.json")
+    eng_market.state = DemoState(balance_usd=1000.0)
+    lim_market = entry_limit_price(ask, cap, order_mode="market", entry_slippage_pct=2.0)
+    assert lim_market >= ask
+    with patch.object(eng_market, "best_ask", AsyncMock(return_value=ask)):
+        r_market = await eng_market.simulate_market_buy(
+            "Up", "tok", 10.0, limit_price=lim_market, context=ctx
+        )
+    assert r_market["ok"] is True  # נכנס לחלון
+    assert r_market["trade"]["price"] == pytest.approx(ask)  # מילוי במחיר השוק
+
+
+# ── market_entry_price_too_high: תקרת מחיר שפויה למצב market ─────────────────────
+
+def test_market_price_cap_blocks_only_above_cap_in_market_mode():
+    # תקרה 80¢: צד ב-0.85 → מדלגים; צד ב-0.75 → נכנסים
+    assert market_entry_price_too_high(0.85, "market", 80.0) is True
+    assert market_entry_price_too_high(0.75, "market", 80.0) is False
+    # בדיוק על התקרה (0.80) — לא מעל → לא מדלגים
+    assert market_entry_price_too_high(0.80, "market", 80.0) is False
+
+
+def test_market_price_cap_disabled_values_never_block():
+    # 0 או 100 = ללא תקרה (כניסה בכל מחיר), גם ב-0.99
+    assert market_entry_price_too_high(0.99, "market", 0.0) is False
+    assert market_entry_price_too_high(0.99, "market", 100.0) is False
+
+
+def test_market_price_cap_ignored_in_limit_mode():
+    # במצב limit התקרה לא רלוונטית (entry_price_cents הוא ה-cap)
+    assert market_entry_price_too_high(0.95, "limit", 80.0) is False
+
+
+def test_market_price_cap_handles_missing_ask():
+    assert market_entry_price_too_high(None, "market", 80.0) is False
 
 
