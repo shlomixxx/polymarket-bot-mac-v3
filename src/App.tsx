@@ -27,6 +27,7 @@ import TipsV2 from "./TipsV2";
 import SignalsPanel from "./SignalsPanel";
 import TriggerTrader from "./TriggerTrader";
 import AnalyticsV3 from "./AnalyticsV3";
+import FaultsTab from "./FaultsTab";
 
 type Market = {
   slug: string;
@@ -55,7 +56,7 @@ type OrderbookSummary = {
   down: SideSummary;
 };
 
-type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "analytics_v3" | "help";
+type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "analytics_v3" | "faults" | "help";
 
 type Trade = {
   id?: string;
@@ -2573,6 +2574,7 @@ export default function App() {
             ["stats_live", "סטטיסטיקה לייב"],
             ["tips_v2", "ניתוח v3"],
             ["analytics_v3", "📊 אנליטיקס V3"],
+            ["faults", "🐞 תקלות"],
             ["help", "עזרה ותיעוד"],
           ] as const
         ).map(([k, l]) => (
@@ -4490,6 +4492,7 @@ export default function App() {
       )}
       {tab === "tips_v2" && <TipsV2 />}
       {tab === "analytics_v3" && <AnalyticsV3 />}
+      {tab === "faults" && <FaultsTab />}
       {tab === "signals" && <SignalsPanel />}
       {tab === "trigger" && <TriggerTrader />}
       </main>

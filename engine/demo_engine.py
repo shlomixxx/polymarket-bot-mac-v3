@@ -483,12 +483,28 @@ class DemoEngine:
                 trade["settled_epoch"] = ep
 
             if ep is None:
+                # תוצאה לא-ידועה (חסר epoch). לא מענישים על כשל פנימי: מבטלים את
+                # העסקה ומחזירים את הסטייק (realized_pnl=None ⇒ לא מזין שחזור-הפסד).
                 trade["type"] = "SETTLE_UNKNOWN"
                 trade["price"] = 0.0
                 trade["fee_est"] = 0.0
-                trade["realized_pnl"] = -leg_cost
+                trade["realized_pnl"] = None
+                trade["voided"] = True
                 trade["settlement_error"] = "missing_window_epoch"
-                trade["settlement_condition"] = "לא ניתן לחשב — חסר epoch לחלון"
+                trade["settlement_condition"] = "לא ניתן לחשב — חסר epoch לחלון (בוטל, הסטייק הוחזר)"
+                self.state.balance_usd += leg_cost
+                try:
+                    from fault_tracker import record_fault
+                    record_fault(
+                        category="settlement", severity="high",
+                        title="התחשבנות לא ודאית — חסר epoch לחלון",
+                        detail=f"side={p.side} ×{p.contracts} — בוטל, הוחזרו ${leg_cost:.2f}",
+                        source="demo_engine.expire_all_outside_tokens",
+                        context={"token_id": p.token_id, "side": p.side, "refund": round(leg_cost, 2)},
+                        dedup_key="settle_unknown:missing_window_epoch",
+                    )
+                except Exception:
+                    pass
                 self.state.trades.append(trade)
                 created.append(trade)
                 continue
@@ -502,11 +518,32 @@ class DemoEngine:
             trade["settlement_condition"] = "BTC בסוף החלון ≥ BTC בתחילת החלון ⇒ Up (פרוקסי Binance, לא Chainlink)"
 
             if start_p is None or end_p is None:
+                # מחיר BTC לא זמין בעת ההתחשבנות (כשל זמני ב-Binance proxy סביב
+                # סגירת החלון). זו התקלה שניפחה את ה-martingale ב-incident: היא
+                # נספרה כהפסד מלא והסלימה את המכפיל. כעת — ביטול + החזר סטייק, ו-
+                # realized_pnl=None כדי שלא יזין שחזור-הפסד; נרשמת תקלה למעקב.
                 trade["type"] = "SETTLE_UNKNOWN"
                 trade["price"] = 0.0
                 trade["fee_est"] = 0.0
-                trade["realized_pnl"] = -leg_cost
+                trade["realized_pnl"] = None
+                trade["voided"] = True
                 trade["settlement_error"] = "btc_prices_unavailable"
+                trade["settlement_condition"] = "מחיר BTC לא זמין — בוטל, הסטייק הוחזר"
+                self.state.balance_usd += leg_cost
+                try:
+                    from fault_tracker import record_fault
+                    record_fault(
+                        category="settlement", severity="high",
+                        title="מחיר BTC לא זמין בהתחשבנות — חלון בוטל",
+                        detail=(f"epoch={ep} ws={ws} start={start_p} end={end_p} "
+                                f"side={p.side} ×{p.contracts} — בוטל, הוחזרו ${leg_cost:.2f}"),
+                        source="demo_engine.expire_all_outside_tokens",
+                        context={"epoch": ep, "btc_start": start_p, "btc_end": end_p,
+                                 "side": p.side, "refund": round(leg_cost, 2)},
+                        dedup_key="settle_unknown:btc_prices_unavailable",
+                    )
+                except Exception:
+                    pass
                 self.state.trades.append(trade)
                 created.append(trade)
                 continue

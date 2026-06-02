@@ -1855,6 +1855,64 @@ async def history_hourly(window_sec: int = 300):
     return {"hourly": rows}
 
 
+# ── Faults / Bugs tracker ────────────────────────────────────────────────────
+class FaultHandledBody(BaseModel):
+    handled: bool = True
+    resolution_note: str = ""
+
+
+class FaultManualBody(BaseModel):
+    title: str
+    detail: str = ""
+    severity: str = "medium"
+    category: str = "manual"
+
+
+@app.get("/api/faults")
+async def faults_list(
+    category: Optional[str] = None,
+    severity: Optional[str] = None,
+    handled: Optional[bool] = None,
+    limit: int = 500,
+):
+    """רשימת תקלות + ספירות מצרפיות ללשונית «תקלות». GET — בלי צורך בטוקן."""
+    import fault_tracker
+    return {
+        "faults": fault_tracker.list_faults(
+            category=category, severity=severity, handled=handled, limit=int(limit)
+        ),
+        "counts": fault_tracker.fault_counts(),
+    }
+
+
+@app.post("/api/faults")
+async def faults_add(body: FaultManualBody):
+    """דיווח תקלה ידני ע"י המשתמש."""
+    import fault_tracker
+    if not str(body.title).strip():
+        raise HTTPException(400, "title required")
+    ok = fault_tracker.add_manual(
+        title=body.title, detail=body.detail, severity=body.severity, category=body.category
+    )
+    return {"ok": ok}
+
+
+@app.post("/api/faults/{fault_id}/handled")
+async def faults_mark_handled(fault_id: int, body: FaultHandledBody):
+    """סימון תקלה כטופלה/לא-טופלה + הערת טיפול."""
+    import fault_tracker
+    ok = fault_tracker.mark_handled(int(fault_id), bool(body.handled), body.resolution_note)
+    return {"ok": ok}
+
+
+@app.delete("/api/faults")
+async def faults_clear(only_handled: bool = True):
+    """מחיקת תקלות (ברירת מחדל: רק שטופלו)."""
+    import fault_tracker
+    n = fault_tracker.clear_faults(only_handled=bool(only_handled))
+    return {"ok": True, "removed": n}
+
+
 @app.get("/api/history/last-window-outcome")
 async def history_last_window_outcome():
     """תוצאת חלון/ות אחרונים + תצוגה מקדימה של בחירת FLW (לתצוגת UI).

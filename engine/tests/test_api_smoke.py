@@ -118,6 +118,31 @@ def test_strategy_config_clamps_min_contracts_to_market_floor(client: TestClient
     assert r2.json().get("min_contracts") == 7
 
 
+def test_faults_endpoints_roundtrip(client: TestClient, tmp_path, monkeypatch):
+    import fault_tracker
+    monkeypatch.setattr(fault_tracker, "_DB_PATH", tmp_path / "faults.db")
+    monkeypatch.setattr(fault_tracker, "_conn", None)
+
+    r = client.post("/api/faults", json={"title": "test bug", "severity": "high", "detail": "d"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+
+    r = client.get("/api/faults")
+    j = r.json()
+    assert len(j["faults"]) == 1
+    assert j["counts"]["open"] == 1
+    assert j["counts"]["open_severe"] == 1
+    fid = j["faults"][0]["id"]
+
+    r = client.post(f"/api/faults/{fid}/handled", json={"handled": True, "resolution_note": "fixed"})
+    assert r.json()["ok"] is True
+    r = client.get("/api/faults?handled=true")
+    rows = r.json()["faults"]
+    assert len(rows) == 1 and rows[0]["resolution_note"] == "fixed"
+
+    r = client.request("DELETE", "/api/faults", params={"only_handled": "true"})
+    assert r.json()["removed"] == 1
+
+
 def test_demo_reset_and_clear_stats(client: TestClient):
     import main as engine_main
 

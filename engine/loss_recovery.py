@@ -36,6 +36,13 @@ def apply_loss_recovery_from_settlements(
     factor = 1.0 + step / 100.0 if step > 0 else 1.0
 
     for t in settlement_trades:
+        typ = str(t.get("type") or "")
+        # תוצאה לא-ידועה (כשל זמני במשיכת מחיר BTC / חסר epoch) אינה הפסד אמיתי —
+        # אסור שתסלים או תאפס את מכפיל השחזור. זו בדיוק התקלה שניפחה את המכפיל
+        # ל-9537× ורוקנה את החשבון: כשלי מחיר נספרו כהפסדים מלאים והכפילו את ההימור.
+        # מדלגים: המכפיל נשאר ללא שינוי עד תוצאה ודאית (Win/Loss).
+        if typ == "SETTLE_UNKNOWN" or t.get("settlement_error"):
+            continue
         rpnl = t.get("realized_pnl")
         if rpnl is None:
             continue
@@ -43,7 +50,6 @@ def apply_loss_recovery_from_settlements(
             r = float(rpnl)
         except (TypeError, ValueError):
             continue
-        typ = str(t.get("type") or "")
         sid = str(t.get("session_id") or "")[:8] if t.get("session_id") else "—"
         if r > 0:
             state.loss_recovery_streak = 0

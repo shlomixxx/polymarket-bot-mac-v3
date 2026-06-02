@@ -1123,7 +1123,14 @@ class StrategyRunner:
                     )
                 cfg_lr = self.rt.config
                 if settlement_trades:
-                    has_loss = any(float(t.get("realized_pnl") or 0) < 0 for t in settlement_trades)
+                    # תוצאה לא-ידועה (SETTLE_UNKNOWN / settlement_error) אינה הפסד אמיתי
+                    # ואסור שתיחשב כ-has_loss (זה הזין את שחזור-ההפסד בתקלת ה-incident).
+                    has_loss = any(
+                        float(t.get("realized_pnl") or 0) < 0
+                        and str(t.get("type") or "") != "SETTLE_UNKNOWN"
+                        and not t.get("settlement_error")
+                        for t in settlement_trades
+                    )
                     if cfg_lr.loss_recovery_enabled:
                         from loss_recovery import apply_loss_recovery_from_settlements
 
@@ -1980,3 +1987,28 @@ class StrategyRunner:
                 self.rt.last_dca_ts = time.time()
                 # עדכון מחיר כניסה בפועל (נדרש ל־DCA drop קשיח בין כניסות)
                 self.rt.dca_last_fill_price = fill if fill > 0 else None
+        else:
+            # שקיפות: כשל קנייה בדמו (יתרה לא מספקת / Ask מעל הלימיט) לא נבלע יותר —
+            # נרשם ביומן וב-לשונית התקלות. זה מה שהמשתמש ראה כ"אין מספיק כסף".
+            err = str(r.get("error") or "כשל לא ידוע")
+            self.rt.log(
+                f"כניסה אוטומטית (דמו) נכשלה: {err} — {side} ×{float(n):.2f} @ limit {float(lim):.4f}$ · "
+                f"יעד אפקטיבי ${eff_inv_snapshot:.2f} (מכפיל {lr_mult_snapshot:.2f}×) · "
+                f"יתרה ${self.demo.state.balance_usd:.2f}"
+            )
+            try:
+                from fault_tracker import record_fault
+                insufficient = "יתרה" in err
+                record_fault(
+                    category="entry_failed",
+                    severity="high" if insufficient else "medium",
+                    title="כניסה בדמו נכשלה — יתרה לא מספקת" if insufficient else "כניסה בדמו נכשלה",
+                    detail=f"{err} | {side} ×{float(n):.2f} @ {float(lim):.4f}$",
+                    source="strategy_runner.demo_auto_entry",
+                    context={"side": side, "contracts": float(n), "limit": float(lim),
+                             "balance": round(float(self.demo.state.balance_usd), 2),
+                             "eff_inv": round(float(eff_inv_snapshot), 2)},
+                    dedup_key="demo_entry_failed:insufficient" if insufficient else "demo_entry_failed",
+                )
+            except Exception:
+                pass
