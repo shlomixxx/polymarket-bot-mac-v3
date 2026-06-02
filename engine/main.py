@@ -364,6 +364,7 @@ def _save_persisted_config() -> None:
             "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 10.0),
             "order_mode": getattr(c, "order_mode", "limit"),
             "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
+            "market_max_entry_price_cents": float(getattr(c, "market_max_entry_price_cents", 80.0)),
             "exit_slippage_pct": getattr(c, "exit_slippage_pct", 5.0),
             "peak_watchdog_enabled": getattr(c, "peak_watchdog_enabled", True),
             "peak_retreat_exit_pct": getattr(c, "peak_retreat_exit_pct", 2.0),
@@ -1235,6 +1236,7 @@ class ConfigBody(BaseModel):
     # ביצוע מובטח: "limit" (ברירת מחדל, תאימות לאחור) או "market" (FOK/FAK)
     order_mode: str = "limit"
     entry_slippage_pct: float = 2.0
+    market_max_entry_price_cents: float = 80.0  # תקרת מחיר למצב market (0/100 = ללא תקרה)
     exit_slippage_pct: float = 5.0
     peak_watchdog_enabled: bool = True
     peak_retreat_exit_pct: float = 2.0
@@ -1273,6 +1275,8 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "order_mode must be 'limit' or 'market'")
     if float(body.entry_slippage_pct) < 0 or float(body.entry_slippage_pct) > 50:
         raise HTTPException(400, "entry_slippage_pct must be between 0 and 50")
+    if float(body.market_max_entry_price_cents) < 0 or float(body.market_max_entry_price_cents) > 100:
+        raise HTTPException(400, "market_max_entry_price_cents must be between 0 and 100")
     if float(body.exit_slippage_pct) < 0 or float(body.exit_slippage_pct) > 50:
         raise HTTPException(400, "exit_slippage_pct must be between 0 and 50")
     if float(body.peak_retreat_exit_pct) < 0 or float(body.peak_retreat_exit_pct) > 50:
@@ -1348,6 +1352,7 @@ async def get_strategy_config():
         "loss_recovery_multiplier": demo.state.loss_recovery_multiplier,
         "order_mode": getattr(c, "order_mode", "limit"),
         "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
+        "market_max_entry_price_cents": float(getattr(c, "market_max_entry_price_cents", 80.0)),
         "exit_slippage_pct": getattr(c, "exit_slippage_pct", 5.0),
         "peak_watchdog_enabled": getattr(c, "peak_watchdog_enabled", True),
         "peak_retreat_exit_pct": getattr(c, "peak_retreat_exit_pct", 2.0),

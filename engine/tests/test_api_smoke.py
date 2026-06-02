@@ -49,6 +49,8 @@ def test_strategy_config_roundtrip(client: TestClient):
         "hedge_combined_ask_max": 0.98,
         "side_preference": "Up",
         "btc_window": "15m",
+        "order_mode": "market",
+        "market_max_entry_price_cents": 65,
     }
     r = client.post("/api/strategy/config", json=body)
     assert r.status_code == 200
@@ -59,6 +61,8 @@ def test_strategy_config_roundtrip(client: TestClient):
     assert j["entry_price_cents"] == 30
     assert j["take_profit_pct"] == 12.5
     assert j.get("btc_window") == "15m"
+    # שדה תקרת מחיר ה-market עושה round-trip מלא (POST -> config -> GET)
+    assert j.get("market_max_entry_price_cents") == 65
     assert isinstance(j.get("ui_runtime_started_ts"), (int, float))
     assert isinstance(j.get("ui_runtime_uptime_sec"), (int, float))
     assert isinstance(j.get("ui_runtime_equity_baseline_usd"), (int, float))
