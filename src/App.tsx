@@ -1877,10 +1877,11 @@ export default function App() {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     try {
-      const [m, b, st, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw, lwo] = await Promise.all([
+      // PR-F: /api/demo/state (היסטוריה מלאה ~19MB) נטען בלולאה איטית נפרדת (ראה fetchFullState),
+      // לא בלולאה המהירה הזו — חוסך הורדת ~19MB כל ~1s. ה-snapshot (500ms) שומר P&L חי טרי.
+      const [m, b, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw, lwo] = await Promise.all([
         api<Market>("/api/market/current", { timeoutMs: TIMEOUT_MS_MARKET_CURRENT }),
         api<{ price: number; history: { t: number; p: number }[] }>("/api/btc/live"),
-        api<Record<string, unknown>>("/api/demo/state", { timeoutMs: TIMEOUT_MS_DEMO_STATE }),
         api<{ lines: string[] }>("/api/strategy/logs"),
         api<{ pending: unknown }>("/api/strategy/pending"),
         api<Record<string, unknown>>("/api/strategy/config"),
@@ -1921,7 +1922,6 @@ export default function App() {
       }
       setMarket(m);
       setBtc(b);
-      setDemoState(st);
       setLogs(lg.lines || []);
       setLogEntries((logEnt?.entries as { ts: number; msg: string; type: string; session_id?: string }[]) || []);
       setPending((pe.pending as Record<string, unknown>) || null);
@@ -2091,6 +2091,50 @@ export default function App() {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);
+
+  /** PR-F: לולאה איטית נפרדת ל-/api/demo/state המלא (כל העסקאות + equity_history ~19MB) — מזין את
+   * גרף ה-PnL המצטבר וטאב הסטטיסטיקה, נתונים שמשתנים לאט (רק כשעסקה נסגרת). מיזוג: לוקחים את
+   * ההיסטוריה מ-st אבל משאירים balance/positions/last_mark מ-prev שה-snapshot (500ms) מתחזק טריים,
+   * כדי שה-P&L החי לא יקפוץ אחורה. חותך הורדת ~19MB מכל ~1s ל-~פעם ב-4-10s. */
+  const fullStateInFlight = useRef(false);
+  const fetchFullState = useCallback(async () => {
+    if (fullStateInFlight.current || isPageHidden()) return;
+    fullStateInFlight.current = true;
+    try {
+      const st = await api<Record<string, unknown>>("/api/demo/state", { timeoutMs: TIMEOUT_MS_DEMO_STATE });
+      setDemoState((prev) => {
+        const p = prev as Record<string, unknown>;
+        return {
+          ...st,
+          balance_usd: p.balance_usd ?? (st as any).balance_usd,
+          positions: p.positions ?? (st as any).positions,
+          last_mark: p.last_mark ?? (st as any).last_mark,
+        };
+      });
+    } catch {
+      // נשאיר את הקודם — הלולאה תנסה שוב; snapshot ממשיך לעדכן P&L חי
+    } finally {
+      fullStateInFlight.current = false;
+    }
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+    (async () => {
+      while (!cancelled) {
+        if (!isPageHidden()) await fetchFullState();
+        if (cancelled) break;
+        const ms = isPageHidden() ? 30_000 : hasOpenDemoPositionsRef.current ? 4_000 : 10_000;
+        await sleep(ms);
+      }
+    })();
+    const onVisible = () => { if (!isPageHidden() && !cancelled) void fetchFullState(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [fetchFullState]);
 
   /** Polling נפרד לתיק חי מ-Polymarket: רק כשמצב לייב "effective" (מפתח, דגל ו-kill-switch). */
   useEffect(() => {
