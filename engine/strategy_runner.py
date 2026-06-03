@@ -371,6 +371,22 @@ def market_entry_price_too_high(
     return a > cents / 100.0
 
 
+# B-4: לקוח httpx משותף עם keep-alive ל-fallback של ה-REST. ה-fallback רץ בתוך לולאת טיק של
+# 0.12s כש-WS מתיישן — לקוח-לכל-קריאה משלם TLS handshake בכל פעם ומושך 429. ללא result cache:
+# ה-WS כבר מקדים, ו-get_clob_book עדיין מושך חי בכל קריאה (מחיר ה-order נשאר טרי).
+_BOOK_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _get_book_client() -> httpx.AsyncClient:
+    global _BOOK_CLIENT
+    if _BOOK_CLIENT is None:
+        _BOOK_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=2.0, read=6.0, write=6.0, pool=6.0),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        )
+    return _BOOK_CLIENT
+
+
 async def fetch_best_bid_ask(token_id: str) -> tuple[Optional[float], Optional[float]]:
     from ws_price_stream import price_stream
     bid, ask = price_stream.get_best_bid_ask(token_id)
@@ -378,11 +394,10 @@ async def fetch_best_bid_ask(token_id: str) -> tuple[Optional[float], Optional[f
         tp = price_stream.get_price(token_id)
         if tp and (time.time() - tp.ts) < 30.0:
             return bid, ask
-    async with httpx.AsyncClient(timeout=6.0) as client:
-        try:
-            book = await get_clob_book(client, token_id)
-        except Exception:
-            return bid, ask
+    try:
+        book = await get_clob_book(_get_book_client(), token_id)
+    except Exception:
+        return bid, ask
     bids = book.get("bids") or []
     asks = book.get("asks") or []
     rest_bid = float(bids[0]["price"]) if bids else None

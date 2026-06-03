@@ -48,10 +48,13 @@ def _load_dotenv_from_project_root() -> None:
 _load_dotenv_from_project_root()
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from _cache import TTLCache
+from _http_cache import etag_json_response
 
 from atomic_io import atomic_write_text
 from btc_price import (
@@ -86,6 +89,7 @@ from live_clob import (
     place_entry_order as live_place_entry_order,
     place_limit_order as live_place_limit_order,
     reset_portfolio_cache,
+    reset_trading_client_cache,
 )
 import secret_store
 from order_validation import validate_contracts_for_market
@@ -189,6 +193,24 @@ def _any_engine_active() -> bool:
     return runner.rt.mode != "off" or bool(getattr(trigger.config, "active", False))
 
 
+# A-3: memoization של win-rate. החישוב סורק את כל demo.state.trades (O(N), עד 50k) ונקרא
+# עד 5 פעמים לכל poll (3× snapshot + state + config). עסקאות יציאה תמיד *מתווספות* (append),
+# אז (bot_run_started_ts, len(trades)) קובע באופן מלא את התוצאה — מפתח invalidation זול ומדויק.
+_WIN_RATE_CACHE: dict[str, Any] = {"key": None, "val": None}
+
+# B-13: cache תצוגתי קצר ל-/api/history/last-window-outcome (לא בתוך get_last_window_winners).
+_LWO_CACHE = TTLCache(ttl_sec=3.0)
+
+# B-1: cache תצוגתי ליתרת ה-CLOB account. היתרה משתנה רק ב-fill/deposit. ה-cache כאן בלבד —
+# check_balance_before_order ממשיך לקרוא fetch_polymarket_clob_account חי ברגע ההזמנה (Guardrail).
+_CLOB_ACCOUNT_CACHE = TTLCache(ttl_sec=3.0)
+
+# B-2: cache תצוגתי ל-/api/signals (1s) — הפאנל הוא תצוגה (TA+imbalance+המלצה), לא ticker חי.
+# מדדדפ את משיכת שני הספרים + compute_signals. ה-cache כאן בלבד; לולאות ה-trigger/strategy
+# קוראות get_clob_book ישירות ולא נוגעות בו. refresh=true עוקף.
+_SIGNALS_CACHE = TTLCache(ttl_sec=1.0)
+
+
 def _bot_run_win_rate_stats() -> dict[str, Any]:
     """אחוז ניצחונות ביציאות ממומשות מתחילת סשן הבוט (כמו חישוב win rate בלשונית סטטיסטיקה)."""
     t0 = _bot_run_started_ts
@@ -198,6 +220,9 @@ def _bot_run_win_rate_stats() -> dict[str, Any]:
             "bot_run_exit_trades_n": 0,
             "bot_run_wins_n": 0,
         }
+    cache_key = (float(t0), len(demo.state.trades or []))
+    if _WIN_RATE_CACHE["key"] == cache_key and _WIN_RATE_CACHE["val"] is not None:
+        return _WIN_RATE_CACHE["val"]
     t0f = float(t0)
     exits: list[dict[str, Any]] = []
     for t in demo.state.trades or []:
@@ -224,18 +249,24 @@ def _bot_run_win_rate_stats() -> dict[str, Any]:
             exits.append(t)
     n = len(exits)
     if n == 0:
-        return {
+        result = {
             "bot_run_win_rate_pct": None,
             "bot_run_exit_trades_n": 0,
             "bot_run_wins_n": 0,
         }
+        _WIN_RATE_CACHE["key"] = cache_key
+        _WIN_RATE_CACHE["val"] = result
+        return result
     wins = sum(1 for x in exits if float(x.get("realized_pnl") or 0) > 0)
     wr = 100.0 * wins / n
-    return {
+    result = {
         "bot_run_win_rate_pct": round(wr, 2),
         "bot_run_exit_trades_n": n,
         "bot_run_wins_n": wins,
     }
+    _WIN_RATE_CACHE["key"] = cache_key
+    _WIN_RATE_CACHE["val"] = result
+    return result
 
 
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(Path(__file__).resolve().parent))).resolve()
@@ -1101,16 +1132,18 @@ async def demo_state():
 
 
 @app.get("/api/demo/snapshot")
-async def demo_snapshot():
+async def demo_snapshot(request: Request):
     """Lightweight snapshot — balance + last_mark + positions + recent trades/equity slices.
-    Designed for fast 500ms polling: keeps P&L display fresh and lets the broadcast chart
-    and LAST TRADES appear within 500ms of a page refresh (without heavy CLOB calls)."""
+    Designed for fast polling: keeps P&L display fresh and lets the broadcast chart
+    and LAST TRADES appear quickly (without heavy CLOB calls).
+    A-3: win-rate מחושב פעם אחת (לא 3×), ו-ETag/304 חוסך גוף כשכלום לא השתנה."""
     s = demo.state
     bw = runner.rt.config.btc_window
     if bw not in ("5m", "15m"):
         bw = "5m"
     market_timing = peek_window_timing_for_ui(bw)
-    return {
+    win_rate = _bot_run_win_rate_stats()
+    payload = {
         "balance_usd": s.balance_usd,
         "positions": [
             {
@@ -1127,11 +1160,12 @@ async def demo_snapshot():
         "bot_run_started_ts": _bot_run_started_ts,
         "bot_run_equity_baseline_usd": _bot_run_equity_baseline_usd,
         "ui_runtime_equity_baseline_usd": float(_ui_runtime_equity_baseline_usd),
-        "bot_run_win_rate_pct": _bot_run_win_rate_stats().get("bot_run_win_rate_pct"),
-        "bot_run_exit_trades_n": _bot_run_win_rate_stats().get("bot_run_exit_trades_n"),
-        "bot_run_wins_n": _bot_run_win_rate_stats().get("bot_run_wins_n"),
+        "bot_run_win_rate_pct": win_rate.get("bot_run_win_rate_pct"),
+        "bot_run_exit_trades_n": win_rate.get("bot_run_exit_trades_n"),
+        "bot_run_wins_n": win_rate.get("bot_run_wins_n"),
         "market_timing": market_timing,
     }
+    return etag_json_response(payload, request.headers.get("if-none-match"))
 
 
 class ResetBody(BaseModel):
@@ -1324,6 +1358,7 @@ async def strategy_config(body: ConfigBody):
     append_strategy_journal(f"\n--- עדכון אסטרטגיה: {time.strftime('%H:%M:%S')} ---\n")
     write_strategy_snapshot(runner, demo)
     _save_persisted_config()
+    _LWO_CACHE.invalidate()  # B-13: תצוגת FLW מתעדכנת מיד אחרי עריכת קונפיג
     return {"ok": True, "config": saved}
 
 
@@ -1440,14 +1475,16 @@ async def api_logs_run_dir():
 
 
 @app.get("/api/strategy/logs")
-async def strategy_logs():
-    return {"lines": runner.rt.log_lines[-100:]}
+async def strategy_logs(request: Request):
+    # C-4: ETag/304 — לוגים משתנים רק כשנרשמת שורה חדשה; poll ללא שינוי מחזיר גוף ריק.
+    return etag_json_response({"lines": runner.rt.log_lines[-100:]}, request.headers.get("if-none-match"))
 
 
 @app.get("/api/strategy/log-entries")
-async def strategy_log_entries():
+async def strategy_log_entries(request: Request):
     """רשומות יומן מובנות: אירועים וסטטוסים, עם session_id לקישור למסכל."""
-    return {"entries": runner.rt.log_entries[-300:]}
+    # C-4: ETag/304 — אותו רציונל כמו /api/strategy/logs.
+    return etag_json_response({"entries": runner.rt.log_entries[-300:]}, request.headers.get("if-none-match"))
 
 
 @app.get("/api/strategy/tips-v2")
@@ -1564,6 +1601,8 @@ async def set_private_key(body: dict[str, Any]):
 
     os.environ["POLYMARKET_PRIVATE_KEY"] = k
     reset_portfolio_cache()
+    reset_trading_client_cache()  # A-6: מפתח חדש -> לבנות client מחדש (לא להגיש creds ישנים)
+    _CLOB_ACCOUNT_CACHE.invalidate()  # B-1: יתרת המפתח החדש מיד
 
     persisted_ok = False
     if persist:
@@ -1598,6 +1637,8 @@ async def delete_private_key():
     removed = secret_store.delete_key()
     _invalidate_persisted_key_cache()
     reset_portfolio_cache()
+    reset_trading_client_cache()  # A-6: מפתח נמחק -> לפסול client שמור
+    _CLOB_ACCOUNT_CACHE.invalidate()  # B-1
     return {"ok": True, "removed_from_keychain": removed, **_live_mode_state()}
 
 
@@ -1645,9 +1686,10 @@ def _live_mode_state() -> dict[str, Any]:
 
 
 @app.get("/api/live/mode")
-async def live_mode_get():
-    """קורא מצב "כסף אמיתי" מהמנוע (נשלט מהממשק)."""
-    return _live_mode_state()
+async def live_mode_get(request: Request):
+    """קורא מצב "כסף אמיתי" מהמנוע (נשלט מהממשק).
+    C-3: ETag/304 על ה-payload החי (לא מוקפא בטיימר) — flip של kill-switch/מפתח משתקף מיד."""
+    return etag_json_response(_live_mode_state(), request.headers.get("if-none-match"))
 
 
 class LiveModeBody(BaseModel):
@@ -1672,8 +1714,14 @@ async def live_mode_set(body: LiveModeBody):
 
 @app.get("/api/live/polymarket-clob-account")
 async def polymarket_clob_account():
-    """יתרת collateral (USDC) ב-CLOB לפי המפתח הנוכחי — לא כל תיק Polymarket באתר."""
-    return fetch_polymarket_clob_account()
+    """יתרת collateral (USDC) ב-CLOB לפי המפתח הנוכחי — לא כל תיק Polymarket באתר.
+    B-1: cache תצוגתי 3s — חוסך auth+balance בכל poll. נתיב ההזמנה קורא חי, לא מכאן."""
+    cached = _CLOB_ACCOUNT_CACHE.get("acct")
+    if cached is not None:
+        return cached
+    acct = fetch_polymarket_clob_account()
+    _CLOB_ACCOUNT_CACHE.set("acct", acct)
+    return acct
 
 
 @app.get("/api/live/portfolio")
@@ -1721,15 +1769,27 @@ async def api_signals(refresh: bool = False, window: Optional[str] = None):
     """
     btc_win = window if window in ("5m", "15m") else runner.rt.config.btc_window
     m = await discover_active_btc_window(btc_win)
+    cache_key = (btc_win, m.slug if m else None)
+    if not refresh:
+        cached = _SIGNALS_CACHE.get(cache_key)
+        if cached is not None:
+            return JSONResponse(content=cached)
     up_book: Optional[dict[str, Any]] = None
     down_book: Optional[dict[str, Any]] = None
     if m:
         try:
             client = _get_shared_httpx()
-            up_book = await get_clob_book(client, m.token_up)
-            down_book = await get_clob_book(client, m.token_down)
+            # B-2: מושכים את שני הספרים במקביל (חוצה latency). single-flight ב-get_clob_book
+            # ממזג קריאות מקבילות לאותו token בין לקוחות.
+            ub, db = await asyncio.gather(
+                get_clob_book(client, m.token_up),
+                get_clob_book(client, m.token_down),
+                return_exceptions=True,
+            )
+            up_book = ub if isinstance(ub, dict) else None
+            down_book = db if isinstance(db, dict) else None
         except Exception:
-            pass
+            up_book = down_book = None
     window_sec = m.window_sec if m else 300
     result = await compute_signals(
         up_book=up_book,
@@ -1757,6 +1817,7 @@ async def api_signals(refresh: bool = False, window: Optional[str] = None):
     result["market_slug"] = m.slug if m else None
     result["btc_window"] = btc_win
 
+    _SIGNALS_CACHE.set(cache_key, result)
     return JSONResponse(content=result)
 
 
@@ -1927,13 +1988,17 @@ async def faults_clear(only_handled: bool = True):
 
 
 @app.get("/api/history/last-window-outcome")
-async def history_last_window_outcome():
+async def history_last_window_outcome(request: Request):
     """תוצאת חלון/ות אחרונים + תצוגה מקדימה של בחירת FLW (לתצוגת UI).
 
     מחזיר:
     - last: החלון האחרון שנסגר (epoch, side_won, btc_open/close, drift_pct).
     - flw_preview: לאיזה צד FLW היה נכנס עכשיו לפי הקונפיג הנוכחי. None אם
       FLW כבוי או שאין מספיק history.
+
+    B-13: התוצאה משתנה רק כשחלון נסגר (כל 5/15 דק׳). cache קצר (3s) חוסך 1-2 שאילתות
+    SQLite לשנייה/לקוח; מתבטל מיד ב-POST config. ה-cache כאן בלבד — לעולם לא בתוך
+    get_last_window_winners, שהוא על נתיב ה-FLW entry החי (Guardrail).
     """
     c = runner.rt.config
     try:
@@ -1941,6 +2006,15 @@ async def history_last_window_outcome():
         ws = window_step_sec(getattr(c, "btc_window", "5m"))
     except Exception:
         ws = 300
+    flw_enabled = bool(getattr(c, "follow_last_winner_enabled", False))
+    flw_lookback = int(getattr(c, "follow_last_winner_lookback", 1) or 1)
+    flw_mode = str(getattr(c, "follow_last_winner_mode", "forward"))
+    flw_min_drift = float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0) or 0.0)
+    flw_side_pref = getattr(c, "side_preference", "Up")
+    cache_key = (ws, flw_enabled, flw_lookback, flw_mode, flw_min_drift, flw_side_pref)
+    cached_payload = _LWO_CACHE.get(cache_key)
+    if cached_payload is not None:
+        return etag_json_response(cached_payload, request.headers.get("if-none-match"))
     # תמיד לוקחים את החלון האחרון (ללא סינון drift) לתצוגה
     latest = get_last_window_winners(window_sec=ws, limit=1, min_drift_pct=0.0)
     last_out: Optional[dict[str, Any]] = None
@@ -1969,18 +2043,16 @@ async def history_last_window_outcome():
         }
     # תצוגה מקדימה של FLW לפי הקונפיג הנוכחי
     flw_preview: Optional[dict[str, Any]] = None
-    if getattr(c, "follow_last_winner_enabled", False):
+    if flw_enabled:
         try:
             side = runner._resolve_follow_winner_side(c)
-            lookback = int(getattr(c, "follow_last_winner_lookback", 1) or 1)
-            min_drift = float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0) or 0.0)
-            sample = get_last_window_winners(window_sec=ws, limit=lookback, min_drift_pct=min_drift)
+            sample = get_last_window_winners(window_sec=ws, limit=flw_lookback, min_drift_pct=flw_min_drift)
             flw_preview = {
                 "side": side,  # None אם אין history → fallback ל-side_preference
-                "lookback": lookback,
-                "mode": str(getattr(c, "follow_last_winner_mode", "forward")),
-                "min_drift_pct": min_drift,
-                "fallback_side_preference": getattr(c, "side_preference", "Up"),
+                "lookback": flw_lookback,
+                "mode": flw_mode,
+                "min_drift_pct": flw_min_drift,
+                "fallback_side_preference": flw_side_pref,
                 "samples": [
                     {
                         "epoch": s.get("epoch"),
@@ -1993,7 +2065,9 @@ async def history_last_window_outcome():
             }
         except Exception:
             flw_preview = None
-    return {"last": last_out, "flw_preview": flw_preview, "window_sec": ws}
+    payload = {"last": last_out, "flw_preview": flw_preview, "window_sec": ws}
+    _LWO_CACHE.set(cache_key, payload)
+    return etag_json_response(payload, request.headers.get("if-none-match"))
 
 
 # ── Trigger API ────────────────────────────────────────────────────────────────

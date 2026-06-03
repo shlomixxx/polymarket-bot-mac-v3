@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -28,6 +29,20 @@ from atomic_io import atomic_write_text
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD
 
 FEE_RATE = 0.002  # 0.2% — תואם ל-demo_engine
+
+# B-5: לקוח httpx משותף עם keep-alive ללולאות ה-DCA/TP. הלולאות רצות כל 2-3s לאורך כל החלון
+# ופתחו client חדש בכל איטרציה (TLS handshake). ללא result cache — get_clob_book מושך חי.
+_TRIGGER_BOOK_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _get_trigger_book_client() -> httpx.AsyncClient:
+    global _TRIGGER_BOOK_CLIENT
+    if _TRIGGER_BOOK_CLIENT is None:
+        _TRIGGER_BOOK_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=5.0),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        )
+    return _TRIGGER_BOOK_CLIENT
 
 _DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(Path(__file__).resolve().parent))).resolve()
 _TRIGGER_POSITIONS_PATH = _DATA_ROOT / "trigger_positions.json"
@@ -271,8 +286,7 @@ class TriggerEngine:
             if not m:
                 return None
             token_id = m.token_up if side == "Up" else m.token_down
-            async with httpx.AsyncClient() as client:
-                book = await get_clob_book(client, token_id)
+            book = await get_clob_book(_get_trigger_book_client(), token_id)
             asks = book.get("asks") or []
             if not asks:
                 return None
@@ -519,9 +533,9 @@ class TriggerEngine:
 
             # שאל סיגנל
             try:
-                async with _httpx.AsyncClient(timeout=5.0) as client:
-                    up_book = await get_clob_book(client, m.token_up) if m else None
-                    down_book = await get_clob_book(client, m.token_down) if m else None
+                client = _get_trigger_book_client()
+                up_book = await get_clob_book(client, m.token_up) if m else None
+                down_book = await get_clob_book(client, m.token_down) if m else None
                 result = await compute_signals(up_book=up_book, down_book=down_book,
                                                window_sec=m.window_sec if m else 300)
                 rec = result.get("recommendation", "neutral")
@@ -574,11 +588,11 @@ class TriggerEngine:
                 await self._check_tp_exits()
 
             try:
-                async with _httpx.AsyncClient(timeout=5.0) as client:
-                    up_book, down_book = await asyncio.gather(
-                        get_clob_book(client, m.token_up),
-                        get_clob_book(client, m.token_down),
-                    )
+                client = _get_trigger_book_client()
+                up_book, down_book = await asyncio.gather(
+                    get_clob_book(client, m.token_up),
+                    get_clob_book(client, m.token_down),
+                )
                 up_ask = float(up_book["asks"][0]["price"]) if up_book.get("asks") else None
                 down_ask = float(down_book["asks"][0]["price"]) if down_book.get("asks") else None
                 result = await compute_signals(up_book=up_book, down_book=down_book,
@@ -911,7 +925,8 @@ class TriggerEngine:
             return
 
         exited: list[str] = []
-        async with _httpx.AsyncClient(timeout=4.0) as client:
+        # B-5: לקוח משותף keep-alive (nullcontext כדי לא לסגור אותו ולא לשנות הזחה בלולאה).
+        async with contextlib.nullcontext(_get_trigger_book_client()) as client:
             for token_id, pos in list(self._trigger_positions.items()):
                 try:
                     # בדוק שהפוזיציה עדיין קיימת ב-demo engine (מקור אמת)

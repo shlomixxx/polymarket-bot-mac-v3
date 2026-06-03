@@ -16,11 +16,14 @@ FEAR_GREED_URL = "https://api.alternative.me/fng/?limit=1"
 # Cache
 _funding_cache: Optional[dict] = None
 _funding_ts: float = 0.0
-_FUNDING_TTL = 300.0  # 5 minutes
+# C-12: funding מתחשבן כל 8 שעות — TTL של 30 דק׳ מיושר לקצב האמיתי (היה 5 דק׳ ⇒ ~288 משיכות/יום).
+# אסור לקצר: זה אות סנטימנט גס במשקל נמוך, לא מחיר/settlement.
+_FUNDING_TTL = 1800.0  # 30 minutes (8h funding cadence)
 
 _fg_cache: Optional[dict] = None
 _fg_ts: float = 0.0
-_FG_TTL = 3600.0  # 1 hour
+# C-11: Fear&Greed הוא נתון *יומי* — TTL של 6 שעות (היה שעה ⇒ ~24 משיכות/יום של אותו ערך).
+_FG_TTL = 21600.0  # 6 hours (daily figure)
 
 
 async def fetch_funding_rate() -> dict[str, Any]:

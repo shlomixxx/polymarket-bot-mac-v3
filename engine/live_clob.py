@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+import threading
 import time
 from typing import Any, Iterable, Literal, Optional
 
@@ -30,8 +31,25 @@ def _live_disabled_reason() -> Optional[str]:
     return None
 
 
+# A-6: memoization של (ClobClient, creds). create_or_derive_api_creds() הוא round-trip רשתי
+# מאומת שמחזיר את אותם creds דטרמיניסטיים למפתח קבוע, ונקרא בכל order/בדיקת יתרה/poll.
+# שומרים client בנוי לפי (pk, signature_type, funder) ומשתמשים חוזר.
+# Guardrails: (1) כשל לעולם לא נשמר; (2) kill-switch/חוסר מפתח תמיד מקצר (לא מ-cache);
+# (3) reset_trading_client_cache() אחרי שינוי מפתח; (4) get_balance_allowance נשאר uncached
+# (היתרה החיה נקראת בכל entry/SELL/settlement — לא נוגעים בה).
+_TRADING_CLIENT_CACHE: dict[str, Any] = {"key": None, "client": None}
+_TRADING_CLIENT_LOCK = threading.Lock()
+
+
+def reset_trading_client_cache() -> None:
+    """מאפס את ה-memoization של ה-trading client — לקרוא אחרי החלפת מפתח/funder/sig-type."""
+    with _TRADING_CLIENT_LOCK:
+        _TRADING_CLIENT_CACHE["key"] = None
+        _TRADING_CLIENT_CACHE["client"] = None
+
+
 def build_trading_client():
-    """מחזיר (client, None) או (None, error_message)."""
+    """מחזיר (client, None) או (None, error_message). ממומואיז לפי (pk, sig_type, funder)."""
     try:
         from py_clob_client.client import ClobClient
     except ImportError:
@@ -39,25 +57,32 @@ def build_trading_client():
 
     err = _live_disabled_reason()
     if err:
-        return None, err
+        return None, err  # kill-switch / חוסר מפתח — אף פעם לא מ-cache
 
     pk = os.environ["POLYMARKET_PRIVATE_KEY"].strip()
     host = "https://clob.polymarket.com"
     chain_id = 137
-
-    temp = ClobClient(host, chain_id=chain_id, key=pk)
-    try:
-        creds = temp.create_or_derive_api_creds()
-    except Exception as e:
-        return None, f"API credentials: {e}"
 
     sig_raw = os.environ.get("POLYMARKET_SIGNATURE_TYPE", "0").strip()
     try:
         signature_type = int(sig_raw)
     except ValueError:
         signature_type = 0
+    funder_env = (os.environ.get("POLYMARKET_FUNDER") or "").strip()
 
-    funder = (os.environ.get("POLYMARKET_FUNDER") or "").strip()
+    cache_key = (pk, signature_type, funder_env)
+    with _TRADING_CLIENT_LOCK:
+        if _TRADING_CLIENT_CACHE["key"] == cache_key and _TRADING_CLIENT_CACHE["client"] is not None:
+            return _TRADING_CLIENT_CACHE["client"], None
+
+    # בנייה (כולל ה-round-trip של ה-creds) מחוץ ל-lock כדי לא לחסום threads אחרים על IO.
+    temp = ClobClient(host, chain_id=chain_id, key=pk)
+    try:
+        creds = temp.create_or_derive_api_creds()
+    except Exception as e:
+        return None, f"API credentials: {e}"  # כשל — לא נשמר
+
+    funder = funder_env
     signer_addr: Optional[str] = None
     try:
         signer_addr = temp.get_address()
@@ -85,6 +110,9 @@ def build_trading_client():
         signature_type=signature_type,
         funder=funder,
     )
+    with _TRADING_CLIENT_LOCK:
+        _TRADING_CLIENT_CACHE["key"] = cache_key
+        _TRADING_CLIENT_CACHE["client"] = client
     return client, None
 
 

@@ -12,6 +12,8 @@ from typing import Any, Literal, Optional
 
 import httpx
 
+from _cache import SingleFlight
+
 GAMMA = "https://gamma-api.polymarket.com"
 
 STEP_5M = 300
@@ -156,12 +158,15 @@ _DISCOVERY_TTL_SEC = 30.0
 
 
 def _cached_market(window: BtcWindow) -> Optional[ActiveMarket]:
+    # A-5: ה-slug/epoch/tokens/window_sec הם פונקציה דטרמיניסטית של ה-epoch — immutable לכל אורך
+    # חיי החלון. לכן מחזיקים את השוק לכל גוף החלון (אין יותר תפוגת TTL שטוחה של 30s) — חוסך
+    # ~90% קריאות Gamma. שומרים את תפוגת הגבול: ברגע שהחלון נסגר -> None -> re-discovery ל-epoch
+    # החדש (קריטי ל-rollover; ה-warmer מאיץ ל-1.5s סביב הגבול). outcome_prices (תצוגה גסה ב-
+    # /api/market/current בלבד) מתרענן פעם בחלון — המחיר החי מגיע מ-WS/CLOB, לא מכאן.
     entry = _DISCOVERY_CACHE.get(window)
     if not entry:
         return None
-    ts, am = entry
-    if (time.time() - ts) > _DISCOVERY_TTL_SEC:
-        return None
+    _ts, am = entry
     if seconds_until_window_end(am.epoch, am.window_sec) <= 0:
         return None
     return am
@@ -348,7 +353,17 @@ def peek_window_timing_for_ui(window: BtcWindow) -> Optional[dict[str, Any]]:
     }
 
 
+# B-3: single-flight — קריאות *מקבילות* לאותו token חולקות בקשת רשת אחת. אין cache מבוסס-זמן,
+# אז אין staleness: כל caller מקבל תוצאה טרייה. מחיר ה-fill בפועל (demo_engine.best_ask) הוא
+# פונקציה נפרדת שמושכת חי תמיד — לא מושפע.
+_BOOK_SINGLE_FLIGHT = SingleFlight()
+
+
 async def get_clob_book(client: httpx.AsyncClient, token_id: str) -> dict[str, Any]:
+    return await _BOOK_SINGLE_FLIGHT.do(token_id, lambda: _get_clob_book_uncached(client, token_id))
+
+
+async def _get_clob_book_uncached(client: httpx.AsyncClient, token_id: str) -> dict[str, Any]:
     r = await client.get(
         "https://clob.polymarket.com/book",
         params={"token_id": token_id},

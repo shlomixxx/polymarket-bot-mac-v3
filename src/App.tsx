@@ -2036,16 +2036,24 @@ export default function App() {
         await sleep(ms);
       }
     })();
+    // B-9: בחזרה לטאב — רענון מיידי במקום להמתין עד 10s שהלולאה ישנה במצב מוסתר.
+    const onVisible = () => { if (!isPageHidden() && !cancelled) void refresh(); };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
+      document.removeEventListener("visibilitychange", onVisible);
     };
   }, [refresh]);
 
-  /** Fast 500ms snapshot poll — רק balance + last_mark + positions לעדכון P&L מהיר */
+  /** Snapshot poll 500ms — balance + last_mark + positions לעדכון P&L מהיר (A-1).
+   * 500ms משמר את חלקות האחוז החי ב-last_mark וחוצה את התעבורה מול 250ms. in-flight guard
+   * מונע ערימת בקשות כשהשרת איטי; visibilitychange מרענן מיד בחזרה לטאב (B-9). */
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
     const pollSnapshot = async () => {
-      if (cancelled || isPageHidden()) return;
+      if (cancelled || isPageHidden() || inFlight) return;
+      inFlight = true;
       try {
         const snap = await api<Record<string, unknown>>("/api/demo/snapshot");
         if (!cancelled) {
@@ -2061,10 +2069,18 @@ export default function App() {
         }
       } catch {
         // silent — full refresh will recover
+      } finally {
+        inFlight = false;
       }
     };
-    const id = window.setInterval(pollSnapshot, 250);
-    return () => { cancelled = true; window.clearInterval(id); };
+    const id = window.setInterval(pollSnapshot, 500);
+    const onVisible = () => { if (!isPageHidden()) void pollSnapshot(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   /** Polling נפרד לתיק חי מ-Polymarket: רק כשמצב לייב "effective" (מפתח, דגל ו-kill-switch). */

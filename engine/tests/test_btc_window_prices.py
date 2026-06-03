@@ -15,6 +15,8 @@ from btc_price import (
 
 @pytest.mark.asyncio
 async def test_fetch_close_price_uses_last_minute_candle_close():
+    import btc_price
+    btc_price._CLOSE_PRICE_CACHE.clear()  # A-7: cache משותף — מנקים כדי לבדוק משיכה חיה
     epoch = 1_700_000_000
     window_sec = 300
     last_open_ms = (epoch + window_sec - 60) * 1000
@@ -28,12 +30,9 @@ async def test_fetch_close_price_uses_last_minute_candle_close():
         r.json = lambda: [mock_row]
         return r
 
-    with patch("btc_price.httpx.AsyncClient") as client_cls:
-        client = AsyncMock()
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=None)
-        client.get = AsyncMock(side_effect=fake_get)
-        client_cls.return_value = client
+    client = AsyncMock()
+    client.get = AsyncMock(side_effect=fake_get)
+    with patch("btc_price._get_binance_client", return_value=client):
         out = await fetch_close_price_at_window_end(epoch, window_sec)
     assert out == pytest.approx(98765.43)
 

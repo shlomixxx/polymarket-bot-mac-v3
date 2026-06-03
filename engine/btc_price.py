@@ -1,6 +1,7 @@
 """מחיר BTC חי + פרוקסי לפתיחת חלון (Binance 1m) + Chainlink (Polygon) לייחוס כמו Polymarket."""
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Optional
 
@@ -8,6 +9,21 @@ import httpx
 
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price"
+
+# לקוח httpx משותף ל-Binance עם keep-alive (תשתית 0.2 / B-6): חוסך TLS handshake חדש בכל
+# קריאת spot/klines. timeout ברירת-מחדל מתאים ל-klines (10s); קריאת ה-spot עוקפת ל-4s לכל קריאה.
+_BINANCE_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+def _get_binance_client() -> httpx.AsyncClient:
+    global _BINANCE_CLIENT
+    if _BINANCE_CLIENT is None:
+        _BINANCE_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=2.0, read=10.0, write=5.0, pool=5.0),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        )
+    return _BINANCE_CLIENT
+
 
 # Chainlink BTC/USD — Polygon PoS (אותו סוג oracle ש-Polymarket מציג כ-Price to beat)
 CHAINLINK_BTC_USD_POLYGON = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
@@ -122,6 +138,22 @@ async def fetch_chainlink_btc_usd_polygon_get_round(round_id: int) -> Optional[t
 
 _CHAINLINK_AT_WINDOW_CACHE: dict[int, float] = {}
 
+# A-7: cache קבוע למחירי open/close של settlement. נרות 1m סגורים הם immutable, אז ערך
+# שנמשך פעם אחת תקף לתמיד. מאחסנים *רק* ערכים סופיים (לא None) — close נשמר רק אחרי
+# שהנר נסגר (בדיקת closeTime>now). מפתח: open לפי epoch, close לפי (epoch, window_sec).
+# זו אינה תקרית ה-martingale: היא נבעה מ-None שהפך ל-loss; כאן None לעולם לא נשמר.
+_OPEN_PRICE_CACHE: dict[int, float] = {}
+_CLOSE_PRICE_CACHE: dict[tuple[int, int], float] = {}
+_SETTLEMENT_CACHE_MAX = 1024
+
+
+def _prune_settlement_cache(cache: dict) -> None:
+    """שומר את החלונות העדכניים ביותר; מסיר ישנים (מפתח קטן = epoch מוקדם) כדי להגביל זיכרון."""
+    excess = len(cache) - _SETTLEMENT_CACHE_MAX
+    if excess > 0:
+        for k in sorted(cache.keys())[:excess]:
+            cache.pop(k, None)
+
 
 async def fetch_chainlink_btc_usd_polygon_at_window_start(window_epoch_sec: int) -> Optional[float]:
     """
@@ -166,32 +198,14 @@ async def fetch_chainlink_btc_usd_polygon_at_window_start(window_epoch_sec: int)
 
 
 async def fetch_chainlink_btc_usd_polygon_latest() -> Optional[float]:
-    """מחיר BTC/USD אחרון מפיד Chainlink על Polygon (latestRound) — לא בהכרח Price to Beat."""
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [
-            {
-                "to": CHAINLINK_BTC_USD_POLYGON,
-                "data": LATEST_ROUND_DATA_SELECTOR,
-            },
-            "latest",
-        ],
-        "id": 1,
-    }
-    async with httpx.AsyncClient() as client:
-        for rpc in POLYGON_PUBLIC_RPCS:
-            try:
-                r = await client.post(rpc, json=payload, timeout=8.0)
-                r.raise_for_status()
-                result = r.json().get("result")
-                if not result or not isinstance(result, str):
-                    continue
-                px = _decode_chainlink_latest_round_answer(result)
-                if px is not None and px > 1000.0:
-                    return px
-            except Exception:
-                continue
+    """מחיר BTC/USD אחרון מפיד Chainlink על Polygon (latestRound) — לא בהכרח Price to Beat.
+    C-6: עובר דרך _polygon_eth_call המאוגד (keep-alive + RPC sticky failover) במקום לקוח ad-hoc."""
+    result = await _polygon_eth_call(LATEST_ROUND_DATA_SELECTOR)
+    if not result or not isinstance(result, str):
+        return None
+    px = _decode_chainlink_latest_round_answer(result)
+    if px is not None and px > 1000.0:
+        return px
     return None
 
 
@@ -208,10 +222,10 @@ async def fetch_btc_spot_usdt() -> float:
     if cached_price is not None and (now - cached_ts) <= _BTC_SPOT_CACHE_TTL_SEC:
         return float(cached_price)
     try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(BINANCE_TICKER, params={"symbol": "BTCUSDT"}, timeout=4.0)
-            r.raise_for_status()
-            price = float(r.json()["price"])
+        client = _get_binance_client()
+        r = await client.get(BINANCE_TICKER, params={"symbol": "BTCUSDT"}, timeout=4.0)
+        r.raise_for_status()
+        price = float(r.json()["price"])
         _BTC_SPOT_CACHE["price"] = price
         _BTC_SPOT_CACHE["ts"] = time.time()
         return price
@@ -222,19 +236,25 @@ async def fetch_btc_spot_usdt() -> float:
 
 
 async def fetch_open_price_at_window_start(window_epoch_sec: int) -> Optional[float]:
-    """מחיר פתיחת נר 1m שמתחיל ב-window_epoch (Unix שניות)."""
+    """מחיר פתיחת נר 1m שמתחיל ב-window_epoch (Unix שניות). A-7: cached (immutable per epoch)."""
+    cached = _OPEN_PRICE_CACHE.get(window_epoch_sec)
+    if cached is not None:
+        return cached
     start_ms = window_epoch_sec * 1000
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            BINANCE_KLINES,
-            params={"symbol": "BTCUSDT", "interval": "1m", "startTime": start_ms, "limit": 1},
-            timeout=10.0,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None
-        return float(data[0][1])
+    client = _get_binance_client()
+    r = await client.get(
+        BINANCE_KLINES,
+        params={"symbol": "BTCUSDT", "interval": "1m", "startTime": start_ms, "limit": 1},
+        timeout=10.0,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if not data:
+        return None
+    val = float(data[0][1])
+    _OPEN_PRICE_CACHE[window_epoch_sec] = val
+    _prune_settlement_cache(_OPEN_PRICE_CACHE)
+    return val
 
 
 async def fetch_close_price_at_window_end(
@@ -254,35 +274,42 @@ async def fetch_close_price_at_window_end(
 
     if window_sec < 60:
         return None
+    cached = _CLOSE_PRICE_CACHE.get((window_epoch_sec, window_sec))
+    if cached is not None:
+        return cached
     # הנר האחרון מתחיל ב-epoch + window_sec - 60 ונסגר ב-epoch + window_sec
     last_candle_open_ms = (window_epoch_sec + window_sec - 60) * 1000
     attempt = 0
     while True:
         attempt += 1
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    BINANCE_KLINES,
-                    params={
-                        "symbol": "BTCUSDT",
-                        "interval": "1m",
-                        "startTime": last_candle_open_ms,
-                        "limit": 1,
-                    },
-                    timeout=10.0,
-                )
-                r.raise_for_status()
-                data = r.json()
-                if data:
-                    # שדה [6] = closeTime במילי-שניות; אם closeTime > now → הנר עדיין פתוח.
-                    close_time_ms = int(data[0][6]) if len(data[0]) > 6 else 0
-                    if close_time_ms and close_time_ms > int(time.time() * 1000):
-                        # הנר עדיין פתוח — לא לקחת את ה-close שלו (זמני).
-                        if attempt < max_retries:
-                            await _asyncio.sleep(retry_sleep_sec)
-                            continue
-                        return None
-                    return float(data[0][4])
+            client = _get_binance_client()
+            r = await client.get(
+                BINANCE_KLINES,
+                params={
+                    "symbol": "BTCUSDT",
+                    "interval": "1m",
+                    "startTime": last_candle_open_ms,
+                    "limit": 1,
+                },
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if data:
+                # שדה [6] = closeTime במילי-שניות; אם closeTime > now → הנר עדיין פתוח.
+                close_time_ms = int(data[0][6]) if len(data[0]) > 6 else 0
+                if close_time_ms and close_time_ms > int(time.time() * 1000):
+                    # הנר עדיין פתוח — לא לקחת את ה-close שלו (זמני).
+                    if attempt < max_retries:
+                        await _asyncio.sleep(retry_sleep_sec)
+                        continue
+                    return None
+                # נר סגור — ערך סופי immutable; נשמר ב-cache (רק non-None).
+                close_val = float(data[0][4])
+                _CLOSE_PRICE_CACHE[(window_epoch_sec, window_sec)] = close_val
+                _prune_settlement_cache(_CLOSE_PRICE_CACHE)
+                return close_val
         except Exception:
             if attempt >= max_retries:
                 raise
@@ -298,8 +325,12 @@ async def fetch_window_start_end_btc_usd(
     זוג מחירי התחלה/סוף לפירוק סימולציה (אותה מתודולוגיה כמו price_to_beat).
     הרזולוציה הרשמית ב-Polymarket היא Chainlink — כאן binance_1m_proxy לשקיפות.
     """
-    start = await fetch_open_price_at_window_start(window_epoch_sec)
-    end = await fetch_close_price_at_window_end(window_epoch_sec, window_sec)
+    # open ו-close הם נרות עצמאיים — מושכים במקביל (B-6) כדי לחצות את זמן ה-settlement.
+    # return_exceptions=False כדי שכשל יתפשט ו-demo_engine יפעיל void-and-refund (לא win/loss שגוי).
+    start, end = await asyncio.gather(
+        fetch_open_price_at_window_start(window_epoch_sec),
+        fetch_close_price_at_window_end(window_epoch_sec, window_sec),
+    )
     return {
         "start": start,
         "end": end,

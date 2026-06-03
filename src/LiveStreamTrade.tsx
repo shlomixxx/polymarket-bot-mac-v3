@@ -886,11 +886,14 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
     return () => { cancelled = true; window.clearInterval(id); };
   }, [refresh]);
 
-  /** Fast 500ms snapshot poll — רק balance + last_mark + positions לעדכון P&L מהיר */
+  /** Snapshot poll 500ms — balance + last_mark + positions ל-broadcast (A-2 + B-9).
+   * הקאונטדאון מונפש מ-clock מקומי + אינטרפולציה, אז הוא חלק בכל קצב; 500ms חוצה תעבורה 24/7. */
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
     const pollSnapshot = async () => {
-      if (cancelled || isPageHidden()) return;
+      if (cancelled || isPageHidden() || inFlight) return;
+      inFlight = true;
       try {
         const snap = await api<DemoState>("/api/demo/snapshot");
         if (!cancelled) {
@@ -932,10 +935,18 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
         }
       } catch {
         // silent — full refresh will recover
+      } finally {
+        inFlight = false;
       }
     };
-    const id = window.setInterval(pollSnapshot, 250);
-    return () => { cancelled = true; window.clearInterval(id); };
+    const id = window.setInterval(pollSnapshot, 500);
+    const onVisible = () => { if (!isPageHidden()) void pollSnapshot(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   useEffect(() => {

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api } from "./api";
+import { api, isPageHidden } from "./api";
 
 /** לשונית "תקלות ובאגים" — מעקב אחרי כשלים במערכת: חומרה, ספירה, טופל/לא, שיתוף. */
 
@@ -100,10 +100,15 @@ export default function FaultsTab() {
     void refresh();
   }, [refresh]);
 
-  // auto-refresh every 12s
+  // auto-refresh every 12s — מדלג כשהטאב מוסתר, ומרענן מיד בחזרה (C-10).
   useEffect(() => {
-    const id = setInterval(() => void refresh(), 12000);
-    return () => clearInterval(id);
+    const id = setInterval(() => { if (!isPageHidden()) void refresh(); }, 12000);
+    const onVisible = () => { if (!isPageHidden()) void refresh(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [refresh]);
 
   const faults = data?.faults ?? [];
