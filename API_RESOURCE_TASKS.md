@@ -24,8 +24,16 @@
 - **קבוצה C:** C-3 live/mode ETag, C-4 logs+log-entries ETag, **C-5 memoize ל-compute_global_metrics**, C-6 Chainlink דרך לקוח Polygon מאוגד, C-10 FaultsTab isPageHidden, C-11 Fear&Greed 6h, C-12 funding 30min.
 - **B-8:** הושג דרך memoization של win-rate (ETag לא ישים כי ב-config יש `last_tick_ts`/uptime שמשתנים בכל בקשה).
 
+**D-1 — בוצע בגרסה בטוחה ✅ (commit 3):** במקום ההסרה הנאיבית המסוכנת, מימשתי לולאת `_mark_loop`
+ברקע (`main.py` lifespan, כל 0.5s, **בכל מצב מנוע**, תחת `_supervise` שמרסטרט על קריסה) שמתחזקת את
+`last_mark` ואת ה-TP-settlement-backfill — **כך ה-backfill מתקדם גם כשהמנוע OFF** (החשש המקורי).
+ה-handler `/api/demo/state` מסמן עכשיו **רק כ-fallback אם `last_mark` התיישן >2s** (כלומר הלולאה
+מתה) — מרפא-עצמי, כך שה-correctness לא תלויה בכך שהלולאה רצה (אם מתה → ה-handler מסמן כמו היום,
+אפס רגרסיה). הרווח מתבטל מנתיב הבקשה: ה-mark/CLOB/כתיבת 6MB יוצאים מה-GET ורצים פעם אחת ברקע
+במקום N פעמים לכל הלקוחות. Guardrail נשמר: entry/exit עדיין קוראים `fetch_best_bid_ask()` חי.
+**מומלץ עדיין smoke-test חי לאחר פריסה:** מנוע OFF → לוודא שה-PnL בממשק זז וה-backfill מתקדם.
+
 **נדחה במכוון (עם נימוק):**
-- **D-1** (`/api/demo/state` — הסרת mark_to_market מהבקשה): 🔴 הפריט היחיד שסומן "לא בטוח כפי שנוסח". דורש לבנות לולאת mark ברקע **ולאמת בריצה חיה** שהיא מקדמת `last_mark` כשהמנוע OFF, לפני הסרת ה-mark. נוגע ב-plumbing של settlement (מחלקת הבאג של ה-martingale). ETag כאן לא עוזר כי `last_mark.ts` משתנה בכל mark. מומלץ כשינוי נפרד עם בדיקה חיה (`engine OFF → PnL עדיין מתעדכן`).
 - **D-2** (klines): אין גרסה שגם בטוחה וגם חוסכת — הגרסה החוסכת (יישור לגבול נר) מקפיאה את ה-momentum עד דקה. ה-TTL הנוכחי (15s) כבר בטוח. הושאר.
 - **C-1/C-2** (orderbook-summary, contract-prices ETag): לא ישים — שדה `ts` משתנה בכל בקשה. ה-WS cache כבר חוסך את קריאות ה-CLOB.
 - **disc-3, C-8** (UI peek endpoint / threading discovery לטיק): **הערך נלכד כבר ע"י A-5** — אחרי שה-discovery מוחזק לאורך החלון, אין יותר חשיפת Gamma בנתיב החם ולא fetch על expiry. נותר רק overhead זניח של lock — לא שווה churn + endpoint/frontend חדש.

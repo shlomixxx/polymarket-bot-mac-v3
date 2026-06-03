@@ -421,6 +421,27 @@ _snapshot_task: Optional[asyncio.Task] = None
 _history_recorder_task: Optional[asyncio.Task] = None
 _ws_subscription_task: Optional[asyncio.Task] = None
 _discovery_warmer_task: Optional[asyncio.Task] = None
+_mark_loop_task: Optional[asyncio.Task] = None
+
+# D-1: לולאת mark ברקע — מסמנת את התיק (mark_to_market) בכל מצב מנוע (כולל OFF, שהוא ברירת
+# המחדל אחרי restart). כך /api/demo/state לא צריך לסמן בעצמו, וה-TP-settlement-backfill מתקדם
+# גם כשהמנוע כבוי. ה-handler מסמן רק כ-fallback אם last_mark מתיישן (>STALE) — מרפא-עצמי.
+MARK_LOOP_INTERVAL_SEC = 0.5
+MARK_STALE_FALLBACK_SEC = 2.0
+
+
+async def _mark_once() -> None:
+    """איטרציה אחת של סימון; בולעת שגיאות כדי שלולאת הרקע לא תיפול על תקלת CLOB זמנית."""
+    try:
+        await demo.mark_to_market()
+    except Exception:
+        pass
+
+
+async def _mark_loop(interval_sec: float = MARK_LOOP_INTERVAL_SEC) -> None:
+    while True:
+        await _mark_once()
+        await asyncio.sleep(interval_sec)
 
 
 async def _supervise(name: str, coro_factory, restart_delay: float = 3.0) -> None:
@@ -710,7 +731,7 @@ def _count_strategy_run_dirs() -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _history_recorder_task, _ws_subscription_task, _discovery_warmer_task
+    global _snapshot_task, _history_recorder_task, _ws_subscription_task, _discovery_warmer_task, _mark_loop_task
     _ensure_log_run_dir()
     n_snap = _count_strategy_run_dirs()
     print(
@@ -739,6 +760,8 @@ async def lifespan(app: FastAPI):
     )
     runner.start_loop()
     trigger.start_loop()
+    # D-1: לולאת mark ברקע — מתחזקת last_mark + backfill בכל מצב, גם כשהמנוע OFF.
+    _mark_loop_task = asyncio.create_task(_supervise("mark_loop", lambda: _mark_loop()))
     _history_recorder_task = asyncio.create_task(
         _supervise("auto_history_recorder_loop", lambda: auto_history_recorder_loop(10.0))
     )
@@ -779,6 +802,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         _discovery_warmer_task = None
+    if _mark_loop_task:
+        _mark_loop_task.cancel()
+        try:
+            await _mark_loop_task
+        except asyncio.CancelledError:
+            pass
+        _mark_loop_task = None
     price_stream.stop()
     trigger.stop_loop()
     runner.stop_loop()
@@ -1126,8 +1156,12 @@ async def market_orderbook_summary():
 
 @app.get("/api/demo/state")
 async def demo_state():
-    # נסמן equity תמיד — כך last_mark.unrealized_usd מתאפס מיד כשאין פוזיציות
-    await demo.mark_to_market()
+    # D-1: לולאת הרקע (_mark_loop) מתחזקת last_mark כל ~0.5s בכל מצב. ה-handler מסמן רק כ-
+    # fallback אם last_mark התיישן (>STALE) — כלומר הלולאה מתה/איטית — כך שה-PnL לא קופא
+    # וה-backfill לא נעצר. במצב רגיל: בלי mark/CLOB/save בנתיב הבקשה (זה החיסכון).
+    lm = demo.state.last_mark or {}
+    if (time.time() - float(lm.get("ts") or 0.0)) > MARK_STALE_FALLBACK_SEC:
+        await demo.mark_to_market()
     _ensure_bot_run_session_if_active()
     out = demo.state.to_dict()
     # נשלח עם state כדי שדפי שידור/OBS לא יסמכו רק על /api/strategy/config או /api/runtime

@@ -1,4 +1,5 @@
 """טסטים לאופטימיזציות המשאבים בצד השרת (Phase 3): A-3, B-8, B-13."""
+import time
 from pathlib import Path
 
 import pytest
@@ -165,3 +166,50 @@ def test_signals_refresh_bypasses_cache(client: TestClient, monkeypatch):
     client.get("/api/signals")
     client.get("/api/signals?refresh=true")
     assert calls["n"] == 2  # refresh עוקף את ה-cache
+
+
+# ---------- D-1: background mark loop + stale-fallback handler ----------
+
+def test_demo_state_skips_mark_when_fresh(client: TestClient, monkeypatch):
+    """last_mark טרי (לולאת הרקע מתחזקת אותו) -> ה-handler לא מבצע mark/CLOB/save."""
+    import main as m
+    called = {"n": 0}
+
+    async def fake_mark():
+        called["n"] += 1
+        return {}
+
+    monkeypatch.setattr(m.demo, "mark_to_market", fake_mark)
+    m.demo.state.last_mark = {"ts": time.time()}  # טרי
+    r = client.get("/api/demo/state")
+    assert r.status_code == 200
+    assert called["n"] == 0
+
+
+def test_demo_state_marks_when_stale(client: TestClient, monkeypatch):
+    """last_mark מיושן (הלולאה מתה?) -> ה-handler מסמן בעצמו — fallback מרפא-עצמי, אין קיפאון."""
+    import main as m
+    called = {"n": 0}
+
+    async def fake_mark():
+        called["n"] += 1
+        m.demo.state.last_mark = {"ts": time.time()}
+        return {}
+
+    monkeypatch.setattr(m.demo, "mark_to_market", fake_mark)
+    m.demo.state.last_mark = {"ts": time.time() - 100.0}  # מיושן
+    r = client.get("/api/demo/state")
+    assert r.status_code == 200
+    assert called["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mark_once_swallows_errors(monkeypatch):
+    """כשל ב-mark_to_market בתוך לולאת הרקע לא מפיל את הלולאה."""
+    import main as m
+
+    async def boom():
+        raise RuntimeError("clob down")
+
+    monkeypatch.setattr(m.demo, "mark_to_market", boom)
+    await m._mark_once()  # לא אמור לזרוק
