@@ -16,6 +16,7 @@ import {
   computeBtcPriceChartYDomain,
 } from "./chartConstants";
 import { formatPnlAxisTime, formatPctAxisTick } from "./pnlChartFormatters";
+import { growLiveTrail } from "./livePnlTrail";
 import { useChartAnimationGate } from "./hooks/useChartAnimationGate";
 import { usePriceStream } from "./hooks/usePriceStream";
 import { Button } from "./ui/Button";
@@ -1069,21 +1070,25 @@ function TradesBySession({
                   );
                   if (isOpen) {
                     if (validServerPoints.length > 0) {
+                      // השרת מספק path גדל — מקור אמת, שומרים אותו.
                       lastOpenPnlPathBySessionRef.current[sid] = validServerPoints.map((p) => ({
                         ts: Number(p.ts),
                         upnl_pct: Number(p.upnl_pct),
                       }));
+                    } else if (liveLeg?.unrealized_pct != null && Number.isFinite(liveLeg.unrealized_pct)) {
+                      // Fix B: ה-path מהשרת ריק (איפוס ברולאובר/כניסה חוזרת) אבל הפוזיציה פתוחה עם
+                      // אחוז חי — מגדילים trail בצד-לקוח כדי שהגרף ימשיך לזוז במקום להציג snapshot קפוא.
+                      lastOpenPnlPathBySessionRef.current[sid] = growLiveTrail(
+                        lastOpenPnlPathBySessionRef.current[sid] || [],
+                        Number(liveLeg.unrealized_pct),
+                        Date.now() / 1000,
+                      );
                     }
                   } else {
                     delete lastOpenPnlPathBySessionRef.current[sid];
                   }
                   let pnlPath = serverPnlRaw;
-                  if (
-                    isOpen &&
-                    validServerPoints.length === 0 &&
-                    liveLeg?.unrealized_pct != null &&
-                    Number.isFinite(liveLeg.unrealized_pct)
-                  ) {
+                  if (isOpen && validServerPoints.length === 0) {
                     const retained = lastOpenPnlPathBySessionRef.current[sid];
                     if (retained && retained.length > 0) {
                       pnlPath = retained;
@@ -1752,6 +1757,9 @@ export default function App() {
   const [cfgDirty, setCfgDirty] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState<"saved" | null>(null);
   const cfgDirtyRef = useRef(false);
+  // Fix A: אחרי שמירה, חוסמים החלת ערכי-שרת על הטופס למשך חלון קצר — כדי ש-GET קונפיג שיצא
+  // *לפני* שה-POST נשמר לא "יקפיץ" את השדה חזרה לערך הישן (מרוץ poll מול save).
+  const cfgApplyBlockedUntilRef = useRef(0);
 
   const [inv, setInv] = useState(5);
   const [entryCents, setEntryCents] = useState(20);
@@ -1941,7 +1949,8 @@ export default function App() {
       }
       // חשוב: יש רענון כל שנייה. לא נדרוס ערכים שהמשתמש עורך לפני "שמור".
       // כשאין עריכה פתוחה — מסנכרנים את כל ההגדרות מהשרת (אחרת אחרי F5 חוזרים לברירות מחדל מקומיות).
-      if (!cfgDirtyRef.current) {
+      // Fix A: גם לא דורסים בחלון ה"settle" שאחרי שמירה (מונע קפיצה חזרה מ-GET ישן שיצא לפני ה-POST).
+      if (!cfgDirtyRef.current && Date.now() >= cfgApplyBlockedUntilRef.current) {
         const c = cfg as Record<string, unknown>;
         if (typeof c.investment_usd === "number") setInv(c.investment_usd);
         if (typeof c.entry_price_cents === "number") setEntryCents(c.entry_price_cents);
@@ -2161,6 +2170,9 @@ export default function App() {
         }),
       });
       cfgDirtyRef.current = false;
+      // Fix A: חלון settle — מתעלמים מהחלת ערכי-שרת על הטופס ל-2.5s, כדי ש-GET קונפיג שיצא
+      // לפני ה-POST הזה לא יקפיץ את השדה חזרה לערך הישן. הטופס כבר מציג את הערך שנשמר.
+      cfgApplyBlockedUntilRef.current = Date.now() + 2500;
       setCfgDirty(false);
       setSaveFeedback("saved");
       setTimeout(() => setSaveFeedback(null), 3000);
@@ -2180,7 +2192,7 @@ export default function App() {
     if (!cfgDirty) return;
     const id = window.setTimeout(() => {
       void pushConfigRef.current().catch(() => { /* שקט — נסיון חוזר בשינוי הבא */ });
-    }, 1500);
+    }, 600);  // Fix A: 1500→600ms — שמירה מהירה יותר אחרי הקלדה (ה-backend נשמר ב-3-7ms)
     return () => window.clearTimeout(id);
   }, [cfgDirty, inv, entryCents, minContracts, btcWindow, tp, minMin, freezeMin, interBlock,
       dca, dcaSlices, dcaInt, dcaDiscountEnabled, dcaDiscountPct, hedge, hedgeMax, side,
