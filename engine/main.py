@@ -855,6 +855,19 @@ async def health_head():
     return {}
 
 
+@app.get("/api/version")
+async def api_version():
+    """גרסת הקוד החי — לאימות פריסות. build_marker מוטמע בקוד (עולה עם כל שינוי);
+    commit/branch מגיעים מ-Railway רק כשהפריסה הופעלה מ-GitHub (auto-deploy)."""
+    return {
+        "build_marker": "v3-faults-flap-rollover-1",
+        "commit": os.environ.get("RAILWAY_GIT_COMMIT_SHA") or None,
+        "branch": os.environ.get("RAILWAY_GIT_BRANCH") or None,
+        "deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID") or None,
+        "deploy_source": "github" if os.environ.get("RAILWAY_GIT_COMMIT_SHA") else "cli_or_unknown",
+    }
+
+
 @app.get("/api/market/current")
 async def market_current():
     # ‎discover_active_btc_window כבר מבצע wait_for פנימי של 8s + stale-on-error fallback.
