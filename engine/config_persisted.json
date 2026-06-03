@@ -30,6 +30,7 @@
   "loss_recovery_max_multiplier": 10.0,
   "order_mode": "limit",
   "entry_slippage_pct": 2.0,
+  "market_max_entry_price_cents": 80.0,
   "exit_slippage_pct": 5.0,
   "peak_watchdog_enabled": true,
   "peak_retreat_exit_pct": 2.0,
@@ -40,6 +41,10 @@
   "hold_to_resolution_stop_loss_enabled": true,
   "investment_mode": "fixed",
   "investment_pct_of_portfolio": 5.0,
+  "follow_last_winner_enabled": false,
+  "follow_last_winner_lookback": 1,
+  "follow_last_winner_mode": "forward",
+  "follow_last_winner_min_btc_drift_pct": 0.0,
   "mode": "auto",
   "live_trading": false
 }
