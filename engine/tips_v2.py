@@ -688,9 +688,20 @@ def delete_run_folder_by_key(run_key: str) -> tuple[bool, str]:
     return True, "הריצה נמחקה"
 
 
+# B-14: cache לאגרגט ההיסטורי הכבד (re-parse של עד 50 תיקיות × 2 JSON). מפתח = מצב תיקיות
+# הריצה (count + max mtime) — *לא* עסקאות הדמו. כך עסקה חדשה לא מכריחה re-parse: היא ממוזגת
+# ב-generate_tips_v2 לאחר מכן. מחזירים תמיד עותק רדוד כי generate_tips_v2 משנה את הרשימה.
+_ANALYZE_RUNS_CACHE: dict[str, Any] = {"key": None, "val": None}
+
+
 def analyze_runs(max_runs: int) -> list[RunStats]:
+    dirs = list_run_dirs(max_runs)
+    sig = (max_runs, len(dirs), max((d.stat().st_mtime for d in dirs), default=0.0))
+    cached = _ANALYZE_RUNS_CACHE["val"]
+    if _ANALYZE_RUNS_CACHE["key"] == sig and cached is not None:
+        return list(cached)  # עותק פרטי — המיזוג ב-generate_tips_v2 לא יפגע ב-cache
     out: list[RunStats] = []
-    for run_dir in list_run_dirs(max_runs):
+    for run_dir in dirs:
         snap = _load_json(run_dir / "strategy_snapshot.json")
         trades_data = _load_json(run_dir / "trades.json")
         if not snap or not trades_data:
@@ -701,7 +712,9 @@ def analyze_runs(max_runs: int) -> list[RunStats]:
             continue
         st = _analyze_trades(trades=trades, strategy_config=cfg)
         out.append(st)
-    return out
+    _ANALYZE_RUNS_CACHE["key"] = sig
+    _ANALYZE_RUNS_CACHE["val"] = out
+    return list(out)
 
 
 def _tip_sort_key(x: dict[str, Any]) -> tuple:

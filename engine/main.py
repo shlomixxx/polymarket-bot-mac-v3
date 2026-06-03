@@ -914,18 +914,24 @@ async def market_current():
     global last_epoch_for_open, cached_open, cached_ptb_source
     if m.epoch != last_epoch_for_open:
         last_epoch_for_open = m.epoch
-        # קודם Binance (מהיר ויציב) כדי שלא לחסום את ה-endpoint; שדרוג ל-Chainlink ברקע אם יזמין.
-        try:
-            cached_open = await asyncio.wait_for(
-                fetch_open_price_at_window_start(m.epoch), timeout=3.0
-            )
-            cached_ptb_source = "binance_1m_fallback"
-        except Exception:
-            cached_open = None
-            cached_ptb_source = "binance_1m_fallback"
-        # שדרוג Chainlink ברקע — לא מעכב את התשובה; אם יחזור ערך, יוחל בקריאה הבאה.
-        async def _upgrade_to_chainlink(epoch: int) -> None:
+        # B-7: גם פתיחת Binance (3s) וגם שדרוג Chainlink רצים ברקע — לא חוסמים את הבקשה.
+        # price_to_beat יחזור null עד שיוכן (ה-UI סובל null) ויתמלא בפול הבא (~1s, או מיד אם
+        # A-7 כבר ב-cache). מסיר את החסימה של עד 3s פעם בכל חלון מנתיב ה-UI.
+        cached_open = None
+        cached_ptb_source = "binance_1m_fallback"
+
+        async def _populate_price_to_beat(epoch: int) -> None:
             global cached_open, cached_ptb_source, last_epoch_for_open
+            try:
+                ob = await asyncio.wait_for(
+                    fetch_open_price_at_window_start(epoch), timeout=3.0
+                )
+                if ob is not None and last_epoch_for_open == epoch:
+                    cached_open = ob
+                    cached_ptb_source = "binance_1m_fallback"
+            except Exception:
+                pass
+            # שדרוג Chainlink (cache פר-epoch ב-_CHAINLINK_AT_WINDOW_CACHE → זול בחזרה).
             try:
                 ptb = await asyncio.wait_for(
                     fetch_chainlink_btc_usd_polygon_at_window_start(epoch), timeout=10.0
@@ -935,7 +941,8 @@ async def market_current():
             if ptb is not None and last_epoch_for_open == epoch:
                 cached_open = ptb
                 cached_ptb_source = "chainlink_polygon_window"
-        asyncio.create_task(_upgrade_to_chainlink(m.epoch))
+
+        asyncio.create_task(_populate_price_to_beat(m.epoch))
     note_chainlink = (
         "ייחוס: סיבוב Chainlink BTC/USD על Polygon שעודכן עד לפתיחת החלון (קרוב לפיד האונ־צ׳יין). "
         "באתר Polymarket מוצג לעיתים Chainlink Data Streams — עשוי להסטות סנטים/דולרים בודדים. "

@@ -17,20 +17,23 @@
 
 בוצע ב-TDD על branch נפרד (production נשאר נקי עד אישור). **238 טסטים python + 8 frontend + tsc + vite build — הכל ירוק.** נוספו 38 טסטים חדשים (7 קבצים).
 
-**בוצע ונבדק (✅):**
+**בוצע ונבדק (✅) — 2 commits:**
 - **תשתית:** 0.1 `engine/_cache.py` (TTLCache + SingleFlight), 0.2 לקוח Binance keep-alive, 0.3 `engine/_http_cache.py` (ETag/304).
 - **קבוצה A (כל ה-7):** A-1/A-2 snapshot 250→500ms + in-flight guard, A-3 snapshot win-rate פעם אחת + ETag/304, A-5 discovery מוחזק לאורך החלון, A-6 memoize ל-CLOB client (+reset על שינוי מפתח), A-7 cache מחירי settlement.
-- **קבוצה B:** B-1 cache יתרת account, B-2 signals gather+cache, B-3 single-flight ל-get_clob_book, B-4 keep-alive ב-fetch_best_bid_ask, B-5 keep-alive בלולאות DCA/TP, B-6 לקוח Binance + gather, B-9 Page Visibility, B-13 last-window cache+ETag (+ביטול ב-POST config).
-- **קבוצה C:** C-3 live/mode ETag, C-4 logs+log-entries ETag, C-6 Chainlink דרך לקוח Polygon מאוגד, C-10 FaultsTab isPageHidden, C-11 Fear&Greed 6h, C-12 funding 30min.
+- **קבוצה B:** B-1 cache יתרת account, B-2 signals gather+cache, B-3 single-flight ל-get_clob_book, B-4 keep-alive ב-fetch_best_bid_ask, B-5 keep-alive בלולאות DCA/TP, **B-7 הוצאת fetch מחיר-פתיחה החוסם לרקע**, B-9 Page Visibility, B-13 last-window cache+ETag, **B-14 cache ל-analyze_runs לפי מצב תיקיות**.
+- **קבוצה C:** C-3 live/mode ETag, C-4 logs+log-entries ETag, **C-5 memoize ל-compute_global_metrics**, C-6 Chainlink דרך לקוח Polygon מאוגד, C-10 FaultsTab isPageHidden, C-11 Fear&Greed 6h, C-12 funding 30min.
 - **B-8:** הושג דרך memoization של win-rate (ETag לא ישים כי ב-config יש `last_tick_ts`/uptime שמשתנים בכל בקשה).
 
 **נדחה במכוון (עם נימוק):**
-- **D-1** (`/api/demo/state` — הסרת mark_to_market מהבקשה): 🔴 הפריט היחיד שסומן "לא בטוח כפי שנוסח". דורש לבנות לולאת mark ברקע **ולאמת בריצה חיה** שהיא מקדמת `last_mark` כשהמנוע OFF, לפני הסרת ה-mark מה-handler. נוגע ב-plumbing של settlement (מחלקת הבאג של ה-martingale) — מומלץ כשינוי נפרד עם בדיקה חיה.
-- **D-2** (klines): אין גרסה שגם בטוחה וגם חוסכת — הגרסה החוסכת (יישור לגבול נר) מקפיאה את ה-momentum עד דקה. ה-TTL הנוכחי (15s) כבר בטוח. הושאר כמות-שהוא.
-- **C-1/C-2** (orderbook-summary, contract-prices ETag): לא ישים — שניהם מחזירים שדה `ts` שמשתנה בכל בקשה (ETag לעולם לא יתאים). ה-WS cache בצד השרת כבר חוסך את קריאות ה-CLOB.
-- **B-7, B-12, B-14, C-5, C-7, C-8, C-9, disc-3:** ערך נמוך יותר או refactor פרונטאנד/endpoint מעורב; נדחה לסבב הבא (פירוט בגוף הקובץ).
+- **D-1** (`/api/demo/state` — הסרת mark_to_market מהבקשה): 🔴 הפריט היחיד שסומן "לא בטוח כפי שנוסח". דורש לבנות לולאת mark ברקע **ולאמת בריצה חיה** שהיא מקדמת `last_mark` כשהמנוע OFF, לפני הסרת ה-mark. נוגע ב-plumbing של settlement (מחלקת הבאג של ה-martingale). ETag כאן לא עוזר כי `last_mark.ts` משתנה בכל mark. מומלץ כשינוי נפרד עם בדיקה חיה (`engine OFF → PnL עדיין מתעדכן`).
+- **D-2** (klines): אין גרסה שגם בטוחה וגם חוסכת — הגרסה החוסכת (יישור לגבול נר) מקפיאה את ה-momentum עד דקה. ה-TTL הנוכחי (15s) כבר בטוח. הושאר.
+- **C-1/C-2** (orderbook-summary, contract-prices ETag): לא ישים — שדה `ts` משתנה בכל בקשה. ה-WS cache כבר חוסך את קריאות ה-CLOB.
+- **disc-3, C-8** (UI peek endpoint / threading discovery לטיק): **הערך נלכד כבר ע"י A-5** — אחרי שה-discovery מוחזק לאורך החלון, אין יותר חשיפת Gamma בנתיב החם ולא fetch על expiry. נותר רק overhead זניח של lock — לא שווה churn + endpoint/frontend חדש.
+- **B-12** (signals two-tier): האימות עצמו סימן "low priority, חוסך מעט מאוד CPU". B-2 כבר עושה cache ל-endpoint כולו ב-1s — הערך השולי ~אפס.
+- **C-9** (איחוד poller של trigger/state): ווליום מוחלט נמוך (0.5 בקשות/שנייה, טאבים שונים) — refactor פרונטאנד ללא תועלת ממשית.
+- **C-7** (BTC spot WS push): מאמץ גבוה (ערוץ WS חדש + צרכן בפרונט) לתמורה בינונית; ה-spot כבר ב-cache 1s. אופציונלי — סבב נפרד.
 
-**הערה:** השינויים על branch — לא מוזגו ל-main ולא נפרסו ל-Railway. ראה סיכום בצ׳אט להוראות מיזוג/פריסה.
+**הערה:** הכל על branch `api-resource-optimization` — לא מוזג ל-main ולא נפרס ל-Railway. ראה סיכום בצ׳אט.
 
 ---
 

@@ -44,7 +44,22 @@ from .signal_quality import compute_signal_accuracy, compute_window_prediction_a
 from .market_regime import compute_volatility_regimes, compute_btc_direction_correlation
 from .insights_engine import generate_insights, generate_config_recommendations
 
+from _cache import TTLCache
+
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
+
+# C-5: memoize ל-compute_global_metrics — נקרא ב-/overview, /full-report ו-/risk/ruin (2-3×
+# לכל דוח). הנתונים משתנים רק ב-/migrate (on-demand), אז TTL קצר אפקטיבית תמיד-טרי.
+_GLOBAL_METRICS_CACHE = TTLCache(ttl_sec=5.0)
+
+
+def _global_metrics(execution: Optional[str]) -> Any:
+    cached = _GLOBAL_METRICS_CACHE.get(execution)
+    if cached is not None:
+        return cached
+    val = compute_global_metrics(execution)
+    _GLOBAL_METRICS_CACHE.set(execution, val)
+    return val
 
 
 # ── DB Management ──────────────────────────────────────────────────────────
@@ -53,6 +68,7 @@ router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 async def api_migrate():
     """Run one-time JSON → SQLite migration."""
     result = migrate_json_to_sqlite()
+    _GLOBAL_METRICS_CACHE.invalidate()  # C-5: נתונים השתנו — לרענן את ה-memo
     return {"status": "ok", "migrated": result}
 
 
@@ -67,7 +83,7 @@ async def api_db_stats():
 @router.get("/overview")
 async def api_overview(execution: Optional[str] = Query(None)):
     """Global performance metrics."""
-    return compute_global_metrics(execution)
+    return _global_metrics(execution)
 
 
 @router.get("/equity-curve")
@@ -167,7 +183,7 @@ async def api_risk_of_ruin(
     risk_pct: float = Query(2.5),
 ):
     """Risk of ruin estimation."""
-    metrics = compute_global_metrics(execution)
+    metrics = _global_metrics(execution)
     if metrics["total_sessions"] < 10:
         return {"error": "Need at least 10 sessions", "risk_of_ruin_pct": None}
     return compute_risk_of_ruin(
@@ -269,7 +285,7 @@ async def api_recommendations(execution: Optional[str] = Query(None)):
 async def api_full_report(execution: Optional[str] = Query(None)):
     """Complete analytics report — all metrics in one call."""
     return {
-        "overview": compute_global_metrics(execution),
+        "overview": _global_metrics(execution),
         "timing": {
             "hourly": compute_hourly_performance(execution),
             "weekday": compute_weekday_performance(execution),
