@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import math
 import os
 import time
@@ -22,6 +23,9 @@ from order_validation import validate_contracts_for_market
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
 
 FEE_RATE = 0.002  # 0.2% לצד כהערכה
+# PR-D: השהיית persist (כתיבת 6MB) מחוץ ל-event-loop + throttle ל-backfill הכבד.
+PERSIST_INTERVAL_SEC = 20.0   # לכל היותר כתיבת state אחת כל 20s מנתיב הקריאה (fire-and-forget)
+BACKFILL_THROTTLE_SEC = 30.0  # ה-backfill הכבד (רשת + סריקה) רץ לכל היותר כל 30s, לא בכל poll
 
 Side = Literal["Up", "Down"]
 
@@ -243,6 +247,12 @@ class DemoEngine:
         self._post_exit_tracking: dict[str, dict[str, Any]] = {}  # token_id -> מעקב שיא/שפל פוטנציאלי אחרי TP
         self._session_by_token: dict[str, str] = {}
         self._mark_aggressive_until: float = 0.0  # mark_to_market מהיר יותר אחרי קפיצה גדולה בין טיקים
+        # PR-D: persist מושהה מחוץ ל-event-loop + throttle ל-backfill, כדי ש-/api/demo/state
+        # לא ישמור 6MB סינכרונית בכל poll ולא יריץ את ה-backfill הכבד בכל poll (גרם ל-6s).
+        self._dirty = False
+        self._persist_in_flight = False
+        self._last_persist_ts = 0.0
+        self._last_backfill_ts = 0.0
         self._backfill_session_ids()
 
     def _load(self) -> DemoState:
@@ -1020,28 +1030,52 @@ class DemoEngine:
             trade["resolved_outcome"] = "Up" if resolved_up else "Down"
             trade["settlement_won"] = (side == "Up" and resolved_up) or (side == "Down" and not resolved_up)
 
+    def _build_session_canon_map(self) -> dict[str, tuple[Optional[int], int]]:
+        """PR-D: בונה ב-pass יחיד מיפוי session_id -> (epoch, window_sec) של הכניסה הראשונה (BUY
+        מוקדם ביותר עם epoch). מחליף קריאות _canonical_window_epoch_ws_for_session החוזרות (כל אחת
+        O(N)) שגרמו ל-O(N²) ב-backfill על 50k עסקאות. סמנטיקה זהה ל-_canonical לצורך ה-backfill."""
+        canon: dict[str, tuple[Optional[int], int]] = {}
+        best_ts: dict[str, float] = {}
+        for bt in self.state.trades:
+            if bt.get("type") != "BUY":
+                continue
+            bsid = bt.get("session_id")
+            if not bsid:
+                continue
+            be = bt.get("epoch")
+            if be is None:
+                continue
+            bts = float(bt.get("ts") or 0)
+            if bsid not in canon or bts < best_ts.get(bsid, 1e18):
+                canon[bsid] = (int(be), int(bt.get("window_sec") or 300))
+                best_ts[bsid] = bts
+        return canon
+
     async def _backfill_missing_tp_settlement_btc(self) -> bool:
         """אחרי סוף החלון — ממלא settlement ל-SELL_TP שלא קיבלו נר סוף בזמן ה-TP (נר עדיין לא נסגר ב-Binance)."""
         now = time.time()
         changed = False
-        # נקרא מ-mark_to_market בתדירות גבוהה — מגבילים קריאות Binance לעסקה אחת לכל הופעה (מספיק למילוי הדרגתי)
+        # נקרא מ-mark_to_market — מגבילים קריאות Binance לתקציב לכל הופעה (מילוי הדרגתי).
         budget = 16
+        # PR-D: precompute canonical-window map פעם אחת (O(N)) במקום קריאה O(N) לכל SELL_TP (O(N²)).
+        session_canon = self._build_session_canon_map()
         for t in self.state.trades:
             if budget <= 0:
                 break
             if t.get("type") != "SELL_TP":
                 continue
-            ep, ws = self._infer_epoch_window_for_exit_trade(t)
+            sid_tp = t.get("session_id")
+            canon_ep, canon_ws = session_canon.get(str(sid_tp), (None, 300)) if sid_tp else (None, 300)
+            # ep/ws לפירוק: קודם החלון הקנוני (כמו _infer_epoch_window_for_exit_trade), אחרת של ה-trade עצמו.
+            if canon_ep is not None:
+                ep, ws = canon_ep, canon_ws
+            else:
+                ep = t.get("epoch")
+                ws = int(t.get("window_sec") or 300)
             if ep is None:
                 continue
             if now < float(ep) + float(ws) - 0.25:
                 continue
-            sid_tp = t.get("session_id")
-            canon_ep, _ = (
-                self._canonical_window_epoch_ws_for_session(str(sid_tp))
-                if sid_tp
-                else (None, 300)
-            )
             tp_ep = t.get("epoch")
             epoch_mismatch = (
                 bool(sid_tp)
@@ -1239,11 +1273,43 @@ class DemoEngine:
         self.save()
         return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
 
+    def _mark_dirty(self) -> None:
+        """PR-D: מסמן שיש שינוי שצריך persist — נכתב בפועל ע"י _maybe_persist_async (מושהה, מחוץ ללולאה)."""
+        self._dirty = True
+
+    async def _maybe_persist_async(self) -> None:
+        """PR-D: persist מושהה (לכל היותר כל PERSIST_INTERVAL_SEC), single-flight, fire-and-forget.
+        ה-snapshot נבנה על ה-event loop (to_dict), וה-json.dumps+כתיבה+fsync של 6MB רצים ב-thread
+        כדי לא לחנוק את הלולאה (זה היה גורם ה-outage). הבקשה לא ממתינה לכתיבה."""
+        now = time.time()
+        if not self._dirty or self._persist_in_flight:
+            return
+        if (now - self._last_persist_ts) < PERSIST_INTERVAL_SEC:
+            return
+        self._persist_in_flight = True
+        self._dirty = False
+        snapshot = self.state.to_dict()  # נבנה על ה-loop — לעולם לא ב-thread (מוטציה במקביל)
+
+        async def _run() -> None:
+            try:
+                await asyncio.to_thread(atomic_write_json, self.state_path, snapshot, indent=2)
+                self._last_persist_ts = time.time()
+            except Exception:
+                self._dirty = True  # כשל — ננסה שוב בבקשה הבאה הזכאית
+            finally:
+                self._persist_in_flight = False
+
+        asyncio.ensure_future(_run())  # fire-and-forget — הבקשה חוזרת מיד
+
     async def mark_to_market(self) -> dict[str, Any]:
         """מסמן את התיק לפי best bid (ערך מימוש משוער) כדי שהסטטיסטיקה תראה הפסד/רווח גם לפני יציאה."""
-        # מילוי פירוק BTC ל-TP — בכל קריאה (מגבלה פנימית לעסקאות/קריאה) כדי שה-UI יקבל נתונים מיד אחרי /api/demo/state
-        if await self._backfill_missing_tp_settlement_btc():
-            self.save()
+        # PR-D: ה-backfill הכבד (רשת + סריקה O(N²)) רץ לכל היותר כל BACKFILL_THROTTLE_SEC, לא בכל
+        # poll. ה-save שלו הופך ל-persist מושהה מחוץ ללולאה (לא 6MB סינכרוני בכל poll).
+        _now_bf = time.time()
+        if (_now_bf - self._last_backfill_ts) >= BACKFILL_THROTTLE_SEC:
+            self._last_backfill_ts = _now_bf
+            if await self._backfill_missing_tp_settlement_btc():
+                self._mark_dirty()
         # Throttle: WS cache makes reads instant, so we can be more aggressive.
         try:
             last_ts = float((self.state.last_mark or {}).get("ts") or 0.0)
@@ -1504,7 +1570,11 @@ class DemoEngine:
                 tr["_last_path_ts"] = now
                 tr["_last_path_upnl"] = upnl_pct
             tr["_prev_tick_upnl"] = upnl_pct
-        self.save()
+        # PR-D: לא שומרים 6MB סינכרונית בכל mark (זה חנק את ה-event loop). מסמנים dirty ומבקשים
+        # persist מושהה מחוץ ללולאה (fire-and-forget, לכל היותר כל 20s). המצב נשמר גם ב-BUY/SELL/
+        # settlement (saves סינכרוניים שנשארו), אז אין סיכון לאיבוד נתונים קריטיים.
+        self._mark_dirty()
+        await self._maybe_persist_async()
         return self.state.last_mark
 
     def unrealized_pnl_pct(self, token_id: str, mark_bid: float) -> Optional[float]:
