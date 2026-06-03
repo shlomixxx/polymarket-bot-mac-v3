@@ -1367,7 +1367,7 @@ class DemoEngine:
                     r = await client.get(
                         "https://clob.polymarket.com/book",
                         params={"token_id": p.token_id},
-                        timeout=8.0,
+                        timeout=4.0,  # F4: 8->4 — cap the WS-down fallback latency
                     )
                     if r.status_code != 200:
                         continue
@@ -1458,21 +1458,36 @@ class DemoEngine:
                         pass
                 to_remove.append(tid)
                 continue
-            r = await client.get(
-                "https://clob.polymarket.com/book",
-                params={"token_id": tid},
-                timeout=15.0,
-            )
-            if r.status_code != 200:
-                continue
-            bids = list((r.json().get("bids") or []))
-            if not bids:
-                continue
+            # F4: WS-first + per-token 2s throttle + 4s timeout. peak/trough tracking is cosmetic,
+            # so a cold WS must not make /api/demo/state pay M sequential 15s CLOB GETs every mark
+            # (this was the residual ~4s after the save/backfill fix). When WS is up it's near-free.
+            bid = None
             try:
-                bids.sort(key=lambda x: float(x["price"]), reverse=True)
+                from ws_price_stream import price_stream
+                _tp = price_stream.get_price(tid)
+                if _tp and _tp.bid is not None and (now - _tp.ts) < 30.0:
+                    bid = _tp.bid
             except Exception:
                 pass
-            bid = float(bids[0]["price"])
+            if bid is None:
+                if now - float(pe.get("_last_book_poll_ts", 0.0)) < 2.0:
+                    continue  # throttle the REST fallback per token
+                pe["_last_book_poll_ts"] = now
+                r = await client.get(
+                    "https://clob.polymarket.com/book",
+                    params={"token_id": tid},
+                    timeout=4.0,
+                )
+                if r.status_code != 200:
+                    continue
+                bids = list((r.json().get("bids") or []))
+                if not bids:
+                    continue
+                try:
+                    bids.sort(key=lambda x: float(x["price"]), reverse=True)
+                except Exception:
+                    pass
+                bid = float(bids[0]["price"])
             leg_val = bid * pe["contracts"] * (1 - FEE_RATE)
             leg_cost = pe["leg_cost"]
             upnl_pct = (leg_val - leg_cost) / leg_cost * 100.0 if leg_cost > 0 else 0.0
