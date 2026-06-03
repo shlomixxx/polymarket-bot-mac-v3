@@ -305,6 +305,33 @@ def effective_price_for_contract_qty(entry_cap_usd: float, ask: Optional[float])
     return min(float(entry_cap_usd), a)
 
 
+def sizing_price_per_contract(
+    ask: Optional[float],
+    entry_cap_usd: float,
+    *,
+    order_mode: str = "limit",
+    entry_slippage_pct: float = 2.0,
+) -> float:
+    """מחיר ליחידה לחישוב כמות החוזים — חייב לשקף את מחיר ה-fill הצפוי כדי שההוצאה בפועל
+    תהיה ≈ investment_usd.
+
+    Bugfix (issue #2): במצב market ה-fill הוא ב-ask (×slippage, עד התקרה החוקית), *לא*
+    ב-entry_cap_price. שימוש ב-min(cap, ask) כמו במצב limit גרם לכך שעם entry_price_cents=20
+    ו-ask=51 חושבו ~24 חוזים אך ההוצאה בפועל הייתה ~פי 2.5 מ-investment_usd. לכן במצב market
+    מתמחרים לפי entry_limit_price (אותו מחיר שאליו ה-order מתמלא). במצב limit — ללא שינוי.
+    """
+    if order_mode == "market" and ask is not None:
+        try:
+            a = float(ask)
+        except (TypeError, ValueError):
+            return effective_price_for_contract_qty(entry_cap_usd, ask)
+        if math.isfinite(a) and MIN_LEGIT_SHARE_PRICE_USD <= a <= MAX_LEGIT_SHARE_PRICE_USD:
+            return entry_limit_price(
+                a, entry_cap_usd, order_mode="market", entry_slippage_pct=entry_slippage_pct
+            )
+    return effective_price_for_contract_qty(entry_cap_usd, ask)
+
+
 def dca_ref_price_from_ask(ask: float, entry_target_usd: float, cfg: StrategyConfig) -> float:
     """מחיר ייחוס לקביעת ה-quantity ול-limit_price בדא״ס.
     אם דחיסון אחוזים פעיל: Q נקבע לפי המחיר המונחה (X% מתחת ל-ask),
@@ -1786,7 +1813,11 @@ class StrategyRunner:
             per = eff_inv / max(1, cfg.dca_slices)
             # נחשב כמות שמרנית כך שהעמלות לא "יאכלו" את היתרה בסלייס הבא.
             safe_per = per / (1.0 + FEE_RATE)
-            qty_px = effective_price_for_contract_qty(entry_cap_price, ask)
+            qty_px = sizing_price_per_contract(
+                ask, entry_cap_price,
+                order_mode=getattr(cfg, "order_mode", "limit"),
+                entry_slippage_pct=getattr(cfg, "entry_slippage_pct", 2.0),
+            )
             n = contracts_from_investment(safe_per, qty_px, min_c)
             now = time.time()
             if self.rt.dca_done_slices >= cfg.dca_slices:
@@ -1803,7 +1834,11 @@ class StrategyRunner:
                 return
         else:
             eff_inv = self._effective_investment_usd(cfg)
-            qty_px = effective_price_for_contract_qty(price_usd, ask)
+            qty_px = sizing_price_per_contract(
+                ask, price_usd,
+                order_mode=getattr(cfg, "order_mode", "limit"),
+                entry_slippage_pct=getattr(cfg, "entry_slippage_pct", 2.0),
+            )
             n = contracts_from_investment(eff_inv, qty_px, min_c)
             entry_cap_price = price_usd
             if price_usd < MIN_LEGIT_SHARE_PRICE_USD or price_usd > MAX_LEGIT_SHARE_PRICE_USD:
