@@ -13,12 +13,16 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 _DB_PATH = Path(os.environ.get("DATA_ROOT", str(Path(__file__).resolve().parent))) / "faults.db"
 _conn: Optional[sqlite3.Connection] = None
+# מנעול לחיבור ה-sqlite המשותף (check_same_thread=False). היום כל הכותבים על אותו event-loop
+# thread, אבל ה-watchdog וכותבים עתידיים עלולים לבוא מ-thread אחר — המנעול מונע מרוץ כתיבה.
+_LOCK = threading.Lock()
 
 SEVERITIES = ("critical", "high", "medium", "low")
 
@@ -26,8 +30,9 @@ SEVERITIES = ("critical", "high", "medium", "low")
 def _get_conn() -> sqlite3.Connection:
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
+        _conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False, timeout=5.0)
         _conn.row_factory = sqlite3.Row
+        _conn.execute("PRAGMA busy_timeout=5000")  # אין WAL — חסר תועלת ב-thread יחיד + סיכון על volume רשת
         _conn.execute(
             """
             CREATE TABLE IF NOT EXISTS faults (
@@ -78,24 +83,25 @@ def record_fault(
         now = time.time()
         key = dedup_key or f"{category}:{title}"
         ctx = json.dumps(context or {}, ensure_ascii=False)
-        conn = _get_conn()
         reopen_sql = "handled = 0, resolved_ts = NULL, resolution_note = NULL," if reopen_on_recur else ""
-        conn.execute(
-            f"""
-            INSERT INTO faults (dedup_key, first_ts, last_ts, count, category,
-                                severity, title, detail, source, context_json)
-            VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(dedup_key) DO UPDATE SET
-                last_ts  = excluded.last_ts,
-                count    = count + 1,
-                {reopen_sql}
-                detail   = excluded.detail,
-                severity = excluded.severity,
-                context_json = excluded.context_json
-            """,
-            (key, now, now, str(category), sev, str(title), str(detail), str(source), ctx),
-        )
-        conn.commit()
+        with _LOCK:
+            conn = _get_conn()
+            conn.execute(
+                f"""
+                INSERT INTO faults (dedup_key, first_ts, last_ts, count, category,
+                                    severity, title, detail, source, context_json)
+                VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dedup_key) DO UPDATE SET
+                    last_ts  = excluded.last_ts,
+                    count    = count + 1,
+                    {reopen_sql}
+                    detail   = excluded.detail,
+                    severity = excluded.severity,
+                    context_json = excluded.context_json
+                """,
+                (key, now, now, str(category), sev, str(title), str(detail), str(source), ctx),
+            )
+            conn.commit()
         return True
     except Exception as e:  # אסור להפיל את לולאת המסחר בגלל לוג תקלה
         print(f"[fault_tracker] record_fault failed: {e!r}", flush=True)
@@ -181,13 +187,14 @@ def fault_counts() -> dict[str, Any]:
 
 def mark_handled(fault_id: int, handled: bool = True, resolution_note: str = "") -> bool:
     try:
-        conn = _get_conn()
-        conn.execute(
-            "UPDATE faults SET handled=?, resolved_ts=?, resolution_note=? WHERE id=?",
-            (1 if handled else 0, time.time() if handled else None,
-             str(resolution_note) if handled else None, int(fault_id)),
-        )
-        conn.commit()
+        with _LOCK:
+            conn = _get_conn()
+            conn.execute(
+                "UPDATE faults SET handled=?, resolved_ts=?, resolution_note=? WHERE id=?",
+                (1 if handled else 0, time.time() if handled else None,
+                 str(resolution_note) if handled else None, int(fault_id)),
+            )
+            conn.commit()
         return True
     except Exception as e:
         print(f"[fault_tracker] mark_handled failed: {e!r}", flush=True)
@@ -207,10 +214,11 @@ def add_manual(
 def clear_faults(only_handled: bool = True) -> int:
     """מוחק תקלות. אם only_handled — רק את אלה שטופלו. מחזיר כמה נמחקו."""
     try:
-        conn = _get_conn()
-        cur = conn.execute("DELETE FROM faults WHERE handled=1" if only_handled else "DELETE FROM faults")
-        conn.commit()
-        return int(cur.rowcount or 0)
+        with _LOCK:
+            conn = _get_conn()
+            cur = conn.execute("DELETE FROM faults WHERE handled=1" if only_handled else "DELETE FROM faults")
+            conn.commit()
+            return int(cur.rowcount or 0)
     except Exception as e:
         print(f"[fault_tracker] clear_faults failed: {e!r}", flush=True)
         return 0

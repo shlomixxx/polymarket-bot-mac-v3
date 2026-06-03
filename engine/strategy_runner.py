@@ -22,6 +22,9 @@ Mode = Literal["off", "semi", "auto"]
 
 # המתנה בין טיקים — ברירת מחדל מהירה יותר מ־0.25; ניתן לעדכן: STRATEGY_TICK_SLEEP_SEC=0.08
 _STRATEGY_TICK_SLEEP = max(0.05, min(float(os.environ.get("STRATEGY_TICK_SLEEP_SEC", "0.12")), 2.0))
+# F5: גילוי שוק שמחזיר None — רושמים תקלה רק אם זה נמשך מעבר ל-60s, ולכל היותר פעם ב-120s.
+DISCOVERY_NONE_PERSIST_SEC = 60.0
+DISCOVERY_NONE_RECORD_INTERVAL_SEC = 120.0
 
 
 def _fmt_px(x: Optional[float]) -> str:
@@ -162,6 +165,12 @@ class StrategyRuntime:
     # Cooldown per-token על TP-SELL אחרי שגיאת "insufficient_onchain_balance":
     # מונע spam של 400-errors עד ש-reconcile יתקן את פער ה-ledger/chain.
     _tp_sell_cooldown_until: dict = field(default_factory=dict)
+    # תשתית throttle לרישום תקלות (PR-A): מצמצמים שורות + כתיבות SQLite.
+    _tp_fail_fault_ts: dict = field(default_factory=dict)          # F2: per-token, 60s
+    _discovery_none_since: float = 0.0                              # F5
+    _discovery_none_last_record_ts: float = 0.0                    # F5
+    _reconcile_fail_streak: int = 0                                # F8
+    _last_reconcile_fault_ts: float = 0.0                          # F8
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -603,7 +612,44 @@ class StrategyRunner:
                 self.rt.log(
                     f"סגירה אקטיבית: עוד {len(sell_fail_msgs) - 5} סוגי שגיאות — גיבוי יפעל"
                 )
+            # F9: תקלה אחת לכל rollover (לא בלולאת הטיק) על כשל סגירה אקטיבית. רק על sell_fail_msgs,
+            # לא על no_bid (לזה יש backstop ב-expire). dedup_key קבוע.
+            try:
+                from fault_tracker import record_fault
+                record_fault(
+                    category="live_order", severity="medium",
+                    title="סגירה אקטיבית של פוזיציות מחוץ לחלון נכשלה",
+                    detail=" | ".join(sell_fail_msgs[:3])[:300],
+                    source="strategy_runner._live_close_outside_tokens",
+                    context={"fail_count": len(sell_fail_msgs)},
+                    dedup_key="live_active_close_failed",
+                )
+            except Exception:
+                pass
         return closed
+
+    def _note_reconcile_fail(self, detail: str) -> None:
+        """F8: רושם תקלה כש-reconfile לייב נכשל שוב ושוב. throttle עצמאי 120s (כי force=True
+        עוקף את שער ה-reconcile), אחרי >=3 כשלים רצופים. UPSERT זעיר, dedup_key קבוע. לא זורק."""
+        self.rt._reconcile_fail_streak += 1
+        if self.rt._reconcile_fail_streak < 3:
+            return
+        _now = time.time()
+        if (_now - float(self.rt._last_reconcile_fault_ts or 0)) < 120.0:
+            return
+        self.rt._last_reconcile_fault_ts = _now
+        try:
+            from fault_tracker import record_fault
+            record_fault(
+                category="reconcile", severity="high",
+                title="סנכרון יתרה/פוזיציות לייב נכשל שוב ושוב",
+                detail=str(detail)[:300],
+                source="strategy_runner._live_reconcile_if_enabled",
+                context={"streak": int(self.rt._reconcile_fail_streak)},
+                dedup_key="live_reconcile_failed",
+            )
+        except Exception:
+            pass
 
     async def _live_reconcile_if_enabled(
         self,
@@ -625,9 +671,12 @@ class StrategyRunner:
             portfolio = await live_clob.fetch_live_portfolio(force=True)
         except Exception as e:
             self.rt.log(f"reconcile לייב: שגיאת fetch — {e}")
+            self._note_reconcile_fail(str(e))  # F8
             return
         if not portfolio.get("ok"):
+            self._note_reconcile_fail(str(portfolio.get("error") or "portfolio not ok"))  # F8
             return
+        self.rt._reconcile_fail_streak = 0  # F8: fetch הצליח — מאפסים רצף כשלים
         ctx = dict(context or {})
         ctx.setdefault("reason", "LIVE_RECONCILE")
         tr = self.demo.reconcile_live_state(
@@ -1093,7 +1142,31 @@ class StrategyRunner:
         m = await discover_active_btc_window(self.rt.config.btc_window)
         if not m:
             self.rt.log(f"לא נמצא שוק BTC Up/Down חלון {self.rt.config.btc_window} פעיל")
+            # F5: גילוי נכשל לגמרי (גם ה-stale-cache נעלם). רושמים תקלה רק אם זה נמשך >60s,
+            # ולכל היותר פעם ב-120s — UPSERT זעיר, dedup_key קבוע (שורה אחת). לעולם לא זורק.
+            try:
+                _now = time.time()
+                if self.rt._discovery_none_since == 0.0:
+                    self.rt._discovery_none_since = _now
+                _persisted = _now - self.rt._discovery_none_since
+                if (_persisted > DISCOVERY_NONE_PERSIST_SEC
+                        and _now - self.rt._discovery_none_last_record_ts > DISCOVERY_NONE_RECORD_INTERVAL_SEC):
+                    from fault_tracker import record_fault
+                    record_fault(
+                        category="discovery", severity="high",
+                        title="אין שוק BTC Up/Down פעיל — גילוי נכשל שוב ושוב",
+                        detail=f"window={self.rt.config.btc_window} discovery=None for {int(_persisted)}s (stale cache gone too)",
+                        source="strategy_runner._tick",
+                        context={"window": self.rt.config.btc_window, "persisted_sec": int(_persisted)},
+                        dedup_key="discovery_none_persistent",
+                    )
+                    self.rt._discovery_none_last_record_ts = _now
+            except Exception:
+                pass
             return
+        # F5: גילוי הצליח — מאפסים את מד ה-None.
+        if self.rt._discovery_none_since != 0.0:
+            self.rt._discovery_none_since = 0.0
         if m.epoch != self.rt.current_epoch:
             # הגנה מפני "הבהוב" בגילוי (epoch קופץ קדימה/אחורה תחת עומס API): מבצעים
             # rollover רק כשזו התקדמות אמיתית — epoch גדול יותר וגם החלון הנוכחי
@@ -1215,6 +1288,24 @@ class StrategyRunner:
                             settlement_trades=settlement_trades,
                         )
                         self.demo.save()
+                        # F10: התראה כשמכפיל שחזור-ההפסד מטפס גבוה (כסף אמיתי מסלים). תצפית בלבד —
+                        # קורא ערכים שכבר חושבו, פעם בחלון תחת ה-rollover lock, dedup_key קבוע. לא save נוסף.
+                        try:
+                            from fault_tracker import record_fault
+                            _m_now = float(self.demo.state.loss_recovery_multiplier or 1.0)
+                            _cap = float(cfg_lr.loss_recovery_max_multiplier or 10.0)
+                            if _m_now >= max(3.0, _cap * 0.8):
+                                record_fault(
+                                    category="risk", severity="high",
+                                    title="מכפיל שחזור-הפסד גבוה",
+                                    detail=f"multiplier={_m_now:.2f}x streak={int(self.demo.state.loss_recovery_streak)} (תקרה {_cap:.1f}x)",
+                                    source="strategy_runner._tick.loss_recovery",
+                                    context={"multiplier": round(_m_now, 2),
+                                             "streak": int(self.demo.state.loss_recovery_streak), "cap": round(_cap, 2)},
+                                    dedup_key="loss_recovery_high_multiplier",
+                                )
+                        except Exception:
+                            pass
                         for line in lr_lines:
                             self.rt.log_event(line)
                     elif has_loss:
@@ -1294,6 +1385,9 @@ class StrategyRunner:
         for tok_cd in list(self.rt._tp_sell_cooldown_until.keys()):
             if tok_cd not in active_tokens_ps:
                 self.rt._tp_sell_cooldown_until.pop(tok_cd, None)
+        for tok_ff in list(self.rt._tp_fail_fault_ts.keys()):  # F2: prune fault-throttle dict
+            if tok_ff not in active_tokens_ps:
+                self.rt._tp_fail_fault_ts.pop(tok_ff, None)
         for p in list(self.demo.state.positions):
             b, _ = await fetch_best_bid_ask(p.token_id)
             if b is None:
@@ -1437,6 +1531,25 @@ class StrategyRunner:
                     )
                     if not lo.get("ok"):
                         self.rt.log(f"TP לייב: {lo.get('error', 'כשל')}")
+                        # F2: רישום תקלה על כשל יציאת TP בלייב (כסף אמיתי / phantom shares).
+                        # throttle per-token 60s; dedup_key per-error-code; UPSERT זעיר. לעולם לא זורק.
+                        try:
+                            _now_f = time.time()
+                            if _now_f - float(self.rt._tp_fail_fault_ts.get(p.token_id) or 0.0) >= 60.0:
+                                self.rt._tp_fail_fault_ts[p.token_id] = _now_f
+                                _code = str(lo.get("error_code") or "tp_exit_failed")
+                                from fault_tracker import record_fault
+                                record_fault(
+                                    category="live_order", severity="medium",
+                                    title="יציאת TP בלייב נכשלה — " + _code,
+                                    detail=str(lo.get("error"))[:300],
+                                    source="strategy_runner.tp.live",
+                                    context={"token_id": p.token_id, "side": p.side,
+                                             "contracts": float(p.contracts), "error_code": _code},
+                                    dedup_key="tp_exit_failed:" + _code,
+                                )
+                        except Exception:
+                            pass
                         if lo.get("error_code") == "insufficient_onchain_balance":
                             # יתרת שרשרת < ledger פנימי — מקור האמת היחיד הוא balance_allowance ב-CLOB,
                             # לא Data API (שמעוכב). סנכרן p.contracts ישירות לשרשרת; אם 0 — הסר פוזיציה.
@@ -2008,6 +2121,29 @@ class StrategyRunner:
                     return
                 self.rt._last_live_auto_entry_fail_msg = err
                 self.rt._last_live_auto_entry_fail_ts = t_fail
+                # F1: רישום תקלה על כשל כניסת לייב (נתיב כסף אמיתי). מצומצם ע"י ה-dedup של 45s
+                # למעלה + dedup_key מקבוצה סופית → לכל היותר ~6 שורות. UPSERT זעיר ל-faults.db.
+                try:
+                    from fault_tracker import record_fault
+                    code = str(lo.get("error_code") or "").strip()
+                    if not code:
+                        low = err.lower()
+                        if "signature" in low or "funder" in low:
+                            code = "signature_or_funder"
+                        elif "py-clob-client" in low or "חסר" in err:
+                            code = "clob_client_missing"
+                        else:
+                            code = "live_entry_failed"
+                    record_fault(
+                        category="live_order",
+                        severity="high" if code in ("insufficient_onchain_balance", "signature_or_funder") else "medium",
+                        title="כניסת לייב נכשלה — " + code,
+                        detail=err[:300], source="strategy_runner.auto_entry.live",
+                        context={"side": side, "contracts": float(n), "limit": float(lim), "error_code": code},
+                        dedup_key="live_entry_failed:" + code,
+                    )
+                except Exception:
+                    pass
                 notional_check = float(lim) * float(n)
                 lr_note = (
                     f"בסיס ${float(cfg.investment_usd):.2f} · מכפיל שחזור {lr_mult_snapshot:.2f}× "

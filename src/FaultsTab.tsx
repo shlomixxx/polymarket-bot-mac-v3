@@ -3,6 +3,10 @@ import { api, isPageHidden } from "./api";
 
 /** לשונית "תקלות ובאגים" — מעקב אחרי כשלים במערכת: חומרה, ספירה, טופל/לא, שיתוף. */
 
+// manual-F1: timeout נדיב ל-/api/faults (ברירת המחדל 15s צרה מדי כשהמנוע עסוק — הסיבה שתקלה
+// ידנית "לא נשמרה": ה-POST הצליח בשרת אבל הדפדפן הפיל אותו ב-15s). מיושר ל-45s כמו endpoints כבדים.
+const FAULTS_TIMEOUT_MS = 45_000;
+
 type Severity = "critical" | "high" | "medium" | "low";
 
 type Fault = {
@@ -78,6 +82,7 @@ export default function FaultsTab() {
   const [mTitle, setMTitle] = useState("");
   const [mDetail, setMDetail] = useState("");
   const [mSev, setMSev] = useState<Severity>("medium");
+  const [submitting, setSubmitting] = useState(false);  // manual-F1: double-submit guard
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -87,7 +92,7 @@ export default function FaultsTab() {
       if (filterHandled === "open") qs.set("handled", "false");
       if (filterHandled === "handled") qs.set("handled", "true");
       if (filterSev !== "all") qs.set("severity", filterSev);
-      const res = await api<FaultsResponse>(`/api/faults?${qs.toString()}`);
+      const res = await api<FaultsResponse>(`/api/faults?${qs.toString()}`, { timeoutMs: FAULTS_TIMEOUT_MS });
       setData(res);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -128,10 +133,12 @@ export default function FaultsTab() {
       if (handled) {
         note = window.prompt("הערת טיפול (אופציונלי):", note) ?? note;
       }
-      await api(`/api/faults/${f.id}/handled`, {
+      const res = await api<{ ok?: boolean }>(`/api/faults/${f.id}/handled`, {
         method: "POST",
         body: JSON.stringify({ handled, resolution_note: note }),
+        timeoutMs: FAULTS_TIMEOUT_MS,
       });
+      if (!res?.ok) { alert("פעולה נכשלה (השרת לא עדכן)"); return; }  // manual-F2
       await refresh();
     } catch (e) {
       alert("פעולה נכשלה: " + (e instanceof Error ? e.message : String(e)));
@@ -141,23 +148,28 @@ export default function FaultsTab() {
   };
 
   const addManual = async () => {
-    if (!mTitle.trim()) return;
+    if (!mTitle.trim() || submitting) return;  // manual-F1: ignore double-submit
+    setSubmitting(true);
     try {
-      await api("/api/faults", {
+      const res = await api<{ ok?: boolean }>("/api/faults", {
         method: "POST",
         body: JSON.stringify({ title: mTitle.trim(), detail: mDetail.trim(), severity: mSev, category: "manual" }),
+        timeoutMs: FAULTS_TIMEOUT_MS,
       });
+      if (!res?.ok) { alert("הוספה נכשלה (השרת לא שמר את התקלה)"); return; }  // manual-F2: no silent success
       setMTitle(""); setMDetail(""); setMSev("medium"); setShowAdd(false);
       await refresh();
     } catch (e) {
       alert("הוספה נכשלה: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setSubmitting(false);
     }
   };
 
   const clearHandled = async () => {
     if (!window.confirm("למחוק את כל התקלות שטופלו?")) return;
     try {
-      await api(`/api/faults?only_handled=true`, { method: "DELETE" });
+      await api(`/api/faults?only_handled=true`, { method: "DELETE", timeoutMs: FAULTS_TIMEOUT_MS });
       await refresh();
     } catch (e) {
       alert("מחיקה נכשלה: " + (e instanceof Error ? e.message : String(e)));

@@ -421,6 +421,45 @@ _snapshot_task: Optional[asyncio.Task] = None
 _history_recorder_task: Optional[asyncio.Task] = None
 _ws_subscription_task: Optional[asyncio.Task] = None
 _discovery_warmer_task: Optional[asyncio.Task] = None
+_watchdog_task: Optional[asyncio.Task] = None
+
+
+async def _loop_watchdog(interval_sec: float = 15.0) -> None:
+    """F6: שומר-סף observe-only — מזהה פיגור ב-event loop ותקיעת לולאת האסטרטגיה ורושם תקלה.
+    זהו בדיוק סוג ה-outage שקרה (event loop חנוק). קל ולא חוסם: sleep + השוואות + UPSERT זעיר
+    ל-faults.db. לעולם לא מפעיל מחדש את הלולאה / לא כופה tick (סיכון re-entry ל-settlement)."""
+    LAG_THRESHOLD = 5.0
+    STALE_THRESHOLD = 30.0
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(interval_sec)
+        try:
+            from fault_tracker import record_fault
+            lag = time.monotonic() - t0 - interval_sec
+            if lag > LAG_THRESHOLD:
+                record_fault(
+                    category="watchdog", severity="critical",
+                    title="פיגור event-loop — הלולאה נחנקת",
+                    detail=f"expected {interval_sec:.0f}s sleep, lag={lag:.1f}s",
+                    source="main._loop_watchdog", context={"lag_sec": round(lag, 2)},
+                    dedup_key="event_loop_lag",
+                )
+            mode = runner.rt.mode
+            last = float(runner.rt.last_tick_ts or 0)
+            # שומר מפני false-positive: לא בודקים תקיעות כשהמנוע כבוי או שעוד לא היה tick ראשון.
+            if mode != "off" and last > 0:
+                age = time.time() - last
+                if age > STALE_THRESHOLD:
+                    record_fault(
+                        category="watchdog", severity="high",
+                        title="לולאת האסטרטגיה תקועה — אין tick",
+                        detail=f"last_tick age={age:.0f}s mode={mode}",
+                        source="main._loop_watchdog",
+                        context={"age_sec": round(age, 1), "mode": mode},
+                        dedup_key="strategy_tick_stalled",
+                    )
+        except Exception:
+            pass  # watchdog must never crash; observe-only
 
 
 async def _supervise(name: str, coro_factory, restart_delay: float = 3.0) -> None:
@@ -442,6 +481,16 @@ async def _supervise(name: str, coro_factory, restart_delay: float = 3.0) -> Non
             )
             try:
                 append_event("background_task_crash", {"name": name, "error": str(e)[:200]})
+            except Exception:
+                pass
+            try:
+                import fault_tracker  # local import — matches existing call-site pattern
+                fault_tracker.record_fault(
+                    category="loop_crash", severity="high",
+                    title=f"לולאת רקע קרסה: {name}",
+                    detail=str(e)[:300], source=f"main._supervise:{name}",
+                    context={"name": name}, dedup_key=f"loop_crash:{name}",
+                )
             except Exception:
                 pass
             try:
@@ -546,6 +595,32 @@ def _history_get_conn_safe() -> Optional[Any]:
         return None
 
 
+# F4: מעקב כשלי משיכת מחיר מ-Binance (spot/klines) בלולאת ההיסטוריה — רושם תקלה כשנכשל שוב ושוב.
+_binance_miss_streak = 0
+_binance_fault_last_ts = 0.0
+
+
+def _note_binance_miss(prev_epoch: int, prev_window_sec: int) -> None:
+    global _binance_miss_streak, _binance_fault_last_ts
+    _binance_miss_streak += 1
+    now = time.time()
+    if _binance_miss_streak >= 3 and (now - _binance_fault_last_ts) >= 60.0:
+        _binance_fault_last_ts = now
+        try:
+            from fault_tracker import record_fault
+            record_fault(
+                category="data_fetch", severity="medium",
+                title="מחיר BTC/קליין לא זמין שוב ושוב (Binance)",
+                detail=f"epoch={prev_epoch} consecutive_misses={_binance_miss_streak}",
+                source="main.auto_history_recorder_loop",
+                context={"epoch": prev_epoch, "window_sec": prev_window_sec,
+                         "consecutive_misses": _binance_miss_streak},
+                dedup_key="binance_klines_repeated_unavailable",
+            )
+        except Exception:
+            pass
+
+
 async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
     """
     רץ ברקע — מזהה מתי חלון נסגר ומתעד אוטומטית מי ניצח.
@@ -557,7 +632,7 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
     4. מחשב מי ניצח (Up אם close > open, אחרת Down).
     5. שומר ב-history_tracker.
     """
-    global _last_recorded_epoch
+    global _last_recorded_epoch, _binance_miss_streak
     prev_epoch: int = 0
     prev_slug: str = ""
     prev_window_sec: int = 300
@@ -605,6 +680,7 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
                             btc_close=btc_close,
                         )
                         _last_recorded_epoch = prev_epoch
+                        _binance_miss_streak = 0  # F4: הצלחה — מאפסים את רצף הכשלים
                         print(
                             f"[history] חלון {prev_slug} נרשם: {side_won} "
                             f"(open={btc_open:.2f}, close={btc_close:.2f}, source=kline_1m_close)",
@@ -613,6 +689,7 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
                     else:
                         # kline עדיין לא זמין (lag של Binance) — לא רושמים, נסיון חוזר בסיבוב הבא.
                         # _last_recorded_epoch לא מתעדכן, prev_epoch נשאר אותו דבר.
+                        _note_binance_miss(prev_epoch, prev_window_sec)  # F4
                         print(
                             f"[history] חלון {prev_slug}: kline לא זמין עדיין — retry בסיבוב הבא ({interval_sec}s)",
                             flush=True,
@@ -622,6 +699,10 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
                         continue
                 except Exception as exc:
                     print(f"[history] שגיאה בתיעוד חלון {prev_slug}: {exc}", flush=True)
+                    try:
+                        _note_binance_miss(prev_epoch, prev_window_sec)  # F4: גם כשל שמרים חריגה
+                    except Exception:
+                        pass
 
             prev_epoch = current_epoch
             prev_slug = current_slug
@@ -641,6 +722,7 @@ ORDERBOOK_SUMMARY_CACHE_TTL_SEC = float(
 )
 last_orderbook_summary: Optional[dict[str, Any]] = None
 last_orderbook_summary_ts: float = 0.0
+_last_clob_degraded_fault_ts: float = 0.0  # F3: throttle for CLOB-degraded fault recording
 # Lock למניעת race condition: מונע שני threads מלעדכן את ה-cache בו-זמנית
 _orderbook_summary_lock: Optional[asyncio.Lock] = None
 _shared_httpx: Optional[httpx.AsyncClient] = None
@@ -710,7 +792,7 @@ def _count_strategy_run_dirs() -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _snapshot_task, _history_recorder_task, _ws_subscription_task, _discovery_warmer_task
+    global _snapshot_task, _history_recorder_task, _ws_subscription_task, _discovery_warmer_task, _watchdog_task
     _ensure_log_run_dir()
     n_snap = _count_strategy_run_dirs()
     print(
@@ -739,6 +821,8 @@ async def lifespan(app: FastAPI):
     )
     runner.start_loop()
     trigger.start_loop()
+    # F6: שומר-סף שמזהה תקיעת לולאה / פיגור event-loop (סוג ה-outage שקרה) ורושם תקלה.
+    _watchdog_task = asyncio.create_task(_supervise("loop_watchdog", lambda: _loop_watchdog(15.0)))
     _history_recorder_task = asyncio.create_task(
         _supervise("auto_history_recorder_loop", lambda: auto_history_recorder_loop(10.0))
     )
@@ -779,6 +863,13 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         _discovery_warmer_task = None
+    if _watchdog_task:
+        _watchdog_task.cancel()
+        try:
+            await _watchdog_task
+        except asyncio.CancelledError:
+            pass
+        _watchdog_task = None
     price_stream.stop()
     trigger.stop_loop()
     runner.stop_loop()
@@ -1022,7 +1113,7 @@ def _best_book_prices(book: Optional[dict[str, Any]]) -> dict[str, Any]:
 @app.get("/api/market/orderbook-summary")
 async def market_orderbook_summary():
     """סיכום מחירי חוזה (bid/ask/mid) לצד Up ו-Down לשוק BTC Up/Down הפעיל (לפי הגדרת btc_window)."""
-    global last_orderbook_summary, last_orderbook_summary_ts
+    global last_orderbook_summary, last_orderbook_summary_ts, _last_clob_degraded_fault_ts
     try:
         m = await asyncio.wait_for(
             discover_active_btc_window(runner.rt.config.btc_window), timeout=10.0
@@ -1106,6 +1197,23 @@ async def market_orderbook_summary():
         if degraded_reason:
             result["degraded"] = True
             result["degraded_reason"] = degraded_reason
+            # F3: תקלה מצומצמת (לכל היותר פעם ב-120s) כש-CLOB מוגבל/איטי. ts מתעדכן ראשון
+            # (בתוך ה-lock, בלי await) כדי שכשל ב-record_fault לא יעקוף את ה-throttle ויגרום סופת כתיבות.
+            if degraded_reason in ("clob_rate_limited", "clob_timeout") and (now - _last_clob_degraded_fault_ts) > 120.0:
+                _last_clob_degraded_fault_ts = now
+                try:
+                    from fault_tracker import record_fault
+                    record_fault(
+                        category=("rate_limit" if degraded_reason == "clob_rate_limited" else "data_fetch"),
+                        severity="medium",
+                        title="CLOB מוגבל/איטי — " + degraded_reason,
+                        detail="orderbook summary degraded, serving stale snapshot",
+                        source="main.market_orderbook_summary",
+                        context={"slug": m.slug, "reason": degraded_reason},
+                        dedup_key=f"clob_degraded:{degraded_reason}",
+                    )
+                except Exception:
+                    pass
             # Rate-limit/שגיאת CLOB: נחזיר snapshot קודם אם יש כדי לא לשבור UI
             if last_orderbook_summary and last_orderbook_summary.get("slug") == m.slug:
                 fallback = dict(last_orderbook_summary)
