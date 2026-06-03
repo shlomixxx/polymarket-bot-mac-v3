@@ -1053,6 +1053,36 @@ class StrategyRunner:
             self.rt.log(f"לא נמצא שוק BTC Up/Down חלון {self.rt.config.btc_window} פעיל")
             return
         if m.epoch != self.rt.current_epoch:
+            # הגנה מפני "הבהוב" בגילוי (epoch קופץ קדימה/אחורה תחת עומס API): מבצעים
+            # rollover רק כשזו התקדמות אמיתית — epoch גדול יותר וגם החלון הנוכחי
+            # הסתיים בפועל לפי שעון. אחרת מתעלמים מה-epoch שהתגלה (לא מתחשבנים, לא
+            # מאפסים מצב-חלון, לא נכנסים מחדש) — מונע ריבוי כניסות/הפסדים באותו חלון.
+            try:
+                from market_discovery import window_step_sec as _wss
+                _ws_cur = int(_wss(self.rt.config.btc_window))
+            except Exception:
+                _ws_cur = 300
+            _cur = int(self.rt.current_epoch or 0)
+            if _cur != 0 and (m.epoch < _cur or time.time() < (_cur + _ws_cur)):
+                self.rt.status(
+                    f"גילוי לא יציב: התקבל חלון {m.epoch} בעוד החלון הנוכחי {_cur} עדיין פעיל — "
+                    f"מתעלמים (מונע התחשבנות/כניסה מוקדמת באותו חלון)",
+                    key="discovery_flap_ignored",
+                    repeat_interval_sec=20.0,
+                )
+                try:
+                    from fault_tracker import record_fault
+                    record_fault(
+                        category="discovery", severity="medium",
+                        title="גילוי חלון לא יציב (flap) — חלון התעלם",
+                        detail=f"discovered epoch={m.epoch} while current={_cur} still active",
+                        source="strategy_runner._tick.rollover",
+                        context={"discovered": m.epoch, "current": _cur},
+                        dedup_key="discovery_flap",
+                    )
+                except Exception:
+                    pass
+                return
             # FIX #24 (v2): lock + sentinel pattern.
             # ה-v1 הראשון רק עטף את ה-double-check וזה לא הספיק — בין שחרור ה-lock
             # לבין עדכון current_epoch ב-end של ה-rollover (שורה ~1087), קריאה

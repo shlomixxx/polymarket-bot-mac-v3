@@ -418,10 +418,19 @@ class DemoEngine:
             settled_ws_raw = ctx.get("window_sec")
         default_ws = int(settled_ws_raw) if settled_ws_raw is not None else 300
 
+        now_ts = time.time()
         keep: list[Position] = []
         to_settle: list[Position] = []
         for p in list(self.state.positions):
             if p.token_id in valid_tokens:
+                keep.append(p)
+            elif (
+                p.window_epoch is not None
+                and now_ts < (int(p.window_epoch) + int(p.window_sec or default_ws))
+            ):
+                # הגנה מפני "הבהוב" בגילוי: הטוקן אמנם לא בחלון שהתגלה כרגע, אבל
+                # החלון של הפוזיציה עדיין לא הסתיים בפועל (לפי שעון). מחזיקים עד
+                # סוף החלון — לא מתחשבנים מוקדם. זה מונע ריבוי הפסדים באותו חלון.
                 keep.append(p)
             else:
                 to_settle.append(p)

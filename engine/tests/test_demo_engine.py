@@ -57,6 +57,38 @@ async def test_expire_all_outside_tokens_creates_expire_trade_and_removes_positi
 
 
 @pytest.mark.asyncio
+async def test_expire_keeps_position_whose_window_not_ended(tmp_path: Path):
+    """הגנת flap: פוזיציה שהחלון שלה עדיין פעיל (לפי שעון) לא מותחשבנת מוקדם,
+    גם אם הטוקן שלה אינו בחלון שהתגלה כרגע. פוזיציה שחלונה הסתיים — כן מותחשבנת.
+    זה מונע את ריבוי ההפסדים באותו חלון."""
+    eng = DemoEngine(state_path=tmp_path / "s.json")
+    eng.state = DemoState(balance_usd=1000.0)
+    now = time.time()
+    active_ep = int(now // 300 * 300)  # תחילת החלון הנוכחי — נגמר ב-active_ep+300 (עתיד)
+    eng.state.positions = [
+        Position(side="Down", contracts=10.0, avg_cost=0.4, token_id="active_tok",
+                 window_epoch=active_ep, window_sec=300),
+        Position(side="Up", contracts=5.0, avg_cost=0.5, token_id="old_tok",
+                 window_epoch=active_ep - 600, window_sec=300),  # חלון שהסתיים
+    ]
+
+    async def _px(_ep: int, _ws: int):
+        return {"start": 100.0, "end": 99.0, "source": "test"}
+
+    with patch("btc_price.fetch_window_start_end_btc_usd", AsyncMock(side_effect=_px)):
+        created = await eng.expire_all_outside_tokens(
+            ("other_up", "other_down"),
+            context={"settled_epoch": active_ep, "settled_window_sec": 300},
+        )
+
+    remaining = [p.token_id for p in eng.state.positions]
+    assert "active_tok" in remaining, "פוזיציה בחלון פעיל לא אמורה להתחשבן מוקדם"
+    assert "old_tok" not in remaining, "פוזיציה שחלונה הסתיים אמורה להתחשבן"
+    assert any(t["token_id"] == "old_tok" for t in created)
+    assert not any(t.get("token_id") == "active_tok" for t in created)
+
+
+@pytest.mark.asyncio
 async def test_expire_marks_reconcile_origin_when_no_session_id(tmp_path: Path):
     """פוזיציה שנכנסה דרך reconcile (חסרה ב-_session_by_token) חייבת להיות מסומנת
     reconcile_origin=True ב-SETTLE — כדי שה-UI לא יציג אותה כ«עסקה» ריקה של הריצה."""
