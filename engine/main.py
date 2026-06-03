@@ -1233,7 +1233,7 @@ async def market_orderbook_summary():
 
 
 @app.get("/api/demo/state")
-async def demo_state():
+async def demo_state(request: Request):
     # נסמן equity תמיד — כך last_mark.unrealized_usd מתאפס מיד כשאין פוזיציות
     await demo.mark_to_market()
     _ensure_bot_run_session_if_active()
@@ -1243,7 +1243,10 @@ async def demo_state():
     out["bot_run_started_ts"] = _bot_run_started_ts
     out["bot_run_equity_baseline_usd"] = _bot_run_equity_baseline_usd
     out.update(_bot_run_win_rate_stats())
-    return out
+    # PR-E: סריאליזציה דרך json.dumps ישיר (etag_json_response) במקום jsonable_encoder של FastAPI.
+    # ה-state כבר JSON-safe (נשמר לדיסק עם json.dumps), ו-jsonable_encoder על ~50k עסקאות עלה ~3s
+    # TTFB וחנק את ה-event-loop בכל poll. ה-helper מהיר פי ~5.6 ומוסיף ETag (304 כשהמצב לא השתנה).
+    return etag_json_response(out, request.headers.get("if-none-match"))
 
 
 @app.get("/api/demo/snapshot")

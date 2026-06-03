@@ -143,6 +143,20 @@ def test_faults_endpoints_roundtrip(client: TestClient, tmp_path, monkeypatch):
     assert r.json()["removed"] == 1
 
 
+def test_demo_state_uses_fast_serializer(client: TestClient):
+    """PR-E: /api/demo/state חייב להחזיר דרך etag_json_response (json.dumps ישיר, לא
+    jsonable_encoder האיטי שחנק את ה-event-loop ~3s על 50k עסקאות). הסימן: כותרת ETag קיימת,
+    והתוכן זהה (מפתחות הליבה + שדות ה-win-rate שמתווספים ב-handler)."""
+    r = client.get("/api/demo/state")
+    assert r.status_code == 200
+    assert r.headers.get("etag"), "expected ETag header (proves the fast json.dumps path, not jsonable_encoder)"
+    j = r.json()
+    for k in ("balance_usd", "trades", "equity_history", "positions",
+              "bot_run_win_rate_pct", "ui_runtime_equity_baseline_usd"):
+        assert k in j, f"missing key {k} after serializer swap"
+    assert isinstance(j["trades"], list)
+
+
 def test_demo_reset_and_clear_stats(client: TestClient):
     import main as engine_main
 
