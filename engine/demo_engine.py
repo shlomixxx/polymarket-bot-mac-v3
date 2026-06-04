@@ -221,6 +221,36 @@ def _smart_trim_path(path: list, max_len: int, peak_ts: Optional[float], trough_
                     must_keep.add(candidates[idx])
     return [path[i] for i in sorted(must_keep)]
 
+
+def _settled_pnl_path_max() -> int:
+    """PR-G: כמה נקודות pnl_path שומרים על עסקה שנסגרה (היסטורית). ברירת מחדל 50 —
+    מספיק לגרף חלק בכרטיס המקופל, וקטן פי ~12 מ-~600 הנקודות הגולמיות שכל חלון ייצר."""
+    default = 50
+    raw = os.environ.get("SETTLED_PNL_PATH_MAX")
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return max(8, min(int(str(raw).strip(), 10), 1000))
+    except ValueError:
+        return default
+
+
+SETTLED_PNL_PATH_MAX = _settled_pnl_path_max()
+
+
+def _trim_settled_path(tr: dict) -> list:
+    """מקצץ את pnl_path של עסקה שנסגרת ל-SETTLED_PNL_PATH_MAX נקודות (משמר כניסה/peak/
+    trough/אחרונות, ראה _smart_trim_path). זה השורש לכל נפיחות ה-state: כל פירוק שמר את
+    כל ~600 דגימות החלון × ~150B ⇒ state 26MB ⇒ json.dumps ~2s שחנק את ה-event-loop
+    (תקלת event_loop_lag). הגרף ההיסטורי בכרטיס נשאר חלק כי נשמרים entry/peak/trough/last."""
+    return _smart_trim_path(
+        list(tr.get("path") or []),
+        SETTLED_PNL_PATH_MAX,
+        tr.get("high_watermark_ts"),
+        tr.get("low_watermark_ts"),
+    )
+
+
 # תנודתיות גבוהה בין טיקי mark_to_market מלאים → חלון דגימה אגרסיבית (יותר קריאות CLOB + צפוף path)
 VOLATILE_TICK_DELTA_PCT = 4.0
 VOLATILE_WINDOW_SEC = 14.0
@@ -254,6 +284,23 @@ class DemoEngine:
         self._last_persist_ts = 0.0
         self._last_backfill_ts = 0.0
         self._backfill_session_ids()
+        self._compact_oversized_pnl_paths()
+
+    def _compact_oversized_pnl_paths(self) -> None:
+        """PR-G: דחיסה חד-פעמית של ה-backlog — עסקאות שנסגרו עם pnl_path ענק (מלפני התיקון)
+        מקצצות ל-SETTLED_PNL_PATH_MAX. בלי זה ה-state נשאר 26MB לנצח (עסקה שנסגרה לא נכתבת
+        מחדש). רץ פעם אחת בטעינה; ה-persist הבא כותב state קטן ⇒ event_loop_lag נעלם."""
+        changed = 0
+        for t in self.state.trades:
+            p = t.get("pnl_path")
+            if isinstance(p, list) and len(p) > SETTLED_PNL_PATH_MAX:
+                t["pnl_path"] = _smart_trim_path(
+                    p, SETTLED_PNL_PATH_MAX, t.get("peak_ts"), t.get("trough_ts")
+                )
+                changed += 1
+        if changed:
+            self._dirty = True
+            print(f"[demo] compacted pnl_path on {changed} settled trades (state slimmed)", flush=True)
 
     def _load(self) -> DemoState:
         if self.state_path.exists():
@@ -333,7 +380,9 @@ class DemoEngine:
         return float(self.state.balance_usd) + value
 
     def save(self) -> None:
-        atomic_write_json(self.state_path, self.state.to_dict(), indent=2)
+        # PR-G: indent=None (compact) — קובץ ה-state נקרא ע"י מכונה (json.loads), אז indent=2
+        # רק הכפיל את הגודל (~26MB→48MB) ואת זמן ה-json.dumps שמחזיק את ה-GIL.
+        atomic_write_json(self.state_path, self.state.to_dict(), indent=None)
 
     def reset(self, balance: float = 10_000.0) -> None:
         """איפוס חשבון: יתרה חדשה, בלי פוזיציות, בלי סימוני מחיר — עסקאות ישנות נשמרות לדיסק (ניתוח v3)."""
@@ -495,7 +544,7 @@ class DemoEngine:
                 trade["trough_unrealized_pct"] = tr.get("low_watermark_pct")
                 trade["trough_ts"] = tr.get("low_watermark_ts")
                 trade["trough_mark_bid"] = tr.get("low_mark_bid")
-                trade["pnl_path"] = tr.get("path", [])
+                trade["pnl_path"] = _trim_settled_path(tr)
 
             trade.update(ctx)
             if ep is not None:
@@ -1150,7 +1199,7 @@ class DemoEngine:
                 trade["trough_unrealized_pct"] = tr.get("low_watermark_pct")
                 trade["trough_ts"] = tr.get("low_watermark_ts")
                 trade["trough_mark_bid"] = tr.get("low_mark_bid")
-                trade["pnl_path"] = tr.get("path", [])
+                trade["pnl_path"] = _trim_settled_path(tr)
             self.state.positions.pop(idx)
         else:
             p.contracts = remainder
@@ -1165,7 +1214,7 @@ class DemoEngine:
                 trade["trough_unrealized_pct"] = tr.get("low_watermark_pct")
                 trade["trough_ts"] = tr.get("low_watermark_ts")
                 trade["trough_mark_bid"] = tr.get("low_mark_bid")
-                trade["pnl_path"] = tr.get("path", [])
+                trade["pnl_path"] = _trim_settled_path(tr)
         if context:
             trade.update(context)
         await self._attach_window_btc_to_tp_trade(trade, side=p.side)
@@ -1248,7 +1297,7 @@ class DemoEngine:
             trade["trough_unrealized_pct"] = tr.get("low_watermark_pct")
             trade["trough_ts"] = tr.get("low_watermark_ts")
             trade["trough_mark_bid"] = tr.get("low_mark_bid")
-            trade["pnl_path"] = tr.get("path", [])
+            trade["pnl_path"] = _trim_settled_path(tr)
         if context:
             trade.update(context)
         await self._attach_window_btc_to_tp_trade(trade, side=p.side)
@@ -1292,7 +1341,7 @@ class DemoEngine:
 
         async def _run() -> None:
             try:
-                await asyncio.to_thread(atomic_write_json, self.state_path, snapshot, indent=2)
+                await asyncio.to_thread(atomic_write_json, self.state_path, snapshot, indent=None)
                 self._last_persist_ts = time.time()
             except Exception:
                 self._dirty = True  # כשל — ננסה שוב בבקשה הבאה הזכאית
