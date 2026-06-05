@@ -312,3 +312,19 @@ def test_live_portfolio_without_key(client: TestClient):
     j = r.json()
     assert j.get("ok") is False
 
+
+# ────────────────── Trade Audit Ledger endpoints ──────────────────
+
+
+def test_audit_list_and_export_endpoints(client: TestClient):
+    """GET /api/audit -> rows+counts; GET /api/audit/export?labels_only -> rows."""
+    r = client.get("/api/audit")
+    assert r.status_code == 200
+    j = r.json()
+    assert isinstance(j.get("rows"), list)
+    assert "counts" in j
+
+    r = client.get("/api/audit/export", params={"labels_only": "true"})
+    assert r.status_code == 200
+    assert isinstance(r.json().get("rows"), list)
+
