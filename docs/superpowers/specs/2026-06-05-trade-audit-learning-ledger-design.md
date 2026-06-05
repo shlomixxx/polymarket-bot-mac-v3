@@ -243,6 +243,8 @@ Built at the entry tick in `strategy_runner` and passed via the existing `contex
 
 Historical closed sessions in `demo_state.trades` already carry **outcome + peak/trough + settlement BTC + pnl_path** → backfill audit rows with the **settlement-time + derived + counterfactual** layers and `schema_version = 0` (pre-signal-capture era). **Entry decision signals were never captured historically, so Layer B (`signal`/`ta`/`clob`/`sentiment`) will be null/partial in backfilled rows.** New trades (schema_version ≥ 1) get the full picture. Stating this honestly: the ledger does **not** retroactively know *why* old trades were entered; it knows *what happened* to them. `schema_version` makes the two eras cleanly separable so the future AI never conflates them.
 
+**Backfill runs automatically and idempotently** (decision: zero-config / no manual step). On engine startup a background task checks an `audit_meta(backfilled_through_ts)` marker row in `audit.db`; if behind, it projects any not-yet-backfilled closed sessions and advances the marker. It runs off the hot boot path (never blocks startup), is safe to re-run on every Railway restart (the marker makes it a no-op once caught up), and writes to `fault_tracker` on failure rather than crashing.
+
 ---
 
 ## 9. API
@@ -285,8 +287,8 @@ Visual layout follows the existing dashboard pattern (no new design language).
 
 - **Engine-change blast radius.** Wiring `decision_snapshot` into `strategy_runner` touches the hot entry path. Mitigation: snapshot assembly must be cheap (reuse cached `compute_signals`), wrapped so a snapshot failure **never** blocks a trade (audit is best-effort; log to `fault_tracker` on failure).
 - **Double source of truth for settlement status.** If the engine already special-cases `SETTLE_UNKNOWN` post-incident, reconcile to the shared enum rather than adding a parallel notion. *(Verify in implementation.)*
-- **`audit.db` growth.** Bounded like `faults.db`; add retention/rotation if needed. `pnl_path` is referenced for the drill-down — decide whether to store a trimmed copy on the row or join from existing storage (lean toward join/trim to avoid duplication).
-- **Open question for the user:** should backfill run automatically on first deploy, or be a manual one-off script? (Default: manual script, to keep deploy side-effect-free.)
+- **`audit.db` growth.** Bounded like `faults.db`; add retention/rotation if needed. `pnl_path` is referenced for the drill-down — store a trimmed copy on the row (decision: avoid a cross-store join in the hot read path; reuse the existing `SETTLED_PNL_PATH_MAX` trim).
+- **Backfill is automatic & idempotent** (resolved — see §8). No manual step; safe across restarts via the `audit_meta` marker.
 
 ---
 
