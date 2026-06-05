@@ -12,12 +12,16 @@ def test_settlement_status_win_loss_void_unknown_pending():
     assert ad.settlement_status({"type": "BUY"}) == "PENDING"
 
 
-def test_exit_efficiency_guards_nonpositive_peak():
+def test_exit_efficiency_bounded_and_guards():
     assert ad.exit_efficiency(realized_pct=40.0, peak_pct=80.0) == 0.5
-    assert ad.exit_efficiency(realized_pct=10.0, peak_pct=0.0) is None
-    assert ad.exit_efficiency(realized_pct=10.0, peak_pct=-5.0) is None
-    # losses have no meaningful exit-efficiency (would otherwise be a wild negative)
+    # held-to-settlement win exceeding the intraday peak caps at 1.0 (not >1)
+    assert ad.exit_efficiency(realized_pct=99.0, peak_pct=40.0) == 1.0
+    # positive realized with no recorded intraday peak = captured everything -> 1.0
+    assert ad.exit_efficiency(realized_pct=10.0, peak_pct=0.0) == 1.0
+    # losses have no meaningful exit-efficiency
     assert ad.exit_efficiency(realized_pct=-100.0, peak_pct=5.0) is None
+    # no upside at all -> None
+    assert ad.exit_efficiency(realized_pct=0.0, peak_pct=0.0) is None
 
 
 def test_cf_other_side_pnl_binary():

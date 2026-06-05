@@ -32,16 +32,20 @@ def settlement_status(outcome: dict[str, Any]) -> str:
 
 
 def exit_efficiency(*, realized_pct: Optional[float], peak_pct: Optional[float]) -> Optional[float]:
-    """Fraction of the favorable excursion captured at exit: realized_pct / peak_pct.
+    """Fraction of the achievable favorable move captured at exit, bounded to [0, 1].
 
-    Only meaningful for a non-losing exit: None when peak<=0 (no favorable excursion) or
-    realized_pct<0 (a loss — "efficiency of capturing the peak" is undefined and would
-    otherwise produce wild negatives that pollute the average).
+    Denominator is max(peak_pct, realized_pct): a held-to-settlement win whose realized %
+    exceeds the intraday bid-peak reads as ~1.0 (optimal capture) instead of >1, so the
+    average stays interpretable. None for losses (realized_pct<0) or when there was no
+    upside at all (max ≤ 0).
     """
     try:
-        if realized_pct is None or peak_pct is None or float(peak_pct) <= 0 or float(realized_pct) < 0:
+        if realized_pct is None or peak_pct is None or float(realized_pct) < 0:
             return None
-        return round(float(realized_pct) / float(peak_pct), 4)
+        denom = max(float(peak_pct), float(realized_pct))
+        if denom <= 0:
+            return None
+        return round(float(realized_pct) / denom, 4)
     except (TypeError, ValueError, ZeroDivisionError):
         return None
 
