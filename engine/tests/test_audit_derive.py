@@ -16,6 +16,8 @@ def test_exit_efficiency_guards_nonpositive_peak():
     assert ad.exit_efficiency(realized_pct=40.0, peak_pct=80.0) == 0.5
     assert ad.exit_efficiency(realized_pct=10.0, peak_pct=0.0) is None
     assert ad.exit_efficiency(realized_pct=10.0, peak_pct=-5.0) is None
+    # losses have no meaningful exit-efficiency (would otherwise be a wild negative)
+    assert ad.exit_efficiency(realized_pct=-100.0, peak_pct=5.0) is None
 
 
 def test_cf_other_side_pnl_binary():

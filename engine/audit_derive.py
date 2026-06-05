@@ -32,9 +32,14 @@ def settlement_status(outcome: dict[str, Any]) -> str:
 
 
 def exit_efficiency(*, realized_pct: Optional[float], peak_pct: Optional[float]) -> Optional[float]:
-    """realized_pct / peak_pct. None when there was no favorable excursion (peak<=0)."""
+    """Fraction of the favorable excursion captured at exit: realized_pct / peak_pct.
+
+    Only meaningful for a non-losing exit: None when peak<=0 (no favorable excursion) or
+    realized_pct<0 (a loss — "efficiency of capturing the peak" is undefined and would
+    otherwise produce wild negatives that pollute the average).
+    """
     try:
-        if realized_pct is None or peak_pct is None or float(peak_pct) <= 0:
+        if realized_pct is None or peak_pct is None or float(peak_pct) <= 0 or float(realized_pct) < 0:
             return None
         return round(float(realized_pct) / float(peak_pct), 4)
     except (TypeError, ValueError, ZeroDivisionError):
