@@ -14,3 +14,6 @@ tips_v2_cache.json
 # SQLite journal files (transient; נוצרים בזמן ריצה ולא לקומיט)
 *.db-shm
 *.db-wal
+
+# מסד הביקורת (audit.db) — runtime store, נוצר ע"י audit_tracker/בדיקות; לא לקומיט
+engine/audit.db
