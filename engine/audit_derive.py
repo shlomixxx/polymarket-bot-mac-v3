@@ -14,10 +14,12 @@ LABEL_OK = ("WIN", "LOSS")
 def settlement_status(outcome: dict[str, Any]) -> str:
     """Map a closing trade/outcome to the canonical enum, separate from numeric PnL."""
     typ = str(outcome.get("type") or "")
-    if outcome.get("voided"):
-        return "VOID"
+    # Order matters: a real SETTLE_UNKNOWN also carries voided=True in the engine, but it is an
+    # UNKNOWN (couldn't determine the outcome), not a deliberate VOID/refund — classify it first.
     if typ == "SETTLE_UNKNOWN" or outcome.get("settlement_error"):
         return "UNKNOWN"
+    if outcome.get("voided"):
+        return "VOID"
     if typ in ("BUY", "") and outcome.get("realized_pnl") is None:
         return "PENDING"
     rp = outcome.get("realized_pnl")

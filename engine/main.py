@@ -810,7 +810,8 @@ async def lifespan(app: FastAPI):
     # Audit ledger: backfill historical sessions once, off the hot boot path.
     async def _audit_backfill_once():
         try:
-            import audit_tracker
+            import audit_tracker, audit_snapshot
+            audit_snapshot.get_git_sha()  # warm the memoized git SHA off the trade path (no fork on first trade)
             trades = list(getattr(demo.state, "trades", []) or [])
             n = audit_tracker.backfill_from_trades(trades)
             if n:

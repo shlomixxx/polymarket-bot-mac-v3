@@ -950,7 +950,9 @@ class DemoEngine:
         if is_new_session:
             trade["trade_num"] = self.state.next_trade_num()
         if context:
-            trade.update(context)
+            # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
+            # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
+            trade.update({_k: _v for _k, _v in context.items() if _k != "audit_inputs"})
         self.state.trades.append(trade)
         eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
@@ -1035,7 +1037,9 @@ class DemoEngine:
             "execution": "live",
         }
         if context:
-            trade.update(context)
+            # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
+            # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
+            trade.update({_k: _v for _k, _v in context.items() if _k != "audit_inputs"})
         self.state.trades.append(trade)
         eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
@@ -1259,7 +1263,9 @@ class DemoEngine:
                 trade["trough_mark_bid"] = tr.get("low_mark_bid")
                 trade["pnl_path"] = _trim_settled_path(tr)
         if context:
-            trade.update(context)
+            # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
+            # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
+            trade.update({_k: _v for _k, _v in context.items() if _k != "audit_inputs"})
         await self._attach_window_btc_to_tp_trade(trade, side=p.side)
         self.state.trades.append(trade)
         epoch = context.get("epoch") if context else None
@@ -1370,7 +1376,9 @@ class DemoEngine:
             trade["trough_mark_bid"] = tr.get("low_mark_bid")
             trade["pnl_path"] = _trim_settled_path(tr)
         if context:
-            trade.update(context)
+            # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
+            # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
+            trade.update({_k: _v for _k, _v in context.items() if _k != "audit_inputs"})
         await self._attach_window_btc_to_tp_trade(trade, side=p.side)
         self.state.trades.append(trade)
         self.state.positions.pop(idx)
