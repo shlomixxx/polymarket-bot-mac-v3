@@ -14,6 +14,7 @@ type AuditRow = {
   exit_type: string | null; settlement_status: string;
   realized_pnl: number | null; realized_pct: number | null;
   peak_unrealized_pct: number | null; trough_unrealized_pct: number | null;
+  settlement_btc_start: number | null; settlement_btc_end: number | null; resolved_outcome: string | null;
   exit_efficiency: number | null; missed_profit_pct: number | null;
   signal_was_correct: boolean | null; signals_agreement: number | null; signal_conflict: boolean | null;
   cf_other_side_pnl: number | null; lesson_tag: string | null;
@@ -308,9 +309,10 @@ export default function AuditTab() {
           const ctx = r.context ?? {};
           const provenance = isPlainObject(ctx.provenance) ? ctx.provenance : {};
           const signalsMissing = provenance.signals_missing === true;
-          const resolvedOutcome = (ctx.resolved_outcome as unknown) ?? null;
-          const btcStart = (ctx.settlement_btc_start as unknown) ?? null;
-          const btcEnd = (ctx.settlement_btc_end as unknown) ?? null;
+          // settlement fields are top-level audit columns (written at finalize), not in the decision context
+          const resolvedOutcome = r.resolved_outcome ?? null;
+          const btcStart = r.settlement_btc_start ?? null;
+          const btcEnd = r.settlement_btc_end ?? null;
           return (
             <div key={r.session_id} style={{
               borderRadius: 12, background: "var(--card,#0f172a)", border: "1px solid #1e293b",
