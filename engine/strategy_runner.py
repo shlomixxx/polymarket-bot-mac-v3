@@ -175,6 +175,7 @@ class StrategyRuntime:
     # A future signal-mode wiring populates this; until then it stays None and the
     # decision snapshot records signals_missing=true. Optional[dict] (JSON-safe).
     _last_signal_result: Optional[dict] = None
+    _last_signal_refresh_ts: float = 0.0  # throttle for the audit signal refresh (>=15s apart)
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -1377,11 +1378,18 @@ class StrategyRunner:
         # Cheap: compute_signals() called WITHOUT books uses a 30s internal cache and makes
         # NO extra book fetches (clob-imbalance is omitted, but book prices are captured in
         # the snapshot separately). Best-effort — must never block a trade.
+        # Throttled to >=15s (the signal data itself has a 30s internal cache, so per-tick
+        # calls add nothing) and bounded by wait_for so a cache-miss Binance fetch can never
+        # stall a trade tick. Stamp the throttle ts BEFORE awaiting to avoid retry storms.
         try:
-            from signal_engine import compute_signals as _compute_signals
-            self.rt._last_signal_result = await _compute_signals(window_sec=int(m.window_sec))
+            _now_sig = time.time()
+            if _now_sig - getattr(self.rt, "_last_signal_refresh_ts", 0.0) >= 15.0:
+                self.rt._last_signal_refresh_ts = _now_sig
+                from signal_engine import compute_signals as _compute_signals
+                self.rt._last_signal_result = await asyncio.wait_for(
+                    _compute_signals(window_sec=int(m.window_sec)), timeout=1.5)
         except Exception as _e:
-            print(f"[audit] signal refresh failed (non-fatal): {_e!r}", flush=True)
+            print(f"[audit] signal refresh skipped (non-fatal): {_e!r}", flush=True)
 
         # ── Audit ledger: stash the point-in-time decision inputs (the "WHY"). ──
         # Plain dict (JSON-safe). The demo_engine BUY hook completes the snapshot with the

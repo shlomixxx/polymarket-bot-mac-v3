@@ -811,9 +811,13 @@ async def lifespan(app: FastAPI):
     async def _audit_backfill_once():
         try:
             import audit_tracker, audit_snapshot
-            audit_snapshot.get_git_sha()  # warm the memoized git SHA off the trade path (no fork on first trade)
+            # Warm the memoized git SHA off the loop (subprocess fork) so the first trade tick never forks.
+            await asyncio.to_thread(audit_snapshot.get_git_sha)
             trades = list(getattr(demo.state, "trades", []) or [])
-            n = audit_tracker.backfill_from_trades(trades)
+            # Run the whole synchronous backfill (iterates all history, sync sqlite commits) OFF
+            # the event loop — same discipline as demo_state's _maybe_persist_async — so a large
+            # prod history can't stall the loop on first boot.
+            n = await asyncio.to_thread(audit_tracker.backfill_from_trades, trades)
             if n:
                 append_event("audit_backfill", {"rows": n})
         except Exception as e:

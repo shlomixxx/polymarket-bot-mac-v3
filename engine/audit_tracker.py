@@ -27,6 +27,11 @@ def _get_conn() -> sqlite3.Connection:
         _conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False, timeout=5.0)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA busy_timeout=5000")
+        # synchronous=NORMAL cuts the per-commit fsync cost (open_row/finalize_row commit
+        # inline from the async loop at BUY/settlement). We deliberately do NOT enable WAL —
+        # like faults.db/history.db, this DB lives on a Railway network volume where WAL is
+        # risky and brings no benefit for a single writer.
+        _conn.execute("PRAGMA synchronous=NORMAL")
         _conn.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_rows (
@@ -184,7 +189,6 @@ def list_audits(*, mode: Optional[str] = None, window_sec: Optional[int] = None,
                 settlement_status: Optional[str] = None, side: Optional[str] = None,
                 lesson_tag: Optional[str] = None, limit: int = 1000) -> list[dict[str, Any]]:
     try:
-        conn = _get_conn()
         where, args = [], []
         for col, val in (("mode", mode), ("window_sec", window_sec),
                          ("settlement_status", settlement_status), ("side", side),
@@ -197,7 +201,9 @@ def list_audits(*, mode: Optional[str] = None, window_sec: Optional[int] = None,
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY COALESCE(settled_ts, decision_ts) DESC LIMIT ?"
         args.append(max(1, min(int(limit), 10000)))
-        return [_row_to_dict(r) for r in conn.execute(sql, args).fetchall()]
+        with _LOCK:  # serialize use of the shared connection (writes may run on a worker thread)
+            rows = _get_conn().execute(sql, args).fetchall()
+        return [_row_to_dict(r) for r in rows]
     except Exception as e:
         print(f"[audit_tracker] list_audits failed: {e!r}", flush=True)
         return []
@@ -205,8 +211,8 @@ def list_audits(*, mode: Optional[str] = None, window_sec: Optional[int] = None,
 
 def get_audit(session_id: str) -> Optional[dict[str, Any]]:
     try:
-        conn = _get_conn()
-        r = conn.execute("SELECT * FROM audit_rows WHERE session_id=?", (str(session_id),)).fetchone()
+        with _LOCK:
+            r = _get_conn().execute("SELECT * FROM audit_rows WHERE session_id=?", (str(session_id),)).fetchone()
         return _row_to_dict(r) if r else None
     except Exception as e:
         print(f"[audit_tracker] get_audit failed: {e!r}", flush=True)
@@ -215,18 +221,19 @@ def get_audit(session_id: str) -> Optional[dict[str, Any]]:
 
 def audit_counts() -> dict[str, Any]:
     try:
-        conn = _get_conn()
-        by_status: dict[str, int] = {}
-        for r in conn.execute("SELECT settlement_status s, COUNT(*) c FROM audit_rows GROUP BY settlement_status"):
-            by_status[r["s"] or "PENDING"] = r["c"]
+        with _LOCK:  # serialize use of the shared connection (writes may run on a worker thread)
+            conn = _get_conn()
+            by_status: dict[str, int] = {}
+            for r in conn.execute("SELECT settlement_status s, COUNT(*) c FROM audit_rows GROUP BY settlement_status"):
+                by_status[r["s"] or "PENDING"] = r["c"]
+            eff = conn.execute(
+                "SELECT AVG(exit_efficiency) e FROM audit_rows WHERE exit_efficiency IS NOT NULL").fetchone()
+            top = [{"lesson_tag": r["lesson_tag"], "n": r["c"]} for r in conn.execute(
+                "SELECT lesson_tag, COUNT(*) c FROM audit_rows WHERE lesson_tag IS NOT NULL "
+                "GROUP BY lesson_tag ORDER BY c DESC LIMIT 8")]
+            total = conn.execute("SELECT COUNT(*) c FROM audit_rows").fetchone()["c"]
         wins, losses = by_status.get("WIN", 0), by_status.get("LOSS", 0)
         win_rate = round(100.0 * wins / (wins + losses), 2) if (wins + losses) else 0.0
-        eff = conn.execute(
-            "SELECT AVG(exit_efficiency) e FROM audit_rows WHERE exit_efficiency IS NOT NULL").fetchone()
-        top = [{"lesson_tag": r["lesson_tag"], "n": r["c"]} for r in conn.execute(
-            "SELECT lesson_tag, COUNT(*) c FROM audit_rows WHERE lesson_tag IS NOT NULL "
-            "GROUP BY lesson_tag ORDER BY c DESC LIMIT 8")]
-        total = conn.execute("SELECT COUNT(*) c FROM audit_rows").fetchone()["c"]
         return {"by_status": by_status, "total": int(total or 0), "win_rate_pct": win_rate,
                 "avg_exit_efficiency": (round(eff["e"], 4) if eff and eff["e"] is not None else None),
                 "top_lessons": top}
@@ -239,7 +246,6 @@ def export_rows(*, since_ts: Optional[int] = None, schema_version: Optional[int]
                 labels_only: bool = False, limit: int = 100000) -> list[dict[str, Any]]:
     """Full-fidelity dump for the future AI. labels_only quarantines non-{WIN,LOSS}."""
     try:
-        conn = _get_conn()
         where, args = [], []
         if since_ts is not None:
             where.append("COALESCE(settled_ts, decision_ts) >= ?"); args.append(int(since_ts))
@@ -252,7 +258,9 @@ def export_rows(*, since_ts: Optional[int] = None, schema_version: Optional[int]
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY COALESCE(settled_ts, decision_ts) ASC LIMIT ?"
         args.append(int(limit))
-        return [_row_to_dict(r) for r in conn.execute(sql, args).fetchall()]
+        with _LOCK:  # serialize use of the shared connection (writes may run on a worker thread)
+            rows = _get_conn().execute(sql, args).fetchall()
+        return [_row_to_dict(r) for r in rows]
     except Exception as e:
         print(f"[audit_tracker] export_rows failed: {e!r}", flush=True)
         return []
@@ -260,7 +268,8 @@ def export_rows(*, since_ts: Optional[int] = None, schema_version: Optional[int]
 
 def get_meta(k: str) -> Optional[str]:
     try:
-        r = _get_conn().execute("SELECT v FROM audit_meta WHERE k=?", (k,)).fetchone()
+        with _LOCK:
+            r = _get_conn().execute("SELECT v FROM audit_meta WHERE k=?", (k,)).fetchone()
         return r["v"] if r else None
     except Exception:
         return None
