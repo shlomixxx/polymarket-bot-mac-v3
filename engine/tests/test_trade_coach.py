@@ -65,6 +65,22 @@ def test_signal_conflict_fires_with_enough_live_rows():
     assert c["stat"]["agree_winrate"] > c["stat"]["conflict_winrate"]
 
 
+def test_drawdown_denominator_excludes_rows_without_trough():
+    # 50 deep-dip rows (trough -90) + 50 rows with NO trough reading.
+    deep = [_row("WIN", trough=-90.0) for _ in range(50)]
+    no_trough = [_row("WIN", trough=None) for _ in range(50)]
+    out = tc.compute_lessons(deep + no_trough)
+    d = next((l for l in out["lessons"] if l["key"] == "drawdown"), None)
+    assert d is not None
+    # denominator is rows-with-a-trough (50), so 50/50 = 100%, not 50/100 = 50%
+    assert d["stat"]["pct_dipped_below_minus50"] == 100.0
+
+
+def test_compute_lessons_never_raises_on_non_dict_rows():
+    out = tc.compute_lessons([None, 5, "x", {"settlement_status": "WIN", "realized_pnl": 1.0}])
+    assert out["eras"]["total"] == 1  # the non-dicts are filtered out, no crash
+
+
 def test_compute_lessons_is_robust_and_sorted():
     out = tc.compute_lessons([])           # empty -> no crash
     assert out["lessons"] == [] or all("severity" in l for l in out["lessons"])

@@ -123,16 +123,18 @@ def lesson_martingale_risk(rows: list[dict]) -> Optional[dict]:
 
 
 def lesson_drawdown(rows: list[dict]) -> Optional[dict]:
-    troughs = [float(r["trough_unrealized_pct"]) for r in rows
-               if r.get("trough_unrealized_pct") is not None]
-    if len(troughs) < 50:
+    # Only consider rows that actually have a trough reading, and use THAT as the denominator
+    # (mixing in rows without a trough would under-report the dip rate).
+    have_trough = [r for r in rows if r.get("trough_unrealized_pct") is not None]
+    if len(have_trough) < 50:
         return None
-    deep = [r for r in rows if (r.get("trough_unrealized_pct") or 0) <= -50]
+    troughs = [float(r["trough_unrealized_pct"]) for r in have_trough]
+    deep = [r for r in have_trough if float(r["trough_unrealized_pct"]) <= -50]
     return _lesson(
         "drawdown", "medium",
         "התנהגות drawdown (שוק בינארי מתנדנד)",
         {"median_trough_pct": round(statistics.median(troughs), 1),
-         "pct_dipped_below_minus50": round(100.0 * len(deep) / len(rows), 1),
+         "pct_dipped_below_minus50": round(100.0 * len(deep) / len(have_trough), 1),
          "deep_dip_winrate": _winrate(deep)},
         "למקד משמעת בצד הרווח (TP/trailing). hard-stop רק בסף עמוק מאוד (<−80%) כדי לא לחתוך מנצחות.",
         "בינוני")
@@ -174,7 +176,7 @@ _LESSON_FNS = (
 
 def compute_lessons(rows: list[dict]) -> dict[str, Any]:
     """Run every lesson rule over the ledger rows and return a ranked, JSON-safe result."""
-    rows = rows or []
+    rows = [r for r in (rows or []) if isinstance(r, dict)]  # honor the never-raises contract
     lessons: list[dict] = []
     for fn in _LESSON_FNS:
         try:
