@@ -30,6 +30,24 @@ type AuditCounts = {
 };
 type AuditResponse = { rows: AuditRow[]; counts: AuditCounts };
 
+// ── lessons (🎓 מאמן העסקאות) ────────────────────────────────────────────────
+type Lesson = {
+  key: string; severity: "critical" | "high" | "medium" | "low" | string; title: string;
+  stat: Record<string, string | number | null>; recommendation: string; confidence: string;
+};
+type LessonsResponse = { note: string; eras: Record<string, number | null>; lessons: Lesson[] };
+
+// severity palette — same language as the Faults tab
+const SEV_META: Record<string, { label: string; color: string; bg: string }> = {
+  critical: { label: "קריטי", color: "#fecaca", bg: "#7f1d1d" },
+  high: { label: "גבוה", color: "#fed7aa", bg: "#7c2d12" },
+  medium: { label: "בינוני", color: "#fde68a", bg: "#713f12" },
+  low: { label: "נמוך", color: "#cbd5e1", bg: "#334155" },
+};
+function sevMeta(s: string) {
+  return SEV_META[s] ?? SEV_META.low;
+}
+
 // ── status meta ──────────────────────────────────────────────────────────────
 function statusColor(s: string): string {
   if (s === "WIN") return "#065f46";
@@ -120,6 +138,105 @@ function Sparkline({ path }: { path: Array<{ upnl_pct?: number }> }) {
   );
 }
 
+// 🎓 collapsible "Trade Coach" lessons — ranked, actionable, mined from the ledger
+function LessonsSection({ lessons }: { lessons: LessonsResponse | null }) {
+  const [open, setOpen] = useState(true);
+  if (!lessons) return null; // failed/loading: don't render — never break the rest of the tab
+
+  const e = lessons.eras ?? {};
+  const num = (k: string): string => {
+    const v = e[k];
+    return v == null || !Number.isFinite(v) ? "—" : String(v);
+  };
+
+  return (
+    <div style={{
+      borderRadius: 12, background: "var(--card,#0f172a)", border: "1px solid #1e293b",
+      borderInlineStart: "4px solid #7c3aed", overflow: "hidden", marginBottom: 18,
+    }}>
+      {/* Header row */}
+      <div
+        style={{ display: "flex", alignItems: "baseline", gap: 10, padding: "12px 14px", cursor: "pointer", flexWrap: "wrap" }}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <div style={{ flex: 1, minWidth: 240 }}>
+          <div style={{ fontSize: 17, fontWeight: 800, letterSpacing: "-0.01em" }}>🎓 לקחים — מאמן העסקאות</div>
+          <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", marginTop: 2 }}>
+            לקחים מדורגים מתוך כל העסקאות — מה לשפר. סכומי $ מוטים ע"י martingale, לכן מתבססים על win-rate ו-median.
+          </div>
+          {Object.keys(e).length > 0 && (
+            <div style={{ fontSize: 12, color: "#93c5fd", marginTop: 4 }}>
+              סה"כ {num("total")} עסקאות · {num("schema_v1")} עם סיגנלים · win {num("overall_winrate")}%
+            </div>
+          )}
+        </div>
+        <span style={{ color: "var(--muted,#94a3b8)", transform: open ? "rotate(90deg)" : "none", transition: "transform .15s" }}>‹</span>
+      </div>
+
+      {open && (
+        <div style={{ padding: "0 14px 14px", borderTop: "1px solid #1e293b", display: "grid", gap: 8 }}>
+          {lessons.lessons.length === 0 && (
+            <div style={{ marginTop: 12, padding: 24, textAlign: "center", color: "var(--muted,#94a3b8)", border: "1px dashed #1e293b", borderRadius: 12 }}>
+              עוד אין מספיק נתונים ללקחים
+            </div>
+          )}
+
+          {lessons.lessons.map((l) => {
+            const m = sevMeta(l.severity);
+            return (
+              <div key={l.key} style={{
+                marginTop: 10, borderRadius: 10, background: "#0b1220",
+                border: "1px solid #1e293b", borderInlineStart: `4px solid ${m.bg}`, padding: "10px 14px",
+              }}>
+                {/* title + severity badge */}
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <span style={{
+                    fontSize: 11, fontWeight: 800, padding: "3px 8px", borderRadius: 999,
+                    color: m.color, background: m.bg, whiteSpace: "nowrap",
+                  }}>{m.label}</span>
+                  <span style={{ fontSize: 14, fontWeight: 800, color: "#e2e8f0" }}>{l.title}</span>
+                </div>
+
+                {/* recommendation */}
+                <div style={{ fontSize: 13, color: "#cbd5e1", marginTop: 6, lineHeight: 1.5 }}>{l.recommendation}</div>
+
+                {/* confidence chip */}
+                {l.confidence && (
+                  <div style={{ marginTop: 6 }}>
+                    <span style={{
+                      fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 999,
+                      color: "#93c5fd", background: "#1e3a5f55", border: "1px solid #1e3a5f", whiteSpace: "nowrap",
+                    }}>ביטחון: {l.confidence}</span>
+                  </div>
+                )}
+
+                {/* stat pills */}
+                {l.stat && Object.keys(l.stat).length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                    {Object.entries(l.stat).map(([k, v]) => (
+                      <span key={k} style={{
+                        fontSize: 11, fontWeight: 600, padding: "3px 8px", borderRadius: 8,
+                        color: "#cbd5e1", background: "#0f172a", border: "1px solid #1e293b", whiteSpace: "nowrap",
+                      }}>
+                        {k}: <b style={{ color: "#e2e8f0" }}>{v == null ? "—" : String(v)}</b>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {/* note */}
+          {lessons.note && (
+            <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", fontStyle: "italic", marginTop: 8 }}>{lessons.note}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // labeled drill-down section for a nested context sub-object
 function Section({ title, obj }: { title: string; obj: unknown }) {
   if (!isPlainObject(obj) || Object.keys(obj).length === 0) return null;
@@ -139,6 +256,7 @@ function Section({ title, obj }: { title: string; obj: unknown }) {
 
 export default function AuditTab() {
   const [data, setData] = useState<AuditResponse | null>(null);
+  const [lessons, setLessons] = useState<LessonsResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -161,6 +279,13 @@ export default function AuditTab() {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
+    }
+    // 🎓 לקחים — refreshes together with the audit data; never breaks the tab on failure.
+    try {
+      const les = await api<LessonsResponse>("/api/audit/lessons", { timeoutMs: AUDIT_TIMEOUT_MS });
+      setLessons(les);
+    } catch {
+      setLessons(null);
     }
   }, [fMode, fWindow, fStatus]);
 
@@ -199,6 +324,9 @@ export default function AuditTab() {
 
   return (
     <div dir="rtl" style={{ padding: "4px 2px 40px", maxWidth: 1100, margin: "0 auto" }}>
+      {/* 🎓 לקחים — מאמן העסקאות (ranked, mined from the ledger) */}
+      <LessonsSection lessons={lessons} />
+
       {/* Header */}
       <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
         <div>
