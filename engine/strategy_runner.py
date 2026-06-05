@@ -1373,6 +1373,16 @@ class StrategyRunner:
             "btc_window": cfg.btc_window,
         }
 
+        # ── Audit: refresh the cached signal snapshot for the decision "WHY". ──
+        # Cheap: compute_signals() called WITHOUT books uses a 30s internal cache and makes
+        # NO extra book fetches (clob-imbalance is omitted, but book prices are captured in
+        # the snapshot separately). Best-effort — must never block a trade.
+        try:
+            from signal_engine import compute_signals as _compute_signals
+            self.rt._last_signal_result = await _compute_signals(window_sec=int(m.window_sec))
+        except Exception as _e:
+            print(f"[audit] signal refresh failed (non-fatal): {_e!r}", flush=True)
+
         # ── Audit ledger: stash the point-in-time decision inputs (the "WHY"). ──
         # Plain dict (JSON-safe). The demo_engine BUY hook completes the snapshot with the
         # final side + execution. Best-effort: must never block a trade.

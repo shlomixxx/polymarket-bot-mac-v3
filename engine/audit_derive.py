@@ -67,10 +67,17 @@ def cf_other_side_pnl(*, side: Optional[str], resolved_outcome: Optional[str],
 
 
 def _lean(snapshot: dict[str, Any]) -> dict[str, int]:
-    """Per-component directional lean in {-1,0,1} (positive = Up)."""
-    ta = (snapshot.get("ta") or {}).get("ta_score")
-    clob = (snapshot.get("clob") or {}).get("net_score")
-    sent = (snapshot.get("sentiment") or {}).get("sentiment_score")
+    """Per-component directional lean in {-1,0,1} (positive = Up).
+
+    compute_signals' ta/sentiment sub-dicts use the key "score"; we also accept the explicit
+    "ta_score"/"sentiment_score" names so the function is robust to either source.
+    """
+    ta_d = snapshot.get("ta") or {}
+    clob_d = snapshot.get("clob") or {}
+    sent_d = snapshot.get("sentiment") or {}
+    ta = ta_d.get("ta_score") if ta_d.get("ta_score") is not None else ta_d.get("score")
+    clob = clob_d.get("net_score")
+    sent = sent_d.get("sentiment_score") if sent_d.get("sentiment_score") is not None else sent_d.get("score")
 
     def sign(x: Any) -> int:
         try:

@@ -43,6 +43,15 @@ def test_signals_agreement_and_conflict():
     assert ad.signal_conflict(snap, side="Down") is True
 
 
+def test_agreement_reads_real_compute_signals_score_keys():
+    # compute_signals' ta/sentiment sub-dicts use "score" (not ta_score/sentiment_score).
+    snap = {"ta": {"score": 2}, "clob": {"net_score": 0.3},
+            "sentiment": {"score": 1}, "signal": {"recommendation": "Up"}}
+    assert ad.signals_agreement(snap) >= 0.66
+    assert ad.signal_conflict(snap, side="Up") is False
+    assert ad.signal_conflict(snap, side="Down") is True
+
+
 def test_lesson_tag_classifies():
     assert ad.lesson_tag(status="WIN", exit_eff=0.95, signal_correct=True, conflict=False) == "clean_win"
     assert ad.lesson_tag(status="WIN", exit_eff=0.3, signal_correct=True, conflict=False) == "good_entry_late_exit"
