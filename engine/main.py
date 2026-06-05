@@ -2151,6 +2151,14 @@ async def audit_export(since_ts: Optional[int] = None, schema_version: Optional[
         labels_only=bool(labels_only), limit=int(limit))}
 
 
+@app.get("/api/audit/lessons")
+async def audit_lessons():
+    """Trade Coach — deterministic, ranked lessons mined from the audit ledger (read-only)."""
+    import audit_tracker, trade_coach
+    rows = audit_tracker.export_rows(limit=100000)
+    return trade_coach.compute_lessons(rows)
+
+
 @app.get("/api/audit/{session_id}")
 async def audit_detail(session_id: str):
     import audit_tracker

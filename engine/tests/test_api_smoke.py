@@ -328,3 +328,10 @@ def test_audit_list_and_export_endpoints(client: TestClient):
     assert r.status_code == 200
     assert isinstance(r.json().get("rows"), list)
 
+    # Trade Coach lessons endpoint must not be shadowed by /api/audit/{session_id}
+    r = client.get("/api/audit/lessons")
+    assert r.status_code == 200
+    j = r.json()
+    assert isinstance(j.get("lessons"), list)
+    assert "eras" in j and "note" in j
+
