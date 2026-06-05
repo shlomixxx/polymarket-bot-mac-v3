@@ -530,6 +530,7 @@ class DemoEngine:
                 "tp_hit": False,
                 "settled_window_sec": ws,
             }
+            trade["leg_cost"] = leg_cost
             if sid:
                 trade["session_id"] = sid
             else:
@@ -545,6 +546,7 @@ class DemoEngine:
                 trade["trough_ts"] = tr.get("low_watermark_ts")
                 trade["trough_mark_bid"] = tr.get("low_mark_bid")
                 trade["pnl_path"] = _trim_settled_path(tr)
+                trade["open_ts"] = tr.get("open_ts")
 
             trade.update(ctx)
             if ep is not None:
@@ -1232,6 +1234,7 @@ class DemoEngine:
             "type": "SELL_TP",
             "token_id": token_id,
             "realized_pnl": realized,
+            "leg_cost": leg_cost,
             "execution": "live",
         }
         if full_exit:
@@ -1247,6 +1250,7 @@ class DemoEngine:
                 trade["trough_ts"] = tr.get("low_watermark_ts")
                 trade["trough_mark_bid"] = tr.get("low_mark_bid")
                 trade["pnl_path"] = _trim_settled_path(tr)
+                trade["open_ts"] = tr.get("open_ts")
             self.state.positions.pop(idx)
         else:
             p.contracts = remainder
@@ -1262,6 +1266,7 @@ class DemoEngine:
                 trade["trough_ts"] = tr.get("low_watermark_ts")
                 trade["trough_mark_bid"] = tr.get("low_mark_bid")
                 trade["pnl_path"] = _trim_settled_path(tr)
+                trade["open_ts"] = tr.get("open_ts")
         if context:
             # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
             # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
@@ -1363,6 +1368,7 @@ class DemoEngine:
             "type": "SELL_TP",
             "token_id": token_id,
             "realized_pnl": realized,
+            "leg_cost": leg_cost,
         }
         if sid:
             trade["session_id"] = sid
@@ -1375,6 +1381,7 @@ class DemoEngine:
             trade["trough_ts"] = tr.get("low_watermark_ts")
             trade["trough_mark_bid"] = tr.get("low_mark_bid")
             trade["pnl_path"] = _trim_settled_path(tr)
+            trade["open_ts"] = tr.get("open_ts")
         if context:
             # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
             # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).

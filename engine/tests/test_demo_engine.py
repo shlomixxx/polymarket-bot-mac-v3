@@ -54,6 +54,8 @@ async def test_expire_all_outside_tokens_creates_expire_trade_and_removes_positi
     expected_loss = -(0.4 * 10.0 * (1 + FEE_RATE))
     assert float(t["realized_pnl"]) == pytest.approx(expected_loss)
     assert t.get("execution") == "live"
+    # leg_cost נחתם על עסקת הסגירה (מזין realized_pct ב-audit finalize)
+    assert float(t["leg_cost"]) == pytest.approx(0.4 * 10.0 * (1 + FEE_RATE))
 
 
 @pytest.mark.asyncio
