@@ -92,3 +92,21 @@ def test_never_raises_on_garbage(tmp_path, monkeypatch):
     assert at.open_row("x", {"bad": object()}) in (True, False)
     assert at.finalize_row("missing", {"type": "SETTLE_WIN"}) in (True, False)
     assert isinstance(at.list_audits(), list)
+
+
+def test_backfill_from_trades_is_idempotent(tmp_path, monkeypatch):
+    at = _fresh_tracker(tmp_path, monkeypatch)
+    trades = [
+        {"type": "BUY", "session_id": "h1", "side": "Up", "ts": 1000.0, "contracts": 40,
+         "price": 0.5, "token_id": "t", "window_sec": 300, "epoch": 1, "slug": "s"},
+        {"type": "SETTLE_WIN", "session_id": "h1", "side": "Up", "ts": 1300.0,
+         "realized_pnl": 18.0, "resolved_outcome": "Up", "peak_unrealized_pct": 95.0,
+         "settlement_btc_start": 64000.0, "settlement_btc_end": 64100.0},
+    ]
+    n1 = at.backfill_from_trades(trades)
+    n2 = at.backfill_from_trades(trades)
+    assert n1 == 1 and n2 == 0
+    row = at.get_audit("h1")
+    assert row["schema_version"] == 0
+    assert row["settlement_status"] == "WIN"
+    assert row["signal"] == {}

@@ -275,3 +275,63 @@ def set_meta(k: str, v: str) -> None:
             conn.commit()
     except Exception as e:
         print(f"[audit_tracker] set_meta failed: {e!r}", flush=True)
+
+
+def backfill_from_trades(trades: list[dict[str, Any]]) -> int:
+    """Project historical closed sessions into audit rows (schema_version=0, null Layer B).
+
+    Idempotent via the 'backfilled_through_ts' marker. Groups by session_id, takes the
+    first BUY as the (signal-less) decision row and the last settlement/TP as the outcome.
+    Returns how many NEW rows were written.
+    """
+    try:
+        through = float(get_meta("backfilled_through_ts") or 0.0)
+        by_sess: dict[str, dict[str, Any]] = {}
+        max_ts = through
+        for t in trades:
+            sid = t.get("session_id")
+            ts = float(t.get("ts") or 0.0)
+            if not sid or ts <= through:
+                continue
+            max_ts = max(max_ts, ts)
+            b = by_sess.setdefault(str(sid), {"buy": None, "close": None})
+            typ = str(t.get("type") or "")
+            if typ == "BUY" and b["buy"] is None:
+                b["buy"] = t
+            if typ in ("SELL_TP", "SETTLE_WIN", "SETTLE_LOSS", "SETTLE_UNKNOWN"):
+                b["close"] = t
+        written = 0
+        for sid, b in by_sess.items():
+            buy = b["buy"]
+            if buy is None or get_audit(sid) is not None:
+                continue
+            snap = {
+                "schema_version": 0, "code_version": None,
+                "mode": "demo" if buy.get("execution") != "live" else "live",
+                "side": buy.get("side"), "slug": buy.get("slug"), "epoch": buy.get("epoch"),
+                "window_sec": buy.get("window_sec"), "decision_ts": int(float(buy.get("ts") or 0) * 1000),
+                "signal": {}, "ta": {}, "clob": {}, "sentiment": {}, "history": {},
+                "regime": {}, "policy": {}, "provenance": {"signals_missing": True},
+                "execution": {"avg_fill_price": buy.get("price"), "contracts": buy.get("contracts")},
+            }
+            open_row(sid, snap)
+            close = b["close"]
+            if close is not None:
+                finalize_row(sid, {
+                    "type": close.get("type"), "exit_type": "settle" if str(close.get("type")).startswith("SETTLE") else "TP",
+                    "realized_pnl": close.get("realized_pnl"),
+                    "peak_unrealized_pct": close.get("peak_unrealized_pct"),
+                    "trough_unrealized_pct": close.get("trough_unrealized_pct"),
+                    "resolved_outcome": close.get("resolved_outcome"),
+                    "settlement_btc_start": close.get("settlement_btc_start"),
+                    "settlement_btc_end": close.get("settlement_btc_end"),
+                    "voided": close.get("voided"), "settlement_error": close.get("settlement_error"),
+                    "settled_ts": int(float(close.get("ts") or 0) * 1000),
+                    "pnl_path": close.get("pnl_path") or [],
+                })
+            written += 1
+        set_meta("backfilled_through_ts", str(max_ts))
+        return written
+    except Exception as e:
+        print(f"[audit_tracker] backfill failed: {e!r}", flush=True)
+        return 0
