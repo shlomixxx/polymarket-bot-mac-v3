@@ -574,6 +574,7 @@ class DemoEngine:
                 except Exception:
                     pass
                 self.state.trades.append(trade)
+                self._audit_finalize_settle_trade(trade)
                 created.append(trade)
                 continue
 
@@ -613,6 +614,7 @@ class DemoEngine:
                 except Exception:
                     pass
                 self.state.trades.append(trade)
+                self._audit_finalize_settle_trade(trade)
                 created.append(trade)
                 continue
 
@@ -636,6 +638,7 @@ class DemoEngine:
                 trade["fee_est"] = 0.0
                 trade["realized_pnl"] = -leg_cost
             self.state.trades.append(trade)
+            self._audit_finalize_settle_trade(trade)
             created.append(trade)
 
         self.state.positions = keep
@@ -947,11 +950,33 @@ class DemoEngine:
         if is_new_session:
             trade["trade_num"] = self.state.next_trade_num()
         if context:
-            trade.update(context)
+            # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
+            # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
+            trade.update({_k: _v for _k, _v in context.items() if _k != "audit_inputs"})
         self.state.trades.append(trade)
         eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
+        # ── Audit ledger: open the decision-time row (best-effort, never blocks). ──
+        try:
+            import audit_tracker, audit_snapshot, time as _t
+            _inp = (context or {}).get("audit_inputs")
+            if _inp and trade.get("session_id"):
+                _inp = dict(_inp)
+                for _k in ("side", "decision_ts_ms", "btc_spot_at_entry", "execution"):
+                    _inp.pop(_k, None)
+                _snap = audit_snapshot.build_decision_snapshot(
+                    side=trade.get("side"),
+                    decision_ts_ms=int(_t.time() * 1000), btc_spot_at_entry=None,
+                    execution={"avg_fill_price": trade.get("price"),
+                               "contracts": trade.get("contracts"),
+                               "gate": (context or {}).get("gate"),
+                               "reason": (context or {}).get("reason"),
+                               "investment_usd_effective": (context or {}).get("effective_investment_usd")},
+                    **_inp)
+                audit_tracker.open_row(str(trade["session_id"]), _snap)
+        except Exception as _e:
+            print(f"[audit] open_row hook failed (non-fatal): {_e!r}", flush=True)
         return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
 
     def record_live_buy(
@@ -1012,11 +1037,33 @@ class DemoEngine:
             "execution": "live",
         }
         if context:
-            trade.update(context)
+            # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
+            # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
+            trade.update({_k: _v for _k, _v in context.items() if _k != "audit_inputs"})
         self.state.trades.append(trade)
         eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
+        # ── Audit ledger: open the decision-time row (best-effort, never blocks). ──
+        try:
+            import audit_tracker, audit_snapshot, time as _t
+            _inp = (context or {}).get("audit_inputs")
+            if _inp and trade.get("session_id"):
+                _inp = dict(_inp)
+                for _k in ("side", "decision_ts_ms", "btc_spot_at_entry", "execution"):
+                    _inp.pop(_k, None)
+                _snap = audit_snapshot.build_decision_snapshot(
+                    side=trade.get("side"),
+                    decision_ts_ms=int(_t.time() * 1000), btc_spot_at_entry=None,
+                    execution={"avg_fill_price": trade.get("price"),
+                               "contracts": trade.get("contracts"),
+                               "gate": (context or {}).get("gate"),
+                               "reason": (context or {}).get("reason"),
+                               "investment_usd_effective": (context or {}).get("effective_investment_usd")},
+                    **_inp)
+                audit_tracker.open_row(str(trade["session_id"]), _snap)
+        except Exception as _e:
+            print(f"[audit] open_row hook failed (non-fatal): {_e!r}", flush=True)
         return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
 
     def _canonical_window_epoch_ws_for_session(self, session_id: str) -> tuple[Optional[int], int]:
@@ -1216,7 +1263,9 @@ class DemoEngine:
                 trade["trough_mark_bid"] = tr.get("low_mark_bid")
                 trade["pnl_path"] = _trim_settled_path(tr)
         if context:
-            trade.update(context)
+            # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
+            # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
+            trade.update({_k: _v for _k, _v in context.items() if _k != "audit_inputs"})
         await self._attach_window_btc_to_tp_trade(trade, side=p.side)
         self.state.trades.append(trade)
         epoch = context.get("epoch") if context else None
@@ -1235,6 +1284,34 @@ class DemoEngine:
         eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
+        # ── Audit ledger: finalize the row with the outcome (best-effort). Only on FULL exit. ──
+        if full_exit:
+            try:
+                import audit_tracker, time as _t
+                if trade.get("session_id"):
+                    audit_tracker.finalize_row(str(trade["session_id"]), {
+                        "type": trade.get("type"),
+                        "exit_type": ("TP" if trade.get("type") == "SELL_TP" else
+                                      ("voided" if trade.get("voided") else "settle")),
+                        "realized_pnl": trade.get("realized_pnl"),
+                        "realized_pct": (round(100.0 * trade["realized_pnl"] /
+                                               max(1e-9, trade.get("leg_cost") or 0), 4)
+                                         if trade.get("realized_pnl") is not None and trade.get("leg_cost") else None),
+                        "peak_unrealized_pct": trade.get("peak_unrealized_pct"),
+                        "trough_unrealized_pct": trade.get("trough_unrealized_pct"),
+                        "hold_duration_sec": (trade.get("ts", 0) - (trade.get("open_ts") or trade.get("ts", 0))),
+                        "fees": trade.get("fee_est"),
+                        "settlement_btc_start": trade.get("settlement_btc_start"),
+                        "settlement_btc_end": trade.get("settlement_btc_end"),
+                        "resolved_outcome": trade.get("resolved_outcome"),
+                        "voided": trade.get("voided"),
+                        "settlement_error": trade.get("settlement_error"),
+                        "settled_ts": int(float(trade.get("ts") or _t.time()) * 1000),
+                        "pnl_path": trade.get("pnl_path") or [],
+                        "fee_rate": 0.0,
+                    })
+            except Exception as _e:
+                print(f"[audit] finalize_row hook failed (non-fatal): {_e!r}", flush=True)
         return {
             "ok": True,
             "trade": trade,
@@ -1299,7 +1376,9 @@ class DemoEngine:
             trade["trough_mark_bid"] = tr.get("low_mark_bid")
             trade["pnl_path"] = _trim_settled_path(tr)
         if context:
-            trade.update(context)
+            # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
+            # ride onto the persisted trade (keeps demo_state.json lean + JSON-safe).
+            trade.update({_k: _v for _k, _v in context.items() if _k != "audit_inputs"})
         await self._attach_window_btc_to_tp_trade(trade, side=p.side)
         self.state.trades.append(trade)
         self.state.positions.pop(idx)
@@ -1320,7 +1399,63 @@ class DemoEngine:
         eq = self._equity_marked_consistent()
         self.state.equity_history.append((time.time(), eq))
         self.save()
+        # ── Audit ledger: finalize the row with the outcome (best-effort). Full exit (sells all). ──
+        try:
+            import audit_tracker, time as _t
+            if trade.get("session_id"):
+                audit_tracker.finalize_row(str(trade["session_id"]), {
+                    "type": trade.get("type"),
+                    "exit_type": ("TP" if trade.get("type") == "SELL_TP" else
+                                  ("voided" if trade.get("voided") else "settle")),
+                    "realized_pnl": trade.get("realized_pnl"),
+                    "realized_pct": (round(100.0 * trade["realized_pnl"] /
+                                           max(1e-9, trade.get("leg_cost") or 0), 4)
+                                     if trade.get("realized_pnl") is not None and trade.get("leg_cost") else None),
+                    "peak_unrealized_pct": trade.get("peak_unrealized_pct"),
+                    "trough_unrealized_pct": trade.get("trough_unrealized_pct"),
+                    "hold_duration_sec": (trade.get("ts", 0) - (trade.get("open_ts") or trade.get("ts", 0))),
+                    "fees": trade.get("fee_est"),
+                    "settlement_btc_start": trade.get("settlement_btc_start"),
+                    "settlement_btc_end": trade.get("settlement_btc_end"),
+                    "resolved_outcome": trade.get("resolved_outcome"),
+                    "voided": trade.get("voided"),
+                    "settlement_error": trade.get("settlement_error"),
+                    "settled_ts": int(float(trade.get("ts") or _t.time()) * 1000),
+                    "pnl_path": trade.get("pnl_path") or [],
+                    "fee_rate": 0.0,
+                })
+        except Exception as _e:
+            print(f"[audit] finalize_row hook failed (non-fatal): {_e!r}", flush=True)
         return {"ok": True, "trade": trade, "balance": self.state.balance_usd}
+
+    def _audit_finalize_settle_trade(self, trade: dict[str, Any]) -> None:
+        # ── Audit ledger: finalize a settled (SETTLE_*) row with the outcome (best-effort). ──
+        try:
+            import audit_tracker, time as _t
+            if trade.get("session_id"):
+                audit_tracker.finalize_row(str(trade["session_id"]), {
+                    "type": trade.get("type"),
+                    "exit_type": ("TP" if trade.get("type") == "SELL_TP" else
+                                  ("voided" if trade.get("voided") else "settle")),
+                    "realized_pnl": trade.get("realized_pnl"),
+                    "realized_pct": (round(100.0 * trade["realized_pnl"] /
+                                           max(1e-9, trade.get("leg_cost") or 0), 4)
+                                     if trade.get("realized_pnl") is not None and trade.get("leg_cost") else None),
+                    "peak_unrealized_pct": trade.get("peak_unrealized_pct"),
+                    "trough_unrealized_pct": trade.get("trough_unrealized_pct"),
+                    "hold_duration_sec": (trade.get("ts", 0) - (trade.get("open_ts") or trade.get("ts", 0))),
+                    "fees": trade.get("fee_est"),
+                    "settlement_btc_start": trade.get("settlement_btc_start"),
+                    "settlement_btc_end": trade.get("settlement_btc_end"),
+                    "resolved_outcome": trade.get("resolved_outcome"),
+                    "voided": trade.get("voided"),
+                    "settlement_error": trade.get("settlement_error"),
+                    "settled_ts": int(float(trade.get("ts") or _t.time()) * 1000),
+                    "pnl_path": trade.get("pnl_path") or [],
+                    "fee_rate": 0.0,
+                })
+        except Exception as _e:
+            print(f"[audit] finalize_row hook failed (non-fatal): {_e!r}", flush=True)
 
     def _mark_dirty(self) -> None:
         """PR-D: מסמן שיש שינוי שצריך persist — נכתב בפועל ע"י _maybe_persist_async (מושהה, מחוץ ללולאה)."""

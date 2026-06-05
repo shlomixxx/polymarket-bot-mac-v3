@@ -807,6 +807,23 @@ async def lifespan(app: FastAPI):
     # FIX #5: backfill חלונות חסרים ב-history.db (אם השרת היה כבוי כשחלון נסגר).
     # רץ כ-task כדי לא לחסום lifespan.
     asyncio.create_task(_backfill_missing_history_windows())
+    # Audit ledger: backfill historical sessions once, off the hot boot path.
+    async def _audit_backfill_once():
+        try:
+            import audit_tracker, audit_snapshot
+            audit_snapshot.get_git_sha()  # warm the memoized git SHA off the trade path (no fork on first trade)
+            trades = list(getattr(demo.state, "trades", []) or [])
+            n = audit_tracker.backfill_from_trades(trades)
+            if n:
+                append_event("audit_backfill", {"rows": n})
+        except Exception as e:
+            try:
+                import fault_tracker
+                fault_tracker.record_fault(category="audit", severity="low",
+                                           title="audit backfill failed", detail=repr(e))
+            except Exception:
+                pass
+    asyncio.create_task(_audit_backfill_once())
     # Start real-time WebSocket price stream from Polymarket CLOB
     price_stream.start()
     _ws_subscription_task = asyncio.create_task(
@@ -2103,6 +2120,40 @@ async def faults_clear(only_handled: bool = True):
     import fault_tracker
     n = fault_tracker.clear_faults(only_handled=bool(only_handled))
     return {"ok": True, "removed": n}
+
+
+# ── Trade Audit Ledger endpoints (read-only analytics; cacheable, NOT order-path) ──
+@app.get("/api/audit")
+async def audit_list(
+    mode: Optional[str] = None, window_sec: Optional[int] = None,
+    settlement_status: Optional[str] = None, side: Optional[str] = None,
+    lesson_tag: Optional[str] = None, limit: int = 1000,
+):
+    import audit_tracker
+    return {
+        "rows": audit_tracker.list_audits(
+            mode=mode, window_sec=window_sec, settlement_status=settlement_status,
+            side=side, lesson_tag=lesson_tag, limit=int(limit)),
+        "counts": audit_tracker.audit_counts(),
+    }
+
+
+@app.get("/api/audit/export")
+async def audit_export(since_ts: Optional[int] = None, schema_version: Optional[int] = None,
+                       labels_only: bool = False, limit: int = 100000):
+    import audit_tracker
+    return {"rows": audit_tracker.export_rows(
+        since_ts=since_ts, schema_version=schema_version,
+        labels_only=bool(labels_only), limit=int(limit))}
+
+
+@app.get("/api/audit/{session_id}")
+async def audit_detail(session_id: str):
+    import audit_tracker
+    row = audit_tracker.get_audit(session_id)
+    if row is None:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return row
 
 
 @app.get("/api/history/last-window-outcome")

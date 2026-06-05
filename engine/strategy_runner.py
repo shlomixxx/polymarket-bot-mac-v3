@@ -171,6 +171,10 @@ class StrategyRuntime:
     _discovery_none_last_record_ts: float = 0.0                    # F5
     _reconcile_fail_streak: int = 0                                # F8
     _last_reconcile_fault_ts: float = 0.0                          # F8
+    # Audit ledger: the last compute_signals() result (the rich "WHY" inputs).
+    # A future signal-mode wiring populates this; until then it stays None and the
+    # decision snapshot records signals_missing=true. Optional[dict] (JSON-safe).
+    _last_signal_result: Optional[dict] = None
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -1368,6 +1372,44 @@ class StrategyRunner:
             "window_sec": int(m.window_sec),
             "btc_window": cfg.btc_window,
         }
+
+        # ── Audit: refresh the cached signal snapshot for the decision "WHY". ──
+        # Cheap: compute_signals() called WITHOUT books uses a 30s internal cache and makes
+        # NO extra book fetches (clob-imbalance is omitted, but book prices are captured in
+        # the snapshot separately). Best-effort — must never block a trade.
+        try:
+            from signal_engine import compute_signals as _compute_signals
+            self.rt._last_signal_result = await _compute_signals(window_sec=int(m.window_sec))
+        except Exception as _e:
+            print(f"[audit] signal refresh failed (non-fatal): {_e!r}", flush=True)
+
+        # ── Audit ledger: stash the point-in-time decision inputs (the "WHY"). ──
+        # Plain dict (JSON-safe). The demo_engine BUY hook completes the snapshot with the
+        # final side + execution. Best-effort: must never block a trade.
+        try:
+            import audit_snapshot
+            _sig_result = getattr(self.rt, "_last_signal_result", None)
+            base_ctx["audit_inputs"] = {
+                "mode": ("live" if getattr(self.rt, "live_trading", False) else "demo"),
+                "slug": m.slug, "epoch": int(m.epoch), "window_sec": int(m.window_sec),
+                "code_version": (audit_snapshot.get_git_sha() or "")[:12],
+                "signal_result": _sig_result,
+                "policy": {
+                    "order_mode": getattr(cfg, "order_mode", None),
+                    "take_profit_pct": getattr(cfg, "take_profit_pct", None),
+                    "entry_price_cents_cap": getattr(cfg, "entry_price_cents", None),
+                    "side_preference": getattr(cfg, "side_preference", None),
+                    "loss_recovery_enabled": getattr(cfg, "loss_recovery_enabled", None),
+                    "loss_recovery_multiplier": self.demo.state.loss_recovery_multiplier,
+                    "loss_recovery_streak": self.demo.state.loss_recovery_streak,
+                },
+                "book": {"ask_u": ask_u, "bid_u": bid_u, "ask_d": ask_d, "bid_d": bid_d},
+                "provenance": {"book_source": "ws", "signals_missing": _sig_result is None},
+                "regime": {"vol_bucket": None, "seconds_remaining_at_entry": sec_left,
+                           "entry_minute_in_window": int((int(m.window_sec) - sec_left) // 60)},
+            }
+        except Exception as _e:
+            print(f"[audit] audit_inputs build failed (non-fatal): {_e!r}", flush=True)
 
         # TP
         best_near_tp: tuple[float, str] | None = None  # (missing_pct, label)
