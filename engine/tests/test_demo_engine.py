@@ -138,3 +138,32 @@ def test_export_csv_contains_headers_and_snapshot(tmp_path: Path):
     assert "ts,time,type,side,contracts,price,fee_est,token_id,session_id,realized_pnl" in csv_text
     assert "snapshot_ts,equity,unrealized_usd" in csv_text
 
+
+def test_audit_buy_hook_creates_row_and_excludes_audit_inputs(tmp_path: Path, monkeypatch):
+    """The BUY audit hook must (a) open an audit row keyed by session_id, and (b) NEVER let
+    audit_inputs ride onto the persisted trade dict (invariant: keep demo_state.json lean)."""
+    import importlib
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    import audit_tracker
+    importlib.reload(audit_tracker)  # bind audit.db to the temp DATA_ROOT
+
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1_000.0)
+    audit_inputs = {
+        "mode": "live", "slug": "s", "epoch": 1, "window_sec": 300, "code_version": "t",
+        "signal_result": None, "policy": {"loss_recovery_multiplier": 1.0},
+        "book": {"ask_u": 0.5, "bid_u": 0.48, "ask_d": 0.5, "bid_d": 0.48},
+        "provenance": {}, "regime": {"vol_bucket": "mid"},
+    }
+    eng.record_live_buy("Up", "tok-A", 10.0, 0.5,
+                        context={"audit_inputs": audit_inputs, "gate": "test"})
+
+    persisted = eng.state.trades[-1]
+    assert "audit_inputs" not in persisted          # (b) not persisted onto the trade
+    sid = persisted["session_id"]
+    row = audit_tracker.get_audit(sid)
+    assert row is not None                            # (a) audit row opened
+    assert row["side"] == "Up"
+    assert row["window_sec"] == 300
+    assert row["settlement_status"] == "PENDING"
+
