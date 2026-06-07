@@ -1802,6 +1802,9 @@ export default function App() {
   // read-only מהשרת — מצב ה-tripped הנוכחי + הסיבה
   const [circuitBreakerTripped, setCircuitBreakerTripped] = useState(false);
   const [circuitBreakerReason, setCircuitBreakerReason] = useState("");
+  // מצב החלטה — מי בוחר את הצד: ידני (צד-זול/FLW) / הצעה (הסיגנל מציע, המשתמש מאשר) / אוטונומי (הסיגנל מחליט לבד)
+  const [decisionMode, setDecisionMode] = useState<"manual" | "suggest" | "auto">("manual");
+  const [decisionMinConfidence, setDecisionMinConfidence] = useState(60);
   /** ביצוע: "limit" = GTC קלאסי (תאימות לאחור); "market" = FOK לכניסה, FAK+retry ליציאה */
   const [orderMode, setOrderMode] = useState<"limit" | "market">("limit");
   const [entrySlippagePct, setEntrySlippagePct] = useState(2);
@@ -2005,6 +2008,9 @@ export default function App() {
         if (typeof c.circuit_breaker_max_consecutive_losses === "number") setCircuitBreakerMaxConsecutiveLosses(c.circuit_breaker_max_consecutive_losses);
         if (typeof c.circuit_breaker_halt_at_cap === "boolean") setCircuitBreakerHaltAtCap(c.circuit_breaker_halt_at_cap);
         if (typeof c.circuit_breaker_equity_floor_pct === "number") setCircuitBreakerEquityFloorPct(c.circuit_breaker_equity_floor_pct);
+        const dm = c.decision_mode;
+        if (dm === "manual" || dm === "suggest" || dm === "auto") setDecisionMode(dm);
+        if (typeof c.decision_min_confidence === "number") setDecisionMinConfidence(c.decision_min_confidence);
         if (typeof c.floor_stop_pct === "number") setFloorStopPct(c.floor_stop_pct);
         if (c.order_mode === "limit" || c.order_mode === "market") setOrderMode(c.order_mode);
         if (typeof c.entry_slippage_pct === "number") setEntrySlippagePct(c.entry_slippage_pct);
@@ -2217,6 +2223,8 @@ export default function App() {
           circuit_breaker_max_consecutive_losses: Math.max(0, Math.floor(circuitBreakerMaxConsecutiveLosses)),
           circuit_breaker_halt_at_cap: circuitBreakerHaltAtCap,
           circuit_breaker_equity_floor_pct: Math.max(0, Math.min(100, circuitBreakerEquityFloorPct)),
+          decision_mode: decisionMode,
+          decision_min_confidence: Math.max(50, Math.min(100, decisionMinConfidence)),
           floor_stop_pct: Math.max(0, Math.min(100, floorStopPct)),
           order_mode: orderMode,
           entry_slippage_pct: Math.max(0, entrySlippagePct),
@@ -2268,6 +2276,7 @@ export default function App() {
       nearEntryPct, nearTpPct, dcaTpOverridePct, bookLogIntervalSec,
       lossRecoveryEnabled, lossRecoveryStepPct, lossRecoveryEveryN, lossRecoveryMaxMult,
       circuitBreakerEnabled, circuitBreakerMaxConsecutiveLosses, circuitBreakerHaltAtCap, circuitBreakerEquityFloorPct,
+      decisionMode, decisionMinConfidence,
       floorStopPct,
       orderMode, entrySlippagePct, marketMaxEntryPriceCents, exitSlippagePct, peakWatchdogEnabled, peakRetreatExitPct,
       retryMaxAttempts, holdToResolutionEnabled, holdToResolutionMinDcaSlices,
@@ -4011,6 +4020,65 @@ export default function App() {
                   style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}
                 />
               </label>
+            </div>
+            <div
+              style={{
+                marginTop: 14,
+                paddingTop: 14,
+                borderTop: "1px dashed #263244",
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>🤖 מצב החלטה — מי בוחר את הצד</div>
+              <label>
+                מצב החלטה
+                <select
+                  value={decisionMode}
+                  onChange={(e) => {
+                    setDecisionMode(e.target.value as "manual" | "suggest" | "auto");
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", marginTop: 6, marginBottom: 10, padding: 8 }}
+                >
+                  <option value="manual">ידני (צד-זול, ברירת מחדל)</option>
+                  <option value="suggest">הצעה — הסיגנל מציע, אני מאשר</option>
+                  <option value="auto">אוטונומי — הסיגנל מחליט לבד</option>
+                </select>
+              </label>
+              <label>
+                סף ביטחון מינימלי לפעולה לפי הסיגנל (%)
+                <input
+                  type="number"
+                  step="1"
+                  min={50}
+                  max={100}
+                  value={decisionMinConfidence}
+                  onChange={(e) => {
+                    setDecisionMinConfidence(Math.max(50, Math.min(100, Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}
+                />
+              </label>
+              <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.55 }}>
+                ידני = כמו היום. הצעה/אוטונומי נותנים לסיגנל לבחור צד מעל סף הביטחון. ⚠️ מומלץ להשאיר 'ידני' עד שיוכח יתרון אמיתי לסיגנל — אחרת הבוט יסחור לפי ניחוש.
+              </div>
+              {decisionMode !== "manual" && (
+                <div
+                  style={{
+                    marginTop: 10,
+                    padding: "6px 10px",
+                    borderRadius: "var(--radius-sm)",
+                    background: "rgba(245, 158, 11, 0.12)",
+                    border: "1px solid rgba(245, 158, 11, 0.4)",
+                    color: "#f59e0b",
+                    fontSize: 12,
+                    fontWeight: 600,
+                  }}
+                >
+                  ⚠️ מסחר מונחה-סיגנל פעיל — הסיגנל בוחר את הצד ({decisionMode === "auto" ? "אוטונומי" : "הצעה"}).
+                </div>
+              )}
             </div>
             <div style={{ color: "var(--muted)", fontSize: 12 }}>
               ההגבלות כאן לא מחליפות Stop Loss — הן רק מונעות מהבוט לרוץ בצורה לא מבוקרת.
