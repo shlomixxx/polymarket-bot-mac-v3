@@ -431,6 +431,9 @@ def _save_persisted_config() -> None:
             "follow_last_winner_lookback": int(getattr(c, "follow_last_winner_lookback", 1)),
             "follow_last_winner_mode": str(getattr(c, "follow_last_winner_mode", "forward")),
             "follow_last_winner_min_btc_drift_pct": float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0)),
+            # Decision-mode (opt-in: let the signal pick the side) — MUST persist or it reverts to manual on restart.
+            "decision_mode": str(getattr(c, "decision_mode", "manual")),
+            "decision_min_confidence": float(getattr(c, "decision_min_confidence", 60.0)),
             # Circuit-breaker (opt-in safety brake) — MUST persist or it silently reverts to OFF on restart.
             "circuit_breaker_enabled": bool(getattr(c, "circuit_breaker_enabled", False)),
             "circuit_breaker_max_consecutive_losses": int(getattr(c, "circuit_breaker_max_consecutive_losses", 0)),
@@ -1488,6 +1491,8 @@ class ConfigBody(BaseModel):
     circuit_breaker_halt_at_cap: bool = False
     circuit_breaker_equity_floor_pct: float = 0.0
     floor_stop_pct: float = 0.0
+    decision_mode: str = "manual"
+    decision_min_confidence: float = 60.0
 
 
 @app.post("/api/strategy/config")
@@ -1537,6 +1542,10 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "circuit_breaker_equity_floor_pct must be between 0 and 100")
     if float(body.floor_stop_pct) < 0 or float(body.floor_stop_pct) > 100:
         raise HTTPException(400, "floor_stop_pct must be between 0 and 100")
+    if body.decision_mode not in ("manual", "suggest", "auto"):
+        raise HTTPException(400, "decision_mode must be 'manual', 'suggest' or 'auto'")
+    # decision_min_confidence: signal confidence_pct is 50–100 → clamp into that range.
+    body.decision_min_confidence = max(50.0, min(100.0, float(body.decision_min_confidence)))
     c = runner.rt.config
     for k, v in body.model_dump().items():
         if hasattr(c, k):
@@ -1615,6 +1624,8 @@ async def get_strategy_config():
         "follow_last_winner_lookback": int(getattr(c, "follow_last_winner_lookback", 1)),
         "follow_last_winner_mode": str(getattr(c, "follow_last_winner_mode", "forward")),
         "follow_last_winner_min_btc_drift_pct": float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0)),
+        "decision_mode": str(getattr(c, "decision_mode", "manual")),
+        "decision_min_confidence": float(getattr(c, "decision_min_confidence", 60.0)),
         "mode": runner.rt.mode,
         "last_status": runner.rt.last_status,
         # מפתח אחרון מ-status() — נוח למיפוי אנגלי בדף שידור/OBS

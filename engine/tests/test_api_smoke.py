@@ -68,6 +68,56 @@ def test_strategy_config_roundtrip(client: TestClient):
     assert isinstance(j.get("ui_runtime_equity_baseline_usd"), (int, float))
 
 
+def test_decision_mode_config_default_settable_persisted(client: TestClient, tmp_path, monkeypatch):
+    """decision_mode: default 'manual' over GET, settable via POST, validated, clamped,
+    and PERSISTED to config_persisted.json (loader restores it generically)."""
+    import json
+    import main as engine_main
+
+    # Redirect persisted-config path so we don't touch the real one.
+    monkeypatch.setattr(engine_main, "CONFIG_PERSISTED_PATH", tmp_path / "config_persisted.json")
+
+    # Default over GET = manual / 60.
+    j = client.get("/api/strategy/config").json()
+    assert j["decision_mode"] == "manual"
+    assert j["decision_min_confidence"] == 60.0
+
+    base = {
+        "investment_usd": 5.0, "entry_price_cents": 30, "min_contracts": 5,
+        "take_profit_pct": 12.0, "min_minutes_for_entry": 3, "freeze_last_minutes": 1,
+        "side_preference": "signal", "btc_window": "5m",
+    }
+
+    # Invalid decision_mode → 400.
+    bad = {**base, "decision_mode": "bogus"}
+    assert client.post("/api/strategy/config", json=bad).status_code == 400
+
+    # Valid set + confidence clamped from 120 → 100.
+    ok = {**base, "decision_mode": "auto", "decision_min_confidence": 120.0}
+    r = client.post("/api/strategy/config", json=ok)
+    assert r.status_code == 200
+    j = client.get("/api/strategy/config").json()
+    assert j["decision_mode"] == "auto"
+    assert j["decision_min_confidence"] == 100.0  # clamped to 100
+
+    # confidence clamped UP from 10 → 50.
+    r = client.post("/api/strategy/config", json={**base, "decision_mode": "suggest",
+                                                  "decision_min_confidence": 10.0})
+    assert r.status_code == 200
+    j = client.get("/api/strategy/config").json()
+    assert j["decision_mode"] == "suggest"
+    assert j["decision_min_confidence"] == 50.0
+
+    # Persisted to disk.
+    persisted = json.loads((tmp_path / "config_persisted.json").read_text(encoding="utf-8"))
+    assert persisted["decision_mode"] == "suggest"
+    assert persisted["decision_min_confidence"] == 50.0
+
+    # Restore the shared singleton config so we don't contaminate other tests.
+    engine_main.runner.rt.config.decision_mode = "manual"
+    engine_main.runner.rt.config.decision_min_confidence = 60.0
+
+
 def test_strategy_config_clamps_min_contracts_to_market_floor(client: TestClient, monkeypatch):
     """אחרי שמירה — min_contracts לא נשאר מתחת למינימום השוק (מ־discover)."""
     import main as engine_main

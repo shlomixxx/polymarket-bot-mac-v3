@@ -127,6 +127,14 @@ class StrategyConfig:
     # 0 = off; e.g. 70 = exit when unrealized <= -70%. Always fires (it's a stop-loss), even
     # when take-profit is gated by DCA-lock / hold-to-resolution.
     floor_stop_pct: float = 0.0
+    # Decision-mode — OPT-IN, DEFAULT "manual" (no behavior change). Controls WHO picks the
+    # entry side. "manual": current behavior (FLW → side_preference → cheaper-ask). "suggest":
+    # the SIGNAL picks the side and the entry is routed to pending_approval for the user to
+    # approve. "auto": the SIGNAL picks the side and the bot enters automatically. In
+    # suggest/auto a no-conviction signal (neutral / below decision_min_confidence) SKIPS the
+    # window — it never falls back to cheaper-ask.
+    decision_mode: Literal["manual", "suggest", "auto"] = "manual"
+    decision_min_confidence: float = 60.0   # in suggest/auto, only act on signal recommendation at/above this confidence_pct
 
 
 @dataclass
@@ -1969,6 +1977,24 @@ class StrategyRunner:
                 self.rt.status(msg, key="intermediate", session_id=sid)
                 return
 
+        # ── Decision-mode: let the SIGNAL pick the side (opt-in). Default "manual" skips this
+        # entirely (cheaper-ask below). In suggest/auto, only act on a confident recommendation;
+        # otherwise SKIP the window (don't trade a no-conviction signal). ──
+        _sig_decided_side = None
+        _sig_rec = ""
+        _sig_conf = 0.0
+        if cfg.decision_mode != "manual" and not (pos_u or pos_d):
+            _sig = self.rt._last_signal_result or {}
+            _sig_rec = (_sig.get("recommendation") or "").strip()
+            _sig_conf = float(_sig.get("confidence_pct") or 0.0)
+            if _sig_rec in ("Up", "Down") and _sig_conf >= float(getattr(cfg, "decision_min_confidence", 60.0) or 60.0):
+                _sig_decided_side = _sig_rec
+            else:
+                self.rt.status(
+                    f"מצב-החלטה {cfg.decision_mode}: הסיגנל לא מספיק בטוח ({_sig_rec or 'neutral'} {_sig_conf:.0f}%) — מדלגים על החלון",
+                    key="decision_mode_skip")
+                return
+
         # Follow Last Winner (FLW): מעקף את side_preference אם פעיל ויש history.
         # אם DCA רץ ויש כבר פוזיציה — נוותר ונמשיך עם הצד הקיים (לא לקטוע סלייסים).
         flw_side: Optional[str] = None
@@ -1993,7 +2019,17 @@ class StrategyRunner:
                     "mode": str(getattr(cfg, "follow_last_winner_mode", "forward")),
                     "ts": time.time(),
                 }
-        if flw_side == "Up":
+        if _sig_decided_side == "Up":
+            if ask_u is None:
+                self.rt.status("סטטוס: Ask חסר ל-Up (מצב-החלטה) — לא ניתן להיכנס", key="book_missing_entry_up")
+                return
+            side, token, ask = "Up", token_up, ask_u
+        elif _sig_decided_side == "Down":
+            if ask_d is None:
+                self.rt.status("סטטוס: Ask חסר ל-Down (מצב-החלטה) — לא ניתן להיכנס", key="book_missing_entry_down")
+                return
+            side, token, ask = "Down", token_down, ask_d
+        elif flw_side == "Up":
             if ask_u is None:
                 self.rt.status("סטטוס: Ask חסר ל-Up (FLW) — לא ניתן להיכנס", key="book_missing_entry_up")
                 return
@@ -2290,7 +2326,17 @@ class StrategyRunner:
             entry_ctx["flw_mode"] = flw_dec.get("mode")
             # מאפסים אחרי שימוש כדי לא לסמן שוב אם כניסה זו נדחית/חוזרת
             self.rt._last_flw_decision = None
-        if mode == "semi":
+        # Decision-mode: record WHY the side was chosen by the signal (audit ledger).
+        if _sig_decided_side is not None:
+            entry_ctx["decision_mode"] = cfg.decision_mode
+            entry_ctx["decision_signal_rec"] = _sig_rec
+            entry_ctx["decision_signal_confidence_pct"] = _sig_conf
+        # Suggest decision-mode routes the entry through the EXISTING pending_approval gate
+        # (the same one semi-mode uses), so the user approves/rejects each signal-driven entry
+        # via the /pending UI — REGARDLESS of the run mode. "auto" decision-mode still enters
+        # automatically unless the run mode is itself "semi".
+        wants_approval = (mode == "semi") or (cfg.decision_mode == "suggest" and _sig_decided_side is not None)
+        if wants_approval:
             if not self.rt.pending_approval:
                 self.rt.pending_approval = {
                     "action": "buy",
