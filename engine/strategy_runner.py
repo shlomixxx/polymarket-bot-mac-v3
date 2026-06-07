@@ -1753,8 +1753,14 @@ class StrategyRunner:
                         self.rt._peak_state.pop(p.token_id, None)
                         self.rt._tp_sell_cooldown_until.pop(p.token_id, None)
                         if cfg.loss_recovery_enabled:
-                            self.demo.state.loss_recovery_streak = 0
-                            self.demo.state.loss_recovery_multiplier = 1.0
+                            _exit_rp = (r.get("trade") or {}).get("realized_pnl")
+                            if _exit_rp is not None and float(_exit_rp) >= 0:
+                                self.demo.state.loss_recovery_streak = 0
+                                self.demo.state.loss_recovery_multiplier = 1.0
+                            else:
+                                # a loss-exit (floor-stop / peak-retreat into loss) counts
+                                # as a loss, not a win — keep building the recovery streak.
+                                self.demo.state.loss_recovery_streak += 1
                             self.demo.save()
                     tr = r.get("trade") or {}
                     price = tr.get("price")

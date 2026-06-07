@@ -1231,7 +1231,7 @@ class DemoEngine:
             "contracts": sold,
             "price": bid,
             "fee_est": FEE_RATE * bid * sold,
-            "type": "SELL_TP",
+            "type": ("SELL_STOP" if realized < 0 else "SELL_TP"),
             "token_id": token_id,
             "realized_pnl": realized,
             "leg_cost": leg_cost,
@@ -1296,8 +1296,10 @@ class DemoEngine:
                 if trade.get("session_id"):
                     audit_tracker.finalize_row(str(trade["session_id"]), {
                         "type": trade.get("type"),
-                        "exit_type": ("TP" if trade.get("type") == "SELL_TP" else
-                                      ("voided" if trade.get("voided") else "settle")),
+                        "exit_type": ("TP" if trade.get("type") == "SELL_TP"
+                                      else "stop" if trade.get("type") == "SELL_STOP"
+                                      else "voided" if trade.get("voided")
+                                      else "settle"),
                         "realized_pnl": trade.get("realized_pnl"),
                         "realized_pct": (round(100.0 * trade["realized_pnl"] /
                                                max(1e-9, trade.get("leg_cost") or 0), 4)
@@ -1365,7 +1367,7 @@ class DemoEngine:
             "contracts": p.contracts,
             "price": bid,
             "fee_est": FEE_RATE * bid * p.contracts,
-            "type": "SELL_TP",
+            "type": ("SELL_STOP" if realized < 0 else "SELL_TP"),
             "token_id": token_id,
             "realized_pnl": realized,
             "leg_cost": leg_cost,
@@ -1412,8 +1414,10 @@ class DemoEngine:
             if trade.get("session_id"):
                 audit_tracker.finalize_row(str(trade["session_id"]), {
                     "type": trade.get("type"),
-                    "exit_type": ("TP" if trade.get("type") == "SELL_TP" else
-                                  ("voided" if trade.get("voided") else "settle")),
+                    "exit_type": ("TP" if trade.get("type") == "SELL_TP"
+                                  else "stop" if trade.get("type") == "SELL_STOP"
+                                  else "voided" if trade.get("voided")
+                                  else "settle"),
                     "realized_pnl": trade.get("realized_pnl"),
                     "realized_pct": (round(100.0 * trade["realized_pnl"] /
                                            max(1e-9, trade.get("leg_cost") or 0), 4)
@@ -1442,8 +1446,10 @@ class DemoEngine:
             if trade.get("session_id"):
                 audit_tracker.finalize_row(str(trade["session_id"]), {
                     "type": trade.get("type"),
-                    "exit_type": ("TP" if trade.get("type") == "SELL_TP" else
-                                  ("voided" if trade.get("voided") else "settle")),
+                    "exit_type": ("TP" if trade.get("type") == "SELL_TP"
+                                  else "stop" if trade.get("type") == "SELL_STOP"
+                                  else "voided" if trade.get("voided")
+                                  else "settle"),
                     "realized_pnl": trade.get("realized_pnl"),
                     "realized_pct": (round(100.0 * trade["realized_pnl"] /
                                            max(1e-9, trade.get("leg_cost") or 0), 4)
