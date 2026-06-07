@@ -260,6 +260,7 @@ export default function AuditTab() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [downloading, setDownloading] = useState(false);
 
   const [fMode, setFMode] = useState<"all" | "demo" | "live">("all");
   const [fWindow, setFWindow] = useState<"all" | "300" | "900">("all");
@@ -288,6 +289,25 @@ export default function AuditTab() {
       setLessons(null);
     }
   }, [fMode, fWindow, fStatus]);
+
+  // ⬇ הורד JSON — מוריד את כל ה-audit.db המלא (GET /api/audit/export) כקובץ JSON.
+  const downloadExport = async () => {
+    setDownloading(true);
+    try {
+      const res = await api<{ rows: unknown[] }>("/api/audit/export", { timeoutMs: 60_000 });
+      const blob = new Blob([JSON.stringify(res.rows ?? [], null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `audit-export-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert("הורדה נכשלה: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   useEffect(() => {
     void refresh();
@@ -334,8 +354,14 @@ export default function AuditTab() {
           <p style={{ margin: "4px 0 0", color: "var(--muted, #94a3b8)", fontSize: 13 }}>
             כל עסקה מתועדת כאן — למה נכנסנו, מה קרה, ומה היה אפשר טוב יותר. הבסיס שה-AI ילמד ממנו.
           </p>
+          <p style={{ margin: "4px 0 0", color: "var(--muted, #94a3b8)", fontSize: 12 }}>
+            הנתונים נשמרים ב-audit.db (נפח /data בשרת). ניתן להוריד הכל כאן או דרך /api/audit/export.
+          </p>
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          <button type="button" onClick={() => void downloadExport()} disabled={downloading} style={btnStyle()}>
+            {downloading ? "מוריד…" : "⬇ הורד JSON"}
+          </button>
           <button type="button" onClick={() => void refresh()} style={btnStyle()}>
             {loading ? "מרענן…" : "↻ רענן"}
           </button>
