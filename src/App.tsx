@@ -1792,6 +1792,14 @@ export default function App() {
   const [lossRecoveryStepPct, setLossRecoveryStepPct] = useState(20);
   const [lossRecoveryEveryN, setLossRecoveryEveryN] = useState(1);
   const [lossRecoveryMaxMult, setLossRecoveryMaxMult] = useState(10);
+  // מפסק בטיחות (circuit-breaker) — חוסם כניסות חדשות כשמצב סיכון מתקיים
+  const [circuitBreakerEnabled, setCircuitBreakerEnabled] = useState(false);
+  const [circuitBreakerMaxConsecutiveLosses, setCircuitBreakerMaxConsecutiveLosses] = useState(0);
+  const [circuitBreakerHaltAtCap, setCircuitBreakerHaltAtCap] = useState(false);
+  const [circuitBreakerEquityFloorPct, setCircuitBreakerEquityFloorPct] = useState(0);
+  // read-only מהשרת — מצב ה-tripped הנוכחי + הסיבה
+  const [circuitBreakerTripped, setCircuitBreakerTripped] = useState(false);
+  const [circuitBreakerReason, setCircuitBreakerReason] = useState("");
   /** ביצוע: "limit" = GTC קלאסי (תאימות לאחור); "market" = FOK לכניסה, FAK+retry ליציאה */
   const [orderMode, setOrderMode] = useState<"limit" | "market">("limit");
   const [entrySlippagePct, setEntrySlippagePct] = useState(2);
@@ -1947,6 +1955,9 @@ export default function App() {
         const lr = cfg as Record<string, unknown>;
         if (typeof lr.loss_recovery_streak === "number") setLossRecoveryStreak(lr.loss_recovery_streak);
         if (typeof lr.loss_recovery_multiplier === "number") setLossRecoveryMultLive(lr.loss_recovery_multiplier);
+        // read-only — תמיד מסונכרן מהשרת (גם בזמן עריכה), כדי שהבאנר ישקף את המצב האמיתי
+        if (typeof lr.circuit_breaker_tripped === "boolean") setCircuitBreakerTripped(lr.circuit_breaker_tripped);
+        if (typeof lr.circuit_breaker_reason === "string") setCircuitBreakerReason(lr.circuit_breaker_reason);
       }
       // חשוב: יש רענון כל שנייה. לא נדרוס ערכים שהמשתמש עורך לפני "שמור".
       // כשאין עריכה פתוחה — מסנכרנים את כל ההגדרות מהשרת (אחרת אחרי F5 חוזרים לברירות מחדל מקומיות).
@@ -1988,6 +1999,10 @@ export default function App() {
         if (typeof c.loss_recovery_step_pct === "number") setLossRecoveryStepPct(c.loss_recovery_step_pct);
         if (typeof c.loss_recovery_every_n_losses === "number") setLossRecoveryEveryN(c.loss_recovery_every_n_losses);
         if (typeof c.loss_recovery_max_multiplier === "number") setLossRecoveryMaxMult(c.loss_recovery_max_multiplier);
+        if (typeof c.circuit_breaker_enabled === "boolean") setCircuitBreakerEnabled(c.circuit_breaker_enabled);
+        if (typeof c.circuit_breaker_max_consecutive_losses === "number") setCircuitBreakerMaxConsecutiveLosses(c.circuit_breaker_max_consecutive_losses);
+        if (typeof c.circuit_breaker_halt_at_cap === "boolean") setCircuitBreakerHaltAtCap(c.circuit_breaker_halt_at_cap);
+        if (typeof c.circuit_breaker_equity_floor_pct === "number") setCircuitBreakerEquityFloorPct(c.circuit_breaker_equity_floor_pct);
         if (c.order_mode === "limit" || c.order_mode === "market") setOrderMode(c.order_mode);
         if (typeof c.entry_slippage_pct === "number") setEntrySlippagePct(c.entry_slippage_pct);
         if (typeof c.market_max_entry_price_cents === "number") setMarketMaxEntryPriceCents(c.market_max_entry_price_cents);
@@ -2195,6 +2210,10 @@ export default function App() {
           loss_recovery_step_pct: lossRecoveryStepPct,
           loss_recovery_every_n_losses: Math.max(1, Math.floor(lossRecoveryEveryN)),
           loss_recovery_max_multiplier: Math.max(1, lossRecoveryMaxMult),
+          circuit_breaker_enabled: circuitBreakerEnabled,
+          circuit_breaker_max_consecutive_losses: Math.max(0, Math.floor(circuitBreakerMaxConsecutiveLosses)),
+          circuit_breaker_halt_at_cap: circuitBreakerHaltAtCap,
+          circuit_breaker_equity_floor_pct: Math.max(0, Math.min(100, circuitBreakerEquityFloorPct)),
           order_mode: orderMode,
           entry_slippage_pct: Math.max(0, entrySlippagePct),
           market_max_entry_price_cents: Math.max(0, Math.min(100, marketMaxEntryPriceCents)),
@@ -2244,6 +2263,7 @@ export default function App() {
       autoReenter, reenterCooldown, maxEntriesPerWindow, maxNotionalPerWindow, maxTradesPerHour,
       nearEntryPct, nearTpPct, dcaTpOverridePct, bookLogIntervalSec,
       lossRecoveryEnabled, lossRecoveryStepPct, lossRecoveryEveryN, lossRecoveryMaxMult,
+      circuitBreakerEnabled, circuitBreakerMaxConsecutiveLosses, circuitBreakerHaltAtCap, circuitBreakerEquityFloorPct,
       orderMode, entrySlippagePct, marketMaxEntryPriceCents, exitSlippagePct, peakWatchdogEnabled, peakRetreatExitPct,
       retryMaxAttempts, holdToResolutionEnabled, holdToResolutionMinDcaSlices,
       holdToResolutionMinPrice, holdToResolutionStopLoss,
@@ -3166,6 +3186,16 @@ export default function App() {
         <Card padding="lg">
           <SectionTitle as="h2">הגדרות אסטרטגיה</SectionTitle>
 
+          {circuitBreakerTripped && (
+            <div
+              className="alert-error"
+              role="alert"
+              style={{ marginBottom: 12, padding: 12, lineHeight: 1.5, fontWeight: 600 }}
+            >
+              🛑 מפסק הבטיחות פעיל — כניסות חדשות חסומות. סיבה: {circuitBreakerReason}
+            </div>
+          )}
+
           <div style={{ marginBottom: 16 }}>
             <strong>פריסטים:</strong>
             {Object.entries(PRESETS).map(([k, v]) => (
@@ -3897,6 +3927,70 @@ export default function App() {
               <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.55 }}>
                 חל על לולאת האסטרטגיה הראשית בלבד (לא Trigger Trader). סיכון מוגבר ליתרה — השתמש בתקרה וביתרה מתאימה.
               </div>
+            </div>
+            <div
+              style={{
+                marginTop: 14,
+                paddingTop: 14,
+                borderTop: "1px dashed #263244",
+                marginBottom: 12,
+              }}
+            >
+              <div style={{ fontWeight: 700, marginBottom: 8 }}>🛑 מפסק בטיחות (Circuit-breaker)</div>
+              <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 10px", lineHeight: 1.55 }}>
+                אופציונלי, כבוי כברירת-מחדל. חוסם כניסות חדשות כשמצב סיכון מתקיים; פוזיציות פתוחות עדיין יוצאות רגיל.
+              </p>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                <input
+                  type="checkbox"
+                  checked={circuitBreakerEnabled}
+                  onChange={(e) => {
+                    setCircuitBreakerEnabled(e.target.checked);
+                    markCfgDirty();
+                  }}
+                />
+                🛑 מפסק בטיחות (Circuit-breaker)
+              </label>
+              <label>
+                עצור אחרי N הפסדים רצופים (0=כבוי)
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  value={circuitBreakerMaxConsecutiveLosses}
+                  onChange={(e) => {
+                    setCircuitBreakerMaxConsecutiveLosses(Math.max(0, Math.floor(Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
+                />
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                <input
+                  type="checkbox"
+                  checked={circuitBreakerHaltAtCap}
+                  onChange={(e) => {
+                    setCircuitBreakerHaltAtCap(e.target.checked);
+                    markCfgDirty();
+                  }}
+                />
+                עצור כשהמכפיל מגיע לתקרה
+              </label>
+              <label>
+                עצור אם ההון יורד מתחת ל-% מהבסיס (0=כבוי)
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  max={100}
+                  value={circuitBreakerEquityFloorPct}
+                  onChange={(e) => {
+                    setCircuitBreakerEquityFloorPct(Math.max(0, Math.min(100, Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}
+                />
+              </label>
             </div>
             <div style={{ color: "var(--muted)", fontSize: 12 }}>
               ההגבלות כאן לא מחליפות Stop Loss — הן רק מונעות מהבוט לרוץ בצורה לא מבוקרת.
