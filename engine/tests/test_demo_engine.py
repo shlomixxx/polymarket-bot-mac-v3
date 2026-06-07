@@ -171,11 +171,12 @@ def test_audit_buy_hook_creates_row_and_excludes_audit_inputs(tmp_path: Path, mo
 def test_settlement_pnl_if_held_pure_arithmetic():
     """Recording-only counterfactual: payoff (=contracts if side==resolved, else 0) minus stake."""
     from demo_engine import _settlement_pnl_if_held
-    # winning side held to resolution: 10 contracts -> $10 payoff, minus a $4.008 stake
+    # winning side held to resolution: 10 contracts -> 10*(1-FEE) payoff (fee netted like a real
+    # win, so it's comparable to realized_pnl), minus the stake
     leg = 0.4 * 10.0 * (1 + FEE_RATE)
     won = _settlement_pnl_if_held(
         {"side": "Up", "contracts": 10.0, "leg_cost": leg, "resolved_outcome": "Up"})
-    assert won == pytest.approx(10.0 - leg)
+    assert won == pytest.approx(round(10.0 * (1 - FEE_RATE) - leg, 4))
     # losing side held to resolution: $0 payoff, lose the whole stake
     lost = _settlement_pnl_if_held(
         {"side": "Down", "contracts": 10.0, "leg_cost": leg, "resolved_outcome": "Up"})
@@ -227,6 +228,6 @@ async def test_settle_finalize_records_pnl_if_held(tmp_path: Path, monkeypatch):
     row = audit_tracker.get_audit(sid)
     assert row is not None
     leg = 0.4 * 10.0 * (1 + FEE_RATE)
-    # winning Down side held to resolution -> $10 payoff minus stake
-    assert row["cf_exit_variants"]["pnl_if_held_to_resolution"] == pytest.approx(10.0 - leg)
+    # winning Down side held to resolution -> 10*(1-FEE) payoff (fee netted) minus stake
+    assert row["cf_exit_variants"]["pnl_if_held_to_resolution"] == pytest.approx(round(10.0 * (1 - FEE_RATE) - leg, 4))
 

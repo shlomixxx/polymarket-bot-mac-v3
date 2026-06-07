@@ -264,8 +264,10 @@ def _settlement_pnl_if_held(trade: dict[str, Any]) -> Optional[float]:
     if resolved_outcome not in ("Up", "Down") or leg_cost is None or contracts is None:
         return None
     try:
-        payoff = float(contracts) if (resolved_outcome and side == resolved_outcome) else 0.0
-        return payoff - float(leg_cost)
+        # Net the same fee the engine books on a real win (proceeds = contracts*(1-FEE_RATE)),
+        # so this counterfactual is directly comparable to realized_pnl on a held-to-win settle.
+        payoff = float(contracts) * (1.0 - FEE_RATE) if (resolved_outcome and side == resolved_outcome) else 0.0
+        return round(payoff - float(leg_cost), 4)
     except (TypeError, ValueError):
         return None
 
