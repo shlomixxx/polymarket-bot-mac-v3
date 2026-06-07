@@ -65,6 +65,33 @@ def test_lesson_tag_classifies():
     assert ad.lesson_tag(status="VOID", exit_eff=None, signal_correct=None, conflict=False) == "void_no_signal"
 
 
+def test_rule_flags_against_recommendation_and_neutral():
+    # entered Down while the headline recommendation was Up -> against_recommendation
+    snap_against = {"side": "Down", "signal": {"recommendation": "Up"}}
+    rf = ad.rule_flags(snap_against, {})
+    assert rf["against_recommendation"] is True
+    assert rf["entered_on_neutral"] is False
+
+    # entered the same side the recommendation pointed to -> not against
+    snap_aligned = {"side": "Up", "signal": {"recommendation": "Up"}}
+    rf2 = ad.rule_flags(snap_aligned, {})
+    assert rf2["against_recommendation"] is False
+    assert rf2["entered_on_neutral"] is False
+
+    # neutral recommendation -> entered_on_neutral, never "against"
+    snap_neutral = {"side": "Up", "signal": {"recommendation": "neutral"}}
+    rf3 = ad.rule_flags(snap_neutral, {})
+    assert rf3["against_recommendation"] is False
+    assert rf3["entered_on_neutral"] is True
+
+    # missing recommendation -> both honest flags False (no signal to be against)
+    rf4 = ad.rule_flags({"side": "Up", "signal": {}}, {})
+    assert rf4["against_recommendation"] is False
+    assert rf4["entered_on_neutral"] is False
+    # the legacy component-majority flag is still present
+    assert "against_signal" in rf4
+
+
 def test_derive_learning_fields_end_to_end():
     snapshot = {
         "side": "Up", "execution": {"contracts": 40.0, "avg_fill_price": 0.52},

@@ -1,6 +1,24 @@
 import audit_snapshot as asnap
 
 
+def test_get_git_sha_prefers_railway_env(monkeypatch):
+    # Prod (/data) has no .git, so prefer Railway's injected commit SHA, truncated to 12.
+    monkeypatch.setattr(asnap, "_GIT_SHA", None)
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "0123456789abcdefdeadbeef")
+    assert asnap.get_git_sha() == "0123456789ab"
+    # memoized: a later env change doesn't re-read
+    monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "ffffffffffffffff")
+    assert asnap.get_git_sha() == "0123456789ab"
+
+
+def test_get_git_sha_falls_back_to_git_when_no_railway_env(monkeypatch):
+    # No Railway env -> use the local git subprocess path (returns a str, possibly "").
+    monkeypatch.setattr(asnap, "_GIT_SHA", None)
+    monkeypatch.delenv("RAILWAY_GIT_COMMIT_SHA", raising=False)
+    out = asnap.get_git_sha()
+    assert isinstance(out, str)
+
+
 def test_build_decision_snapshot_shape():
     snap = asnap.build_decision_snapshot(
         mode="demo", side="Up", slug="btc-updown-5m-123", epoch=123, window_sec=300,

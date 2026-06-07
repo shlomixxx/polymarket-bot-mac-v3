@@ -251,6 +251,25 @@ def _trim_settled_path(tr: dict) -> list:
     )
 
 
+def _settlement_pnl_if_held(trade: dict[str, Any]) -> Optional[float]:
+    """Recording-only counterfactual for the audit ledger: what the position would have netted
+    if held to the $1/$0 binary resolution (payoff − stake), regardless of how it actually
+    exited. Pure arithmetic from the trade dict. Returns None when the window didn't resolve
+    Up/Down (e.g. a TP/stop early exit, where resolved_outcome is absent) or leg_cost is unknown.
+    """
+    resolved_outcome = trade.get("resolved_outcome")
+    leg_cost = trade.get("leg_cost")
+    side = trade.get("side")
+    contracts = trade.get("contracts")
+    if resolved_outcome not in ("Up", "Down") or leg_cost is None or contracts is None:
+        return None
+    try:
+        payoff = float(contracts) if (resolved_outcome and side == resolved_outcome) else 0.0
+        return payoff - float(leg_cost)
+    except (TypeError, ValueError):
+        return None
+
+
 # תנודתיות גבוהה בין טיקי mark_to_market מלאים → חלון דגימה אגרסיבית (יותר קריאות CLOB + צפוף path)
 VOLATILE_TICK_DELTA_PCT = 4.0
 VOLATILE_WINDOW_SEC = 14.0
@@ -965,11 +984,12 @@ class DemoEngine:
             _inp = (context or {}).get("audit_inputs")
             if _inp and trade.get("session_id"):
                 _inp = dict(_inp)
+                _btc_spot = _inp.get("btc_spot_at_entry")  # stamped by strategy_runner from the cached TA
                 for _k in ("side", "decision_ts_ms", "btc_spot_at_entry", "execution"):
                     _inp.pop(_k, None)
                 _snap = audit_snapshot.build_decision_snapshot(
                     side=trade.get("side"),
-                    decision_ts_ms=int(_t.time() * 1000), btc_spot_at_entry=None,
+                    decision_ts_ms=int(_t.time() * 1000), btc_spot_at_entry=_btc_spot,
                     execution={"avg_fill_price": trade.get("price"),
                                "contracts": trade.get("contracts"),
                                "gate": (context or {}).get("gate"),
@@ -1052,11 +1072,12 @@ class DemoEngine:
             _inp = (context or {}).get("audit_inputs")
             if _inp and trade.get("session_id"):
                 _inp = dict(_inp)
+                _btc_spot = _inp.get("btc_spot_at_entry")  # stamped by strategy_runner from the cached TA
                 for _k in ("side", "decision_ts_ms", "btc_spot_at_entry", "execution"):
                     _inp.pop(_k, None)
                 _snap = audit_snapshot.build_decision_snapshot(
                     side=trade.get("side"),
-                    decision_ts_ms=int(_t.time() * 1000), btc_spot_at_entry=None,
+                    decision_ts_ms=int(_t.time() * 1000), btc_spot_at_entry=_btc_spot,
                     execution={"avg_fill_price": trade.get("price"),
                                "contracts": trade.get("contracts"),
                                "gate": (context or {}).get("gate"),
@@ -1311,6 +1332,7 @@ class DemoEngine:
                         "settlement_btc_start": trade.get("settlement_btc_start"),
                         "settlement_btc_end": trade.get("settlement_btc_end"),
                         "resolved_outcome": trade.get("resolved_outcome"),
+                        "settlement_pnl_if_held": _settlement_pnl_if_held(trade),
                         "voided": trade.get("voided"),
                         "settlement_error": trade.get("settlement_error"),
                         "settled_ts": int(float(trade.get("ts") or _t.time()) * 1000),
@@ -1429,6 +1451,7 @@ class DemoEngine:
                     "settlement_btc_start": trade.get("settlement_btc_start"),
                     "settlement_btc_end": trade.get("settlement_btc_end"),
                     "resolved_outcome": trade.get("resolved_outcome"),
+                    "settlement_pnl_if_held": _settlement_pnl_if_held(trade),
                     "voided": trade.get("voided"),
                     "settlement_error": trade.get("settlement_error"),
                     "settled_ts": int(float(trade.get("ts") or _t.time()) * 1000),
@@ -1461,6 +1484,7 @@ class DemoEngine:
                     "settlement_btc_start": trade.get("settlement_btc_start"),
                     "settlement_btc_end": trade.get("settlement_btc_end"),
                     "resolved_outcome": trade.get("resolved_outcome"),
+                    "settlement_pnl_if_held": _settlement_pnl_if_held(trade),
                     "voided": trade.get("voided"),
                     "settlement_error": trade.get("settlement_error"),
                     "settled_ts": int(float(trade.get("ts") or _t.time()) * 1000),

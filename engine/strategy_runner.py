@@ -1500,11 +1500,25 @@ class StrategyRunner:
         try:
             import audit_snapshot
             _sig_result = getattr(self.rt, "_last_signal_result", None)
+            _ta = (_sig_result or {}).get("sub", {}).get("ta", {}) or {}
+            # vol_bucket from the cached signal's ATR as a % of price (reuses in-memory data,
+            # no network). Cheap recording-only context for a future learner.
+            _atr = _ta.get("atr")
+            _px = _ta.get("current_price")
+            if _atr is not None and _px is not None and float(_px) > 0:
+                _atr_pct = float(_atr) / float(_px) * 100.0
+                _vol_bucket = "low" if _atr_pct < 0.03 else "high" if _atr_pct > 0.08 else "mid"
+            else:
+                _vol_bucket = None
+            # BTC spot at entry, taken from the same cached signal TA (can be ~30s stale — an
+            # approximate spot is far more useful to a learner than NULL).
+            _btc_spot_at_entry = _ta.get("current_price")
             base_ctx["audit_inputs"] = {
                 "mode": ("live" if getattr(self.rt, "live_trading", False) else "demo"),
                 "slug": m.slug, "epoch": int(m.epoch), "window_sec": int(m.window_sec),
                 "code_version": (audit_snapshot.get_git_sha() or "")[:12],
                 "signal_result": _sig_result,
+                "btc_spot_at_entry": _btc_spot_at_entry,
                 "policy": {
                     "order_mode": getattr(cfg, "order_mode", None),
                     "take_profit_pct": getattr(cfg, "take_profit_pct", None),
@@ -1515,8 +1529,9 @@ class StrategyRunner:
                     "loss_recovery_streak": self.demo.state.loss_recovery_streak,
                 },
                 "book": {"ask_u": ask_u, "bid_u": bid_u, "ask_d": ask_d, "bid_d": bid_d},
-                "provenance": {"book_source": "ws", "signals_missing": _sig_result is None},
-                "regime": {"vol_bucket": None, "seconds_remaining_at_entry": sec_left,
+                "provenance": {"book_source": "ws", "signals_missing": _sig_result is None,
+                               "btc_spot_stale": True, "entry_logic": "cheaper_ask"},
+                "regime": {"vol_bucket": _vol_bucket, "seconds_remaining_at_entry": sec_left,
                            "entry_minute_in_window": int((int(m.window_sec) - sec_left) // 60)},
             }
         except Exception as _e:
@@ -2246,8 +2261,11 @@ class StrategyRunner:
                 "limit_price": lim,
             }
         )
+        # Always stamp the effective investment for the audit ledger (it was previously set
+        # only when loss-recovery was on, leaving it None on every row when martingale is off).
+        # Recording-only — does not affect sizing (n was already computed above).
+        entry_ctx["effective_investment_usd"] = eff_inv_snapshot
         if cfg.loss_recovery_enabled:
-            entry_ctx["effective_investment_usd"] = eff_inv_snapshot
             entry_ctx["loss_recovery_multiplier"] = lr_mult_snapshot
         # FLW: חתימה ב-trade context אם הכניסה נבחרה ע"י FLW. ה-UI/אנליטיקס יוכלו
         # לסנן או להציג "כניסה זו הגיעה מ-FLW: side=X, lookback=N, mode=Y".

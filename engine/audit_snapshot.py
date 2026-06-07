@@ -6,6 +6,7 @@ returned by signal_engine.compute_signals() (it nests components under "sub").
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Optional
@@ -18,12 +19,18 @@ _GIT_SHA: Optional[str] = None
 def get_git_sha() -> str:
     global _GIT_SHA
     if _GIT_SHA is None:
-        try:
-            _GIT_SHA = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).resolve().parent),
-                stderr=subprocess.DEVNULL, timeout=2).decode().strip()
-        except Exception:
-            _GIT_SHA = ""
+        # Prod (Railway /data) has no .git dir, so `git rev-parse` returns "". Railway injects
+        # the build commit as RAILWAY_GIT_COMMIT_SHA — prefer it so prod rows carry a code_version.
+        _railway = os.environ.get("RAILWAY_GIT_COMMIT_SHA")
+        if _railway:
+            _GIT_SHA = _railway.strip()[:12]
+        else:
+            try:
+                _GIT_SHA = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=str(Path(__file__).resolve().parent),
+                    stderr=subprocess.DEVNULL, timeout=2).decode().strip()
+            except Exception:
+                _GIT_SHA = ""
     return _GIT_SHA
 
 

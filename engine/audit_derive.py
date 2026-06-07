@@ -151,9 +151,16 @@ def cf_exit_variants(outcome: dict[str, Any]) -> dict[str, Optional[float]]:
 def rule_flags(snapshot: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
     pol = snapshot.get("policy") or {}
     regime = snapshot.get("regime") or {}
+    side = snapshot.get("side")
+    # Honest flags vs the signal engine's headline recommendation. against_signal (the
+    # component-majority lean) is often null when components are mixed/neutral; these two
+    # read the single "recommendation" field directly so they're populated far more often.
+    rec = (snapshot.get("signal") or {}).get("recommendation")
     return {
         "recovery_active": bool(pol.get("loss_recovery_enabled") and (pol.get("loss_recovery_multiplier") or 1.0) > 1.0),
-        "against_signal": signal_conflict(snapshot, side=snapshot.get("side")),
+        "against_signal": signal_conflict(snapshot, side=side),
+        "against_recommendation": bool(side and rec in ("Up", "Down") and side != rec),
+        "entered_on_neutral": bool(rec == "neutral"),
         "entered_late": (regime.get("seconds_remaining_at_entry") is not None
                          and float(regime.get("seconds_remaining_at_entry")) < 60),
         "outcome_reason": outcome.get("outcome_reason"),

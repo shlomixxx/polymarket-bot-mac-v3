@@ -167,3 +167,66 @@ def test_audit_buy_hook_creates_row_and_excludes_audit_inputs(tmp_path: Path, mo
     assert row["window_sec"] == 300
     assert row["settlement_status"] == "PENDING"
 
+
+def test_settlement_pnl_if_held_pure_arithmetic():
+    """Recording-only counterfactual: payoff (=contracts if side==resolved, else 0) minus stake."""
+    from demo_engine import _settlement_pnl_if_held
+    # winning side held to resolution: 10 contracts -> $10 payoff, minus a $4.008 stake
+    leg = 0.4 * 10.0 * (1 + FEE_RATE)
+    won = _settlement_pnl_if_held(
+        {"side": "Up", "contracts": 10.0, "leg_cost": leg, "resolved_outcome": "Up"})
+    assert won == pytest.approx(10.0 - leg)
+    # losing side held to resolution: $0 payoff, lose the whole stake
+    lost = _settlement_pnl_if_held(
+        {"side": "Down", "contracts": 10.0, "leg_cost": leg, "resolved_outcome": "Up"})
+    assert lost == pytest.approx(-leg)
+    # early exit (no resolved_outcome) -> None
+    assert _settlement_pnl_if_held(
+        {"side": "Up", "contracts": 10.0, "leg_cost": leg}) is None
+    # unknown / missing leg_cost -> None (never raises)
+    assert _settlement_pnl_if_held(
+        {"side": "Up", "contracts": 10.0, "resolved_outcome": "Up"}) is None
+    assert _settlement_pnl_if_held(
+        {"side": "Up", "contracts": 10.0, "leg_cost": leg, "resolved_outcome": "UNKNOWN"}) is None
+
+
+@pytest.mark.asyncio
+async def test_settle_finalize_records_pnl_if_held(tmp_path: Path, monkeypatch):
+    """A settled (held-to-resolution) trade must stamp settlement_pnl_if_held into the audit
+    row's cf_exit_variants.pnl_if_held_to_resolution (read by audit_derive)."""
+    import importlib
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    import audit_tracker
+    importlib.reload(audit_tracker)  # bind audit.db to the temp DATA_ROOT
+
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1_000.0)
+    # Open an audit row via a BUY so finalize_row has a row to complete.
+    audit_inputs = {
+        "mode": "demo", "slug": "s", "epoch": 1_700_000_000, "window_sec": 300,
+        "code_version": "t", "signal_result": None, "policy": {"loss_recovery_multiplier": 1.0},
+        "book": {"ask_u": 0.4, "bid_u": 0.38, "ask_d": 0.6, "bid_d": 0.58},
+        "provenance": {}, "regime": {},
+    }
+    eng.simulate_buy = eng.record_live_buy  # avoid book fetch; record path opens the same row
+    eng.record_live_buy("Down", "old", 10.0, 0.4,
+                        context={"audit_inputs": audit_inputs, "gate": "test"})
+    sid = eng.state.trades[-1]["session_id"]
+    # Position must mirror the BUY so the settle leg_cost matches.
+    eng.state.positions = [Position(side="Down", contracts=10.0, avg_cost=0.4, token_id="old")]
+
+    async def _px(_ep: int, _ws: int):
+        # end < start -> resolves "Down"; our Down position wins
+        return {"start": 100.0, "end": 99.0, "source": "test"}
+
+    with patch("btc_price.fetch_window_start_end_btc_usd", AsyncMock(side_effect=_px)):
+        await eng.expire_all_outside_tokens(
+            ("other_up", "other_down"),
+            context={"settled_epoch": 1_700_000_000, "settled_window_sec": 300})
+
+    row = audit_tracker.get_audit(sid)
+    assert row is not None
+    leg = 0.4 * 10.0 * (1 + FEE_RATE)
+    # winning Down side held to resolution -> $10 payoff minus stake
+    assert row["cf_exit_variants"]["pnl_if_held_to_resolution"] == pytest.approx(10.0 - leg)
+
