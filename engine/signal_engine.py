@@ -37,6 +37,19 @@ def _normalize_score(score: int, max_score: int) -> float:
     return max(min(score / max_score, 1.0), -1.0)
 
 
+def _renormalized_score(parts: list[tuple[float, float, bool]]) -> float:
+    """
+    מחשב ציון משוקלל מנורמל מעל תתי-הסיגנלים הזמינים בלבד.
+
+    parts: רשימת (norm, weight, available). משקל של רכיב נכנס גם למונה וגם
+    למכנה אך ורק כשהרכיב זמין (available=True), כך שרכיב חסר לא מדלל את הציון.
+    מחזיר 0.0 כשאף רכיב לא זמין (ללא חלוקה באפס).
+    """
+    _num = sum(n * w for (n, w, avail) in parts if avail)
+    _den = sum(w for (n, w, avail) in parts if avail)
+    return round(_num / _den, 4) if _den > 0 else 0.0
+
+
 def _score_to_confidence(normalized: float) -> tuple[float, float]:
     """
     ממיר ציון מנורמל (-1..+1) ל-(up_confidence, down_confidence) בטווח 0..1.
@@ -126,12 +139,15 @@ async def compute_signals(
         )
 
     # --- ציון משוקלל כולל ---
-    weighted_score = (
-        ta_norm * WEIGHTS["ta"]
-        + clob_norm * WEIGHTS["clob"]
-        + history_norm * WEIGHTS["history"]
-        + sentiment_norm * WEIGHTS["sentiment"]
-    )
+    # מנרמל מעל תתי-הסיגנלים הזמינים בלבד: משקל של רכיב חסר (למשל CLOB כשאין
+    # ספרים) לא נשאר במכנה ולכן לא מדלל את הציון.
+    _parts = [
+        (ta_norm,        WEIGHTS["ta"],        ta_result.get("available")),
+        (clob_norm,      WEIGHTS["clob"],      clob_result.get("available")),
+        (history_norm,   WEIGHTS["history"],   history_result.get("available")),
+        (sentiment_norm, WEIGHTS["sentiment"], sentiment_result.get("available")),
+    ]
+    weighted_score = _renormalized_score(_parts)
 
     up_conf, down_conf = _score_to_confidence(weighted_score)
 
