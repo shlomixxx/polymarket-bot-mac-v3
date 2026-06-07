@@ -2190,10 +2190,18 @@ async def audit_lessons():
     if cached is not None:
         return cached
     import audit_tracker, trade_coach
+    c = runner.rt.config
+    cfg_snapshot = {
+        "loss_recovery_enabled": bool(getattr(c, "loss_recovery_enabled", False)),
+        "loss_recovery_max_multiplier": float(getattr(c, "loss_recovery_max_multiplier", 10.0)),
+        "take_profit_pct": float(getattr(c, "take_profit_pct", 20.0)),
+        "max_notional_per_window_usd": float(getattr(c, "max_notional_per_window_usd", 0.0)),
+        "circuit_breaker_enabled": bool(getattr(c, "circuit_breaker_enabled", False)),
+    }
 
     def _work():
         rows = audit_tracker.export_rows(limit=100000, light=True)
-        return trade_coach.compute_lessons(rows)
+        return trade_coach.compute_lessons(rows, config=cfg_snapshot)
     out = await asyncio.to_thread(_work)
     _AUDIT_LESSONS_CACHE.set("lessons", out)
     return out

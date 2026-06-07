@@ -164,6 +164,53 @@ def lesson_signals(rows: list[dict]) -> Optional[dict]:
         "בינוני")
 
 
+def config_risk_lessons(config: Optional[dict]) -> list[dict]:
+    """Warn about a DANGEROUS CURRENT config (not history-derived). Each fires only on the
+    actual risky value, so a safe config produces nothing. Helps a non-technical user SEE the
+    risk in-app instead of only in a chat recommendation."""
+    out: list[dict] = []
+    if not config:
+        return out
+    try:
+        lr_on = bool(config.get("loss_recovery_enabled"))
+        cb_on = bool(config.get("circuit_breaker_enabled"))
+        max_mult = float(config.get("loss_recovery_max_multiplier") or 0)
+        tp = float(config.get("take_profit_pct") or 0)
+        max_notional = float(config.get("max_notional_per_window_usd") or 0)
+
+        if lr_on and max_mult > 100:
+            out.append(_lesson(
+                "config_martingale_cap", "critical",
+                f"⚙️ הגדרה מסוכנת: מכפיל שחזור-הפסד עד {max_mult:.0f}× (ברירת-מחדל 10×)",
+                {"loss_recovery_max_multiplier": max_mult, "loss_recovery_enabled": True},
+                "הורד את loss_recovery_max_multiplier ל-2–3× בטאב אסטרטגיה — מכפיל גבוה = סיכון runaway של ה-martingale (בדיוק תקרית ה-85%−).",
+                "ודאות"))
+        if tp >= 80:
+            out.append(_lesson(
+                "config_tp_too_high", "high",
+                f"⚙️ הגדרה: take_profit_pct={tp:.0f}% — TP כמעט לא נורה בחלון 5 דקות",
+                {"take_profit_pct": tp},
+                "הורד את take_profit_pct ל-15–20% כדי לממש רווח לפני שהוא נמחק (זה ה'ירוק שהפך אדום').",
+                "ודאות"))
+        if max_notional >= 100000:
+            out.append(_lesson(
+                "config_no_notional_cap", "medium",
+                "⚙️ אין תקרת חשיפה אמיתית per-window",
+                {"max_notional_per_window_usd": max_notional},
+                "קבע max_notional_per_window_usd לתקרה אמיתית (פי 5–10 מההשקעה הבסיסית) כבלם גיבוי.",
+                "בינוני"))
+        if lr_on and not cb_on:
+            out.append(_lesson(
+                "config_cb_off", "high",
+                "⚙️ ה-martingale פעיל אבל מפסק-הבטיחות (circuit-breaker) כבוי",
+                {"loss_recovery_enabled": True, "circuit_breaker_enabled": False},
+                "הפעל את מפסק-הבטיחות בטאב אסטרטגיה (עצור אחרי N הפסדים / בתקרת מכפיל) כבלם נגד runaway.",
+                "בינוני"))
+    except Exception as e:
+        print(f"[trade_coach] config_risk_lessons failed: {e!r}", flush=True)
+    return out
+
+
 _LESSON_FNS = (
     lesson_exit_discipline,
     lesson_green_turned_red,
@@ -174,8 +221,9 @@ _LESSON_FNS = (
 )
 
 
-def compute_lessons(rows: list[dict]) -> dict[str, Any]:
-    """Run every lesson rule over the ledger rows and return a ranked, JSON-safe result."""
+def compute_lessons(rows: list[dict], config: Optional[dict] = None) -> dict[str, Any]:
+    """Run every lesson rule over the ledger rows (+ optional current-config risk checks) and
+    return a ranked, JSON-safe result."""
     rows = [r for r in (rows or []) if isinstance(r, dict)]  # honor the never-raises contract
     lessons: list[dict] = []
     for fn in _LESSON_FNS:
@@ -186,6 +234,7 @@ def compute_lessons(rows: list[dict]) -> dict[str, Any]:
             out = None
         if out:
             lessons.append(out)
+    lessons.extend(config_risk_lessons(config))  # current-config warnings (never raises)
     lessons.sort(key=lambda l: SEV_ORDER.get(l["severity"], 9))
     eras = {
         "total": len(rows),

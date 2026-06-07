@@ -65,6 +65,28 @@ def test_signal_conflict_fires_with_enough_live_rows():
     assert c["stat"]["agree_winrate"] > c["stat"]["conflict_winrate"]
 
 
+def test_config_risk_flags_dangerous_live_settings():
+    cfg = {"loss_recovery_enabled": True, "loss_recovery_max_multiplier": 10000.0,
+           "take_profit_pct": 100.0, "max_notional_per_window_usd": 1000000.0,
+           "circuit_breaker_enabled": False}
+    keys = {l["key"] for l in tc.compute_lessons([], config=cfg)["lessons"]}
+    assert {"config_martingale_cap", "config_tp_too_high",
+            "config_no_notional_cap", "config_cb_off"} <= keys
+
+
+def test_config_risk_silent_on_safe_config():
+    cfg = {"loss_recovery_enabled": True, "loss_recovery_max_multiplier": 3.0,
+           "take_profit_pct": 18.0, "max_notional_per_window_usd": 50.0,
+           "circuit_breaker_enabled": True}
+    keys = {l["key"] for l in tc.compute_lessons([], config=cfg)["lessons"]}
+    assert not any(k.startswith("config_") for k in keys)
+
+
+def test_config_risk_noop_without_config():
+    keys = {l["key"] for l in tc.compute_lessons([])["lessons"]}
+    assert not any(k.startswith("config_") for k in keys)
+
+
 def test_drawdown_denominator_excludes_rows_without_trough():
     # 50 deep-dip rows (trough -90) + 50 rows with NO trough reading.
     deep = [_row("WIN", trough=-90.0) for _ in range(50)]
