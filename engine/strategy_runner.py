@@ -116,6 +116,12 @@ class StrategyConfig:
     follow_last_winner_lookback: int = 1
     follow_last_winner_mode: Literal["forward", "reverse"] = "forward"
     follow_last_winner_min_btc_drift_pct: float = 0.0
+    # Circuit-breaker — OPT-IN, OFF by default (no behavior change until enabled). A safety
+    # brake that blocks NEW entries when a risk condition trips; open positions still exit.
+    circuit_breaker_enabled: bool = False
+    circuit_breaker_max_consecutive_losses: int = 0   # 0 = this condition off
+    circuit_breaker_halt_at_cap: bool = False         # halt once loss-recovery multiplier hits its cap
+    circuit_breaker_equity_floor_pct: float = 0.0     # 0 = off; halt if equity < this % of session baseline
 
 
 @dataclass
@@ -130,6 +136,9 @@ class StrategyRuntime:
     dca_last_fill_price: Optional[float] = None
     hedge_leg2_done: bool = False
     pending_approval: Optional[dict] = None
+    circuit_breaker_tripped: bool = False
+    circuit_breaker_reason: str = ""
+    circuit_breaker_baseline_usd: Optional[float] = None  # session equity baseline (lazy-init)
     last_tp_ts: float = 0.0
     last_tp_side: Optional[str] = None
     tp_happened_this_window: bool = False
@@ -884,6 +893,44 @@ class StrategyRunner:
     def _entry_limits_ok(self, *, now: float, cfg: StrategyConfig, planned_cost_usd: float) -> bool:
         """בדיקות מגבלות בטיחות (ללא SL). מחזיר True אם מותר להיכנס."""
         self._prune_trade_timestamps(now)
+        # ── Circuit-breaker: block NEW entries when a risk condition trips (opt-in, default off).
+        # Does NOT affect exits — _entry_limits_ok is only the entry gate. Fail-OPEN. ──
+        try:
+            import circuit_breaker
+            _eq = None
+            try:
+                _eq = float(self.demo.equity_snapshot_usd())
+            except Exception:
+                _eq = None
+            if self.rt.circuit_breaker_baseline_usd is None and _eq is not None:
+                self.rt.circuit_breaker_baseline_usd = _eq  # session baseline = equity at first gate eval
+            _cb_reason = circuit_breaker.should_halt(
+                enabled=getattr(cfg, "circuit_breaker_enabled", False),
+                streak=int(self.demo.state.loss_recovery_streak or 0),
+                multiplier=float(self.demo.state.loss_recovery_multiplier or 1.0),
+                cap=float(getattr(cfg, "loss_recovery_max_multiplier", 10.0) or 10.0),
+                equity=_eq,
+                baseline=self.rt.circuit_breaker_baseline_usd,
+                max_consecutive_losses=int(getattr(cfg, "circuit_breaker_max_consecutive_losses", 0) or 0),
+                halt_at_cap=bool(getattr(cfg, "circuit_breaker_halt_at_cap", False)),
+                equity_floor_pct=float(getattr(cfg, "circuit_breaker_equity_floor_pct", 0.0) or 0.0),
+            )
+            self.rt.circuit_breaker_tripped = bool(_cb_reason)
+            self.rt.circuit_breaker_reason = _cb_reason or ""
+            if _cb_reason:
+                try:
+                    from fault_tracker import record_fault
+                    record_fault(category="risk", severity="critical",
+                                 title="Circuit-breaker עצר כניסות חדשות", detail=_cb_reason,
+                                 source="strategy_runner._entry_limits_ok",
+                                 context={"reason": _cb_reason}, dedup_key="circuit_breaker_tripped")
+                except Exception:
+                    pass
+                self.rt.status(f"🛑 Circuit-breaker: {_cb_reason} — לא נכנסים", key="circuit_breaker")
+                return False
+        except Exception as _e:
+            print(f"[circuit_breaker] eval failed (non-fatal, fail-open): {_e!r}", flush=True)
+        # ── end circuit-breaker ──
         if cfg.max_trades_per_hour > 0 and len(self.rt.trade_timestamps) >= cfg.max_trades_per_hour:
             self.rt.status(
                 f"סטטוס: הגיע למקס׳ עסקאות לשעה ({cfg.max_trades_per_hour}) — עצירה זמנית",
