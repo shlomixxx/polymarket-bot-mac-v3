@@ -210,6 +210,10 @@ _CLOB_ACCOUNT_CACHE = TTLCache(ttl_sec=3.0)
 # קוראות get_clob_book ישירות ולא נוגעות בו. refresh=true עוקף.
 _SIGNALS_CACHE = TTLCache(ttl_sec=1.0)
 
+# Trade-Coach lessons are mined from the whole audit ledger — relatively expensive and slow-moving.
+# Cache 30s so the dashboard's 12s poll doesn't recompute every time, and the compute runs off-loop.
+_AUDIT_LESSONS_CACHE = TTLCache(ttl_sec=30.0)
+
 
 def _bot_run_win_rate_stats() -> dict[str, Any]:
     """אחוז ניצחונות ביציאות ממומשות מתחילת סשן הבוט (כמו חישוב win rate בלשונית סטטיסטיקה)."""
@@ -2134,29 +2138,48 @@ async def audit_list(
     lesson_tag: Optional[str] = None, limit: int = 1000,
 ):
     import audit_tracker
-    return {
-        "rows": audit_tracker.list_audits(
-            mode=mode, window_sec=window_sec, settlement_status=settlement_status,
-            side=side, lesson_tag=lesson_tag, limit=int(limit)),
-        "counts": audit_tracker.audit_counts(),
-    }
+
+    # Reads parse a JSON blob per row + scan the table; run OFF the event loop so a large
+    # ledger can't add to loop lag (the audit tab polls this).
+    def _work():
+        return {
+            "rows": audit_tracker.list_audits(
+                mode=mode, window_sec=window_sec, settlement_status=settlement_status,
+                side=side, lesson_tag=lesson_tag, limit=int(limit)),
+            "counts": audit_tracker.audit_counts(),
+        }
+    return await asyncio.to_thread(_work)
 
 
 @app.get("/api/audit/export")
 async def audit_export(since_ts: Optional[int] = None, schema_version: Optional[int] = None,
                        labels_only: bool = False, limit: int = 100000):
     import audit_tracker
-    return {"rows": audit_tracker.export_rows(
+    rows = await asyncio.to_thread(
+        audit_tracker.export_rows,
         since_ts=since_ts, schema_version=schema_version,
-        labels_only=bool(labels_only), limit=int(limit))}
+        labels_only=bool(labels_only), limit=int(limit))
+    return {"rows": rows}
 
 
 @app.get("/api/audit/lessons")
 async def audit_lessons():
-    """Trade Coach — deterministic, ranked lessons mined from the audit ledger (read-only)."""
+    """Trade Coach — deterministic, ranked lessons mined from the audit ledger (read-only).
+
+    Cached 30s + computed off-loop on a LIGHT projection (no per-row JSON parsing) so the
+    dashboard's 12s poll can't choke the event loop on a large ledger.
+    """
+    cached = _AUDIT_LESSONS_CACHE.get("lessons")
+    if cached is not None:
+        return cached
     import audit_tracker, trade_coach
-    rows = audit_tracker.export_rows(limit=100000)
-    return trade_coach.compute_lessons(rows)
+
+    def _work():
+        rows = audit_tracker.export_rows(limit=100000, light=True)
+        return trade_coach.compute_lessons(rows)
+    out = await asyncio.to_thread(_work)
+    _AUDIT_LESSONS_CACHE.set("lessons", out)
+    return out
 
 
 @app.get("/api/audit/{session_id}")

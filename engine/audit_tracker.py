@@ -185,6 +185,22 @@ def _row_to_dict(r: sqlite3.Row) -> dict[str, Any]:
     return d
 
 
+def _row_light(r: sqlite3.Row) -> dict[str, Any]:
+    """Cheap projection: promoted columns only, no JSON-blob parsing.
+
+    The Trade Coach reads only promoted columns (settlement_status/side/exit_type/realized_pnl/
+    peak/trough/schema_version/signal_conflict), so skipping the 4 json.loads per row makes the
+    hot lessons path ~orders of magnitude cheaper on a large ledger.
+    """
+    d = dict(r)
+    for js in ("context_json", "rule_flags_json", "cf_exit_variants_json", "pnl_path_json"):
+        d.pop(js, None)
+    for b in ("signal_was_correct", "signal_conflict", "dipped_then_won", "exploration_flag"):
+        if d.get(b) is not None:
+            d[b] = bool(d[b])
+    return d
+
+
 def list_audits(*, mode: Optional[str] = None, window_sec: Optional[int] = None,
                 settlement_status: Optional[str] = None, side: Optional[str] = None,
                 lesson_tag: Optional[str] = None, limit: int = 1000) -> list[dict[str, Any]]:
@@ -243,8 +259,13 @@ def audit_counts() -> dict[str, Any]:
 
 
 def export_rows(*, since_ts: Optional[int] = None, schema_version: Optional[int] = None,
-                labels_only: bool = False, limit: int = 100000) -> list[dict[str, Any]]:
-    """Full-fidelity dump for the future AI. labels_only quarantines non-{WIN,LOSS}."""
+                labels_only: bool = False, limit: int = 100000,
+                light: bool = False) -> list[dict[str, Any]]:
+    """Full-fidelity dump for the future AI. labels_only quarantines non-{WIN,LOSS}.
+
+    light=True returns the cheap projection (promoted columns only, no JSON-blob parsing) —
+    used by the Trade Coach, which never reads the parsed blobs.
+    """
     try:
         where, args = [], []
         if since_ts is not None:
@@ -260,7 +281,8 @@ def export_rows(*, since_ts: Optional[int] = None, schema_version: Optional[int]
         args.append(int(limit))
         with _LOCK:  # serialize use of the shared connection (writes may run on a worker thread)
             rows = _get_conn().execute(sql, args).fetchall()
-        return [_row_to_dict(r) for r in rows]
+        projector = _row_light if light else _row_to_dict
+        return [projector(r) for r in rows]
     except Exception as e:
         print(f"[audit_tracker] export_rows failed: {e!r}", flush=True)
         return []

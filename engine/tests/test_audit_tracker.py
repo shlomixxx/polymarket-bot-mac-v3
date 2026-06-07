@@ -23,6 +23,30 @@ def _snapshot(side="Up"):
     }
 
 
+def test_export_rows_light_skips_json_blobs_but_keeps_columns(tmp_path, monkeypatch):
+    at = _fresh_tracker(tmp_path, monkeypatch)
+    at.open_row("s", _snapshot("Up"))
+    at.finalize_row("s", {"type": "SETTLE_WIN", "realized_pnl": 5.0, "realized_pct": 30.0,
+                          "peak_unrealized_pct": 40.0, "resolved_outcome": "Up",
+                          "settled_ts": 2, "exit_type": "settle"})
+    light = at.export_rows(light=True)[0]
+    full = at.export_rows(light=False)[0]
+    # light path skips the parsed JSON blobs ...
+    assert "context" not in light and "pnl_path" not in light and "cf_exit_variants" not in light
+    # ... but keeps every promoted column the coach needs, with bool coercion
+    for col in ("settlement_status", "side", "exit_type", "realized_pnl",
+                "peak_unrealized_pct", "schema_version", "signal_conflict"):
+        assert col in light
+    assert light["settlement_status"] == "WIN" and light["side"] == "Up"
+    # full path still parses the blobs (unchanged behavior)
+    assert "context" in full and isinstance(full["pnl_path"], list)
+
+    # the coach produces identical lessons whether fed light or full rows
+    import trade_coach
+    assert trade_coach.compute_lessons(at.export_rows(light=True)) == \
+           trade_coach.compute_lessons(at.export_rows(light=False))
+
+
 def test_open_then_finalize_row(tmp_path, monkeypatch):
     at = _fresh_tracker(tmp_path, monkeypatch)
     assert at.open_row("sess1", _snapshot()) is True
