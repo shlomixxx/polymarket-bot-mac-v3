@@ -1,0 +1,46 @@
+name: Backup audit ledger
+
+# Daily OFF-Railway backup of the trade audit ledger — the irreplaceable learning data
+# (audit.db lives on a single Railway volume with no other copy). This pulls the public,
+# read-only export endpoint and stores it as a GitHub artifact (durable, off-Railway,
+# no credentials). It runs entirely on GitHub Actions — it does NOT touch the engine and
+# does NOT trigger a Railway deploy.
+#
+# Restore: Actions tab → latest "Backup audit ledger" run → download the artifact →
+# `gunzip audit-export.json.gz`. The JSON is a full ledger dump (rows[]).
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # daily at 04:00 UTC
+  workflow_dispatch: {}    # allow manual run from the Actions tab
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Pull and validate the audit export
+        run: |
+          set -euo pipefail
+          URL="https://polymarket-bot-mac-v3-production.up.railway.app/api/audit/export"
+          echo "Fetching audit export ..."
+          curl -fsS --max-time 180 "$URL" -o audit-export.json
+          # Refuse to store a junk/empty backup (e.g. if prod is down) — never overwrite a
+          # good history with garbage. Require a non-trivial rows[] array.
+          ROWS=$(python3 -c "import json; print(len(json.load(open('audit-export.json')).get('rows', [])))")
+          echo "audit rows fetched: $ROWS"
+          if [ "$ROWS" -lt 1 ]; then
+            echo "::error::audit export returned 0 rows — aborting (not saving an empty backup)"
+            exit 1
+          fi
+          gzip -9 audit-export.json   # -> audit-export.json.gz
+          echo "STAMP=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_ENV"
+          echo "ROWS=$ROWS" >> "$GITHUB_ENV"
+
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-ledger-${{ env.STAMP }}-${{ env.ROWS }}rows
+          path: audit-export.json.gz
+          retention-days: 90
+          if-no-files-found: error

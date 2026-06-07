@@ -17,3 +17,6 @@ tips_v2_cache.json
 
 # מסד הביקורת (audit.db) — runtime store, נוצר ע"י audit_tracker/בדיקות; לא לקומיט
 engine/audit.db
+
+# גיבויי-נתונים מקומיים (off-Railway) — לא לקומיט (גדול/פרטי)
+backups/
