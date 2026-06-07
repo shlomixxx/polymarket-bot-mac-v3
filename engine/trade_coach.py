@@ -192,11 +192,12 @@ def config_risk_lessons(config: Optional[dict]) -> list[dict]:
                 {"take_profit_pct": tp},
                 "הורד את take_profit_pct ל-15–20% כדי לממש רווח לפני שהוא נמחק (זה ה'ירוק שהפך אדום').",
                 "ודאות"))
-        if max_notional >= 100000:
+        if lr_on and max_notional >= 100000:
+            # only a runaway risk when the martingale can escalate size; don't nag the default config
             out.append(_lesson(
                 "config_no_notional_cap", "medium",
-                "⚙️ אין תקרת חשיפה אמיתית per-window",
-                {"max_notional_per_window_usd": max_notional},
+                "⚙️ ה-martingale פעיל ואין תקרת חשיפה אמיתית per-window",
+                {"max_notional_per_window_usd": max_notional, "loss_recovery_enabled": True},
                 "קבע max_notional_per_window_usd לתקרה אמיתית (פי 5–10 מההשקעה הבסיסית) כבלם גיבוי.",
                 "בינוני"))
         if lr_on and not cb_on:
