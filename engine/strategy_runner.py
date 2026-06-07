@@ -256,6 +256,11 @@ class StrategyRuntime:
         self.last_tp_side = None
         self._last_book_log_ts = 0.0
         self.strategy_first_buy_ts = None
+        # Re-arm the circuit-breaker baseline to the post-reset equity (else the equity-floor
+        # would measure against a stale pre-reset baseline and could trip spuriously).
+        self.circuit_breaker_baseline_usd = None
+        self.circuit_breaker_tripped = False
+        self.circuit_breaker_reason = ""
 
     def status(
         self,
@@ -1360,11 +1365,35 @@ class StrategyRunner:
                             pass
                         for line in lr_lines:
                             self.rt.log_event(line)
-                    elif has_loss:
-                        self.rt.log_event(
-                            "שחזור הפסד: כבוי בהגדרות המנוע — פירוק עם הפסד לא מגדיל מכפיל ולא משנה סכום לסלייס. "
-                            "הפעל «שחזור אחרי הפסד», לחץ שמור הגדרות, והפעל מחדש את המנוע אם צריך לטעון config מהדיסק."
-                        )
+                    else:
+                        # Loss-recovery is OFF — but still maintain loss_recovery_streak as a faithful
+                        # consecutive-loss counter (win→0, loss→+1, skip UNKNOWN/error exactly like
+                        # apply_loss_recovery) so the circuit-breaker's "halt after N losses" works
+                        # without loss-recovery. The MULTIPLIER is left untouched (stays 1.0).
+                        _streak_changed = False
+                        for t in settlement_trades:
+                            if str(t.get("type") or "") == "SETTLE_UNKNOWN" or t.get("settlement_error"):
+                                continue
+                            rp = t.get("realized_pnl")
+                            if rp is None:
+                                continue
+                            try:
+                                r = float(rp)
+                            except (TypeError, ValueError):
+                                continue
+                            if r > 0 and self.demo.state.loss_recovery_streak != 0:
+                                self.demo.state.loss_recovery_streak = 0
+                                _streak_changed = True
+                            elif r < 0:
+                                self.demo.state.loss_recovery_streak += 1
+                                _streak_changed = True
+                        if _streak_changed:
+                            self.demo.save()
+                        if has_loss:
+                            self.rt.log_event(
+                                "שחזור הפסד: כבוי בהגדרות המנוע — פירוק עם הפסד לא מגדיל מכפיל ולא משנה סכום לסלייס. "
+                                "הפעל «שחזור אחרי הפסד», לחץ שמור הגדרות, והפעל מחדש את המנוע אם צריך לטעון config מהדיסק."
+                            )
             self.rt.log(f"מעבר חלון → {m.slug}")
             # current_epoch כבר עודכן בתוך ה-lock כסנטינל — לא לעדכן שוב.
             self.rt.dca_done_slices = 0

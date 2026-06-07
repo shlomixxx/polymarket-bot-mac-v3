@@ -414,6 +414,11 @@ def _save_persisted_config() -> None:
             "follow_last_winner_lookback": int(getattr(c, "follow_last_winner_lookback", 1)),
             "follow_last_winner_mode": str(getattr(c, "follow_last_winner_mode", "forward")),
             "follow_last_winner_min_btc_drift_pct": float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0)),
+            # Circuit-breaker (opt-in safety brake) — MUST persist or it silently reverts to OFF on restart.
+            "circuit_breaker_enabled": bool(getattr(c, "circuit_breaker_enabled", False)),
+            "circuit_breaker_max_consecutive_losses": int(getattr(c, "circuit_breaker_max_consecutive_losses", 0)),
+            "circuit_breaker_halt_at_cap": bool(getattr(c, "circuit_breaker_halt_at_cap", False)),
+            "circuit_breaker_equity_floor_pct": float(getattr(c, "circuit_breaker_equity_floor_pct", 0.0)),
             "mode": runner.rt.mode,
             # מצב "כסף אמיתי" נשלט מהממשק — נשמר בין הפעלות אבל נגדר ע"י POLYMARKET_LIVE env בפריסה.
             "live_trading": bool(getattr(runner.rt, "live_trading", False)),
