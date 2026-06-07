@@ -25,6 +25,7 @@ _STRATEGY_TICK_SLEEP = max(0.05, min(float(os.environ.get("STRATEGY_TICK_SLEEP_S
 # F5: גילוי שוק שמחזיר None — רושמים תקלה רק אם זה נמשך מעבר ל-60s, ולכל היותר פעם ב-120s.
 DISCOVERY_NONE_PERSIST_SEC = 60.0
 DISCOVERY_NONE_RECORD_INTERVAL_SEC = 120.0
+_CB_COOLDOWN_SEC = 900.0  # 15 min — how long the circuit-breaker pauses new entries after a trip before auto-resuming
 
 
 def _fmt_px(x: Optional[float]) -> str:
@@ -143,6 +144,7 @@ class StrategyRuntime:
     circuit_breaker_tripped: bool = False
     circuit_breaker_reason: str = ""
     circuit_breaker_baseline_usd: Optional[float] = None  # session equity baseline (lazy-init)
+    circuit_breaker_cooldown_until: float = 0.0
     last_tp_ts: float = 0.0
     last_tp_side: Optional[str] = None
     tp_happened_this_window: bool = False
@@ -265,6 +267,7 @@ class StrategyRuntime:
         self.circuit_breaker_baseline_usd = None
         self.circuit_breaker_tripped = False
         self.circuit_breaker_reason = ""
+        self.circuit_breaker_cooldown_until = 0.0
 
     def status(
         self,
@@ -902,41 +905,61 @@ class StrategyRunner:
     def _entry_limits_ok(self, *, now: float, cfg: StrategyConfig, planned_cost_usd: float) -> bool:
         """בדיקות מגבלות בטיחות (ללא SL). מחזיר True אם מותר להיכנס."""
         self._prune_trade_timestamps(now)
-        # ── Circuit-breaker: block NEW entries when a risk condition trips (opt-in, default off).
-        # Does NOT affect exits — _entry_limits_ok is only the entry gate. Fail-OPEN. ──
+        # ── Circuit-breaker: SELF-RECOVERING. On a trip it pauses NEW entries for a cooldown,
+        # records ONE fault, then auto-resumes (resetting the consecutive-loss streak) — so it
+        # can never deadlock (the old bug: blocking entries meant no win could ever reset it).
+        # Only the entry gate; never affects exits. Fail-OPEN. ──
         try:
-            import circuit_breaker
+            import circuit_breaker, time as _cbt
+            _now = _cbt.time()
+            if _now < float(getattr(self.rt, "circuit_breaker_cooldown_until", 0.0) or 0.0):
+                # still cooling down — keep blocking, but do NOT re-evaluate or re-record (no spam)
+                self.rt.circuit_breaker_tripped = True
+                _left = int(float(self.rt.circuit_breaker_cooldown_until) - _now)
+                self.rt.status(f"🛑 Circuit-breaker: בקירור (עוד ~{_left//60+1} דק׳)", key="circuit_breaker")
+                return False
+            # cooldown over (or never tripped): if we WERE tripped, clear it and give a CLEAN SLATE
+            # so the consecutive-loss condition can't immediately re-trip (this breaks the deadlock).
+            if getattr(self.rt, "circuit_breaker_tripped", False):
+                self.rt.circuit_breaker_tripped = False
+                self.rt.circuit_breaker_reason = ""
+                self.demo.state.loss_recovery_streak = 0
+            # fresh evaluation
             _eq = None
             try:
                 _eq = float(self.demo.equity_snapshot_usd())
             except Exception:
                 _eq = None
             if self.rt.circuit_breaker_baseline_usd is None and _eq is not None:
-                self.rt.circuit_breaker_baseline_usd = _eq  # session baseline = equity at first gate eval
+                self.rt.circuit_breaker_baseline_usd = _eq
             _cb_reason = circuit_breaker.should_halt(
                 enabled=getattr(cfg, "circuit_breaker_enabled", False),
                 streak=int(self.demo.state.loss_recovery_streak or 0),
                 multiplier=float(self.demo.state.loss_recovery_multiplier or 1.0),
                 cap=float(getattr(cfg, "loss_recovery_max_multiplier", 10.0) or 10.0),
-                equity=_eq,
-                baseline=self.rt.circuit_breaker_baseline_usd,
+                equity=_eq, baseline=self.rt.circuit_breaker_baseline_usd,
                 max_consecutive_losses=int(getattr(cfg, "circuit_breaker_max_consecutive_losses", 0) or 0),
                 halt_at_cap=bool(getattr(cfg, "circuit_breaker_halt_at_cap", False)),
                 equity_floor_pct=float(getattr(cfg, "circuit_breaker_equity_floor_pct", 0.0) or 0.0),
             )
-            self.rt.circuit_breaker_tripped = bool(_cb_reason)
-            self.rt.circuit_breaker_reason = _cb_reason or ""
             if _cb_reason:
+                # NEW trip → start the cooldown + record the fault ONCE (not every tick)
+                self.rt.circuit_breaker_tripped = True
+                self.rt.circuit_breaker_reason = _cb_reason
+                self.rt.circuit_breaker_cooldown_until = _now + _CB_COOLDOWN_SEC
                 try:
                     from fault_tracker import record_fault
                     record_fault(category="risk", severity="critical",
-                                 title="Circuit-breaker עצר כניסות חדשות", detail=_cb_reason,
+                                 title="Circuit-breaker עצר כניסות חדשות (בקירור אוטומטי)",
+                                 detail=f"{_cb_reason} — קירור ~{int(_CB_COOLDOWN_SEC//60)} דק׳ ואז חידוש אוטומטי",
                                  source="strategy_runner._entry_limits_ok",
                                  context={"reason": _cb_reason}, dedup_key="circuit_breaker_tripped")
                 except Exception:
                     pass
-                self.rt.status(f"🛑 Circuit-breaker: {_cb_reason} — לא נכנסים", key="circuit_breaker")
+                self.rt.status(f"🛑 Circuit-breaker: {_cb_reason} — קירור ~{int(_CB_COOLDOWN_SEC//60)} דק׳", key="circuit_breaker")
                 return False
+            self.rt.circuit_breaker_tripped = False
+            self.rt.circuit_breaker_reason = ""
         except Exception as _e:
             print(f"[circuit_breaker] eval failed (non-fatal, fail-open): {_e!r}", flush=True)
         # ── end circuit-breaker ──
