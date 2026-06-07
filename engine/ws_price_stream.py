@@ -26,6 +26,8 @@ RECONNECT_MAX_DELAY_SEC = 15.0
 STALE_RECONNECT_SEC = 30.0
 # מתחת לסף הזה אנחנו מסמנים מחיר WS כ-"טרי" — מעל זה צרכן צריך לעשות fallback ל-HTTP.
 FRESH_PRICE_MAX_AGE_SEC = 5.0
+# כמה רמות עומק לשמור בכל צד (top-of-book). מספיק ל-CLOB imbalance, כמה KB לטוקן.
+BOOK_DEPTH_LEVELS = 10
 
 
 def _ssl_context_for_polymarket_ws() -> ssl.SSLContext:
@@ -40,12 +42,34 @@ def _ssl_context_for_polymarket_ws() -> ssl.SSLContext:
     return ctx
 
 
+def _truncate_levels(levels: list[Any]) -> list[dict[str, float]]:
+    """ממיר רמות ספר (כבר ממויינות) לרשימת {"price","size"} חתוכה ל-BOOK_DEPTH_LEVELS.
+
+    מתאים בדיוק למה ש-clob_imbalance.compute_book_depth קורא (.get("size")/.get("price")
+    ו-bids[0]["price"]). רמות פגומות מדולגות; אף פעם לא זורק.
+    """
+    out: list[dict[str, float]] = []
+    for lvl in levels[:BOOK_DEPTH_LEVELS]:
+        try:
+            out.append({"price": float(lvl["price"]), "size": float(lvl["size"])})
+        except (KeyError, IndexError, ValueError, TypeError):
+            continue
+    return out
+
+
 @dataclass
 class TokenPrice:
     bid: Optional[float] = None
     ask: Optional[float] = None
     mid: Optional[float] = None
     ts: float = 0.0
+    # עומק ספר הפקודות (עד BOOK_DEPTH_LEVELS רמות לכל צד) — מגיע "בחינם" על אותו WS
+    # ומשרת את analyze_clob_imbalance. כל רמה היא {"price": float, "size": float}.
+    bids: list[dict[str, float]] = field(default_factory=list)
+    asks: list[dict[str, float]] = field(default_factory=list)
+    # זמן עדכון העומק. מתעדכן יחד עם book/initial. נשמר בנפרד מ-ts (שמתעדכן גם
+    # מ-price_change/best_bid_ask שלא נושאים עומק מלא).
+    book_ts: float = 0.0
 
     def update_from_best_bid_ask(self, data: dict[str, Any]) -> bool:
         changed = False
@@ -74,18 +98,30 @@ class TokenPrice:
         bids = data.get("bids") or []
         asks = data.get("asks") or []
         old_bid, old_ask = self.bid, self.ask
+        sorted_bids: list[Any] = []
+        sorted_asks: list[Any] = []
         if bids:
             try:
                 sorted_bids = sorted(bids, key=lambda x: float(x["price"]), reverse=True)
                 self.bid = float(sorted_bids[0]["price"])
             except (KeyError, IndexError, ValueError):
-                pass
+                sorted_bids = []
         if asks:
             try:
                 sorted_asks = sorted(asks, key=lambda x: float(x["price"]))
                 self.ask = float(sorted_asks[0]["price"])
             except (KeyError, IndexError, ValueError):
-                pass
+                sorted_asks = []
+        # שמירת עומק (top-N) בצורה ש-analyze_clob_imbalance מצפה לה: רשימת
+        # {"price": float, "size": float}. ההפעלה הזו "בחינם" — העומק כבר על ה-WS.
+        new_bids = _truncate_levels(sorted_bids)
+        new_asks = _truncate_levels(sorted_asks)
+        # מעדכנים depth רק אם ההודעה הביאה רמות (book/initial). price_change חלקי
+        # לא יגיע לכאן עם bids/asks מלאים, אז לא נמחק עומק קיים לחינם.
+        if new_bids or new_asks:
+            self.bids = new_bids
+            self.asks = new_asks
+            self.book_ts = time.time()
         changed = self.bid != old_bid or self.ask != old_ask
         if changed:
             self.ts = time.time()
@@ -224,6 +260,26 @@ class PriceStreamManager:
         if (time.time() - tp.ts) > max_age_sec:
             return None
         return tp
+
+    def get_book(
+        self, token_id: str, *, max_age_sec: float = FRESH_PRICE_MAX_AGE_SEC
+    ) -> Optional[dict[str, list[dict[str, float]]]]:
+        """מחזיר את עומק הספר {"bids":[...], "asks":[...]} רק אם הוא טרי.
+
+        משמש את analyze_clob_imbalance (data-only, ל-audit). אם אין עומק או שהוא
+        stale (מעבר ל-max_age_sec) → None, כך ש-compute_signals יקבל None וה-clob
+        sub-signal יישאר available=False (אף פעם לא נתון ישן/רע). אין fetch רשת — זה
+        רק העומק שכבר הגיע על ה-WS.
+        """
+        tp = self._prices.get(token_id)
+        if tp is None or tp.book_ts <= 0:
+            return None
+        if not tp.bids and not tp.asks:
+            return None
+        if (time.time() - tp.book_ts) > max_age_sec:
+            return None
+        # מחזירים עותקים רדודים כדי ש-caller לא ישנה את ה-cache הפנימי בטעות.
+        return {"bids": list(tp.bids), "asks": list(tp.asks)}
 
     def get_best_bid_ask(self, token_id: str) -> tuple[Optional[float], Optional[float]]:
         tp = self._prices.get(token_id)

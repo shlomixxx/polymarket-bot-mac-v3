@@ -1478,19 +1478,33 @@ class StrategyRunner:
         }
 
         # ── Audit: refresh the cached signal snapshot for the decision "WHY". ──
-        # Cheap: compute_signals() called WITHOUT books uses a 30s internal cache and makes
-        # NO extra book fetches (clob-imbalance is omitted, but book prices are captured in
-        # the snapshot separately). Best-effort — must never block a trade.
-        # Throttled to >=15s (the signal data itself has a 30s internal cache, so per-tick
-        # calls add nothing) and bounded by wait_for so a cache-miss Binance fetch can never
-        # stall a trade tick. Stamp the throttle ts BEFORE awaiting to avoid retry storms.
+        # Cheap: compute_signals() makes NO extra network fetches. We now feed CLOB book
+        # DEPTH straight from the in-process WS stream (already on the wire, free) so the
+        # 0.30-weight CLOB-imbalance sub-signal is finally populated in the AUDIT ledger.
+        # DATA-ONLY: the bot still chooses its side by cheaper-ask, NOT this signal.
+        # Best-effort — must never block a trade. Throttled to >=15s, bounded by wait_for so
+        # a cache-miss Binance fetch can never stall a tick. Stamp the throttle ts BEFORE
+        # awaiting to avoid retry storms. Passing books bypasses compute_signals' 30s no-books
+        # cache, but the >=15s throttle bounds recompute and the analysis is in-memory.
+        # If get_book() returns None (no fresh depth) we pass None -> clob stays unavailable
+        # this tick (graceful); a stale book is dropped to None, never fed as bad data.
         try:
             _now_sig = time.time()
             if _now_sig - getattr(self.rt, "_last_signal_refresh_ts", 0.0) >= 15.0:
                 self.rt._last_signal_refresh_ts = _now_sig
                 from signal_engine import compute_signals as _compute_signals
+                _up_book = _down_book = None
+                try:
+                    from ws_price_stream import price_stream as _price_stream
+                    _up_book = _price_stream.get_book(token_up, max_age_sec=30.0)
+                    _down_book = _price_stream.get_book(token_down, max_age_sec=30.0)
+                except Exception:
+                    _up_book = _down_book = None
                 self.rt._last_signal_result = await asyncio.wait_for(
-                    _compute_signals(window_sec=int(m.window_sec)), timeout=1.5)
+                    _compute_signals(
+                        up_book=_up_book, down_book=_down_book,
+                        window_sec=int(m.window_sec)),
+                    timeout=1.5)
         except Exception as _e:
             print(f"[audit] signal refresh skipped (non-fatal): {_e!r}", flush=True)
 
