@@ -1797,6 +1797,8 @@ export default function App() {
   const [circuitBreakerMaxConsecutiveLosses, setCircuitBreakerMaxConsecutiveLosses] = useState(0);
   const [circuitBreakerHaltAtCap, setCircuitBreakerHaltAtCap] = useState(false);
   const [circuitBreakerEquityFloorPct, setCircuitBreakerEquityFloorPct] = useState(0);
+  // רצפת-הגנה (hard stop-loss) — צא מפוזיציה כשההפסד מגיע ל-X% (0=כבוי)
+  const [floorStopPct, setFloorStopPct] = useState(0);
   // read-only מהשרת — מצב ה-tripped הנוכחי + הסיבה
   const [circuitBreakerTripped, setCircuitBreakerTripped] = useState(false);
   const [circuitBreakerReason, setCircuitBreakerReason] = useState("");
@@ -2003,6 +2005,7 @@ export default function App() {
         if (typeof c.circuit_breaker_max_consecutive_losses === "number") setCircuitBreakerMaxConsecutiveLosses(c.circuit_breaker_max_consecutive_losses);
         if (typeof c.circuit_breaker_halt_at_cap === "boolean") setCircuitBreakerHaltAtCap(c.circuit_breaker_halt_at_cap);
         if (typeof c.circuit_breaker_equity_floor_pct === "number") setCircuitBreakerEquityFloorPct(c.circuit_breaker_equity_floor_pct);
+        if (typeof c.floor_stop_pct === "number") setFloorStopPct(c.floor_stop_pct);
         if (c.order_mode === "limit" || c.order_mode === "market") setOrderMode(c.order_mode);
         if (typeof c.entry_slippage_pct === "number") setEntrySlippagePct(c.entry_slippage_pct);
         if (typeof c.market_max_entry_price_cents === "number") setMarketMaxEntryPriceCents(c.market_max_entry_price_cents);
@@ -2214,6 +2217,7 @@ export default function App() {
           circuit_breaker_max_consecutive_losses: Math.max(0, Math.floor(circuitBreakerMaxConsecutiveLosses)),
           circuit_breaker_halt_at_cap: circuitBreakerHaltAtCap,
           circuit_breaker_equity_floor_pct: Math.max(0, Math.min(100, circuitBreakerEquityFloorPct)),
+          floor_stop_pct: Math.max(0, Math.min(100, floorStopPct)),
           order_mode: orderMode,
           entry_slippage_pct: Math.max(0, entrySlippagePct),
           market_max_entry_price_cents: Math.max(0, Math.min(100, marketMaxEntryPriceCents)),
@@ -2264,6 +2268,7 @@ export default function App() {
       nearEntryPct, nearTpPct, dcaTpOverridePct, bookLogIntervalSec,
       lossRecoveryEnabled, lossRecoveryStepPct, lossRecoveryEveryN, lossRecoveryMaxMult,
       circuitBreakerEnabled, circuitBreakerMaxConsecutiveLosses, circuitBreakerHaltAtCap, circuitBreakerEquityFloorPct,
+      floorStopPct,
       orderMode, entrySlippagePct, marketMaxEntryPriceCents, exitSlippagePct, peakWatchdogEnabled, peakRetreatExitPct,
       retryMaxAttempts, holdToResolutionEnabled, holdToResolutionMinDcaSlices,
       holdToResolutionMinPrice, holdToResolutionStopLoss,
@@ -3986,6 +3991,21 @@ export default function App() {
                   value={circuitBreakerEquityFloorPct}
                   onChange={(e) => {
                     setCircuitBreakerEquityFloorPct(Math.max(0, Math.min(100, Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}
+                />
+              </label>
+              <label>
+                רצפת-הגנה (stop-loss): צא אם מפסידים מעל X% (0=כבוי)
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  max={100}
+                  value={floorStopPct}
+                  onChange={(e) => {
+                    setFloorStopPct(Math.max(0, Math.min(100, Number(e.target.value) || 0)));
                     markCfgDirty();
                   }}
                   style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}

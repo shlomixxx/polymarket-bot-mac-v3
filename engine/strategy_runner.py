@@ -122,6 +122,10 @@ class StrategyConfig:
     circuit_breaker_max_consecutive_losses: int = 0   # 0 = this condition off
     circuit_breaker_halt_at_cap: bool = False         # halt once loss-recovery multiplier hits its cap
     circuit_breaker_equity_floor_pct: float = 0.0     # 0 = off; halt if equity < this % of session baseline
+    # Floor-stop (hard stop-loss): exit a losing position at this unrealized-loss %. OPT-IN.
+    # 0 = off; e.g. 70 = exit when unrealized <= -70%. Always fires (it's a stop-loss), even
+    # when take-profit is gated by DCA-lock / hold-to-resolution.
+    floor_stop_pct: float = 0.0
 
 
 @dataclass
@@ -1609,9 +1613,20 @@ class StrategyRunner:
             tp_trigger = (
                 tp_allowed and upnl is not None and upnl >= cfg.take_profit_pct * (1 + 2 * FEE_RATE)
             )
-            if tp_trigger or peak_trigger or hold_stop_trigger:
+            # ── Floor-stop (hard stop-loss) ───────────────────────────────────
+            # OPT-IN absolute loss floor. Bypasses tp_allowed / DCA-lock / hold-to-
+            # resolution gating on purpose: a stop-loss must always be able to fire.
+            floor_trigger = (
+                float(getattr(cfg, "floor_stop_pct", 0.0) or 0.0) > 0.0
+                and upnl is not None
+                and upnl <= -float(cfg.floor_stop_pct)
+            )
+            if tp_trigger or peak_trigger or hold_stop_trigger or floor_trigger:
                 tp_ctx = dict(base_ctx)
-                if hold_stop_trigger:
+                if floor_trigger:
+                    tp_ctx["reason"] = f"FLOOR_STOP {p.side}: upnl {upnl:.1f}% <= -{float(cfg.floor_stop_pct):.0f}%"
+                    self.rt.log(f"Floor-stop יציאה {p.side}: הפסד {upnl:.1f}% הגיע לרצפה -{float(cfg.floor_stop_pct):.0f}% — יוצאים")
+                elif hold_stop_trigger:
                     tp_ctx["reason"] = f"HOLD_STOP {p.side}: {hold_stop_reason}"
                     self.rt.log_event(
                         f"Hold-to-Resolution stop-loss {p.side}: {hold_stop_reason}"

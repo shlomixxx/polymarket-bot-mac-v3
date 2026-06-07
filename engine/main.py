@@ -419,6 +419,8 @@ def _save_persisted_config() -> None:
             "circuit_breaker_max_consecutive_losses": int(getattr(c, "circuit_breaker_max_consecutive_losses", 0)),
             "circuit_breaker_halt_at_cap": bool(getattr(c, "circuit_breaker_halt_at_cap", False)),
             "circuit_breaker_equity_floor_pct": float(getattr(c, "circuit_breaker_equity_floor_pct", 0.0)),
+            # Floor-stop (hard stop-loss) — MUST persist or it silently reverts to OFF on restart.
+            "floor_stop_pct": float(getattr(c, "floor_stop_pct", 0.0)),
             "mode": runner.rt.mode,
             # מצב "כסף אמיתי" נשלט מהממשק — נשמר בין הפעלות אבל נגדר ע"י POLYMARKET_LIVE env בפריסה.
             "live_trading": bool(getattr(runner.rt, "live_trading", False)),
@@ -1451,6 +1453,7 @@ class ConfigBody(BaseModel):
     circuit_breaker_max_consecutive_losses: int = 0
     circuit_breaker_halt_at_cap: bool = False
     circuit_breaker_equity_floor_pct: float = 0.0
+    floor_stop_pct: float = 0.0
 
 
 @app.post("/api/strategy/config")
@@ -1498,6 +1501,8 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "follow_last_winner_min_btc_drift_pct must be between 0 and 10")
     if float(body.circuit_breaker_equity_floor_pct) < 0 or float(body.circuit_breaker_equity_floor_pct) > 100:
         raise HTTPException(400, "circuit_breaker_equity_floor_pct must be between 0 and 100")
+    if float(body.floor_stop_pct) < 0 or float(body.floor_stop_pct) > 100:
+        raise HTTPException(400, "floor_stop_pct must be between 0 and 100")
     c = runner.rt.config
     for k, v in body.model_dump().items():
         if hasattr(c, k):
@@ -1558,6 +1563,7 @@ async def get_strategy_config():
         "circuit_breaker_equity_floor_pct": float(getattr(c, "circuit_breaker_equity_floor_pct", 0.0)),
         "circuit_breaker_tripped": bool(getattr(runner.rt, "circuit_breaker_tripped", False)),
         "circuit_breaker_reason": str(getattr(runner.rt, "circuit_breaker_reason", "")),
+        "floor_stop_pct": float(getattr(c, "floor_stop_pct", 0.0)),
         "order_mode": getattr(c, "order_mode", "limit"),
         "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
         "market_max_entry_price_cents": float(getattr(c, "market_max_entry_price_cents", 80.0)),
