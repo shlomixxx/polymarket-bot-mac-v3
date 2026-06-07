@@ -276,6 +276,23 @@ def _bot_run_win_rate_stats() -> dict[str, Any]:
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(Path(__file__).resolve().parent))).resolve()
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
+
+def _data_root_is_ephemeral(data_root, env: dict) -> bool:
+    """True if we're in a Railway deploy but DATA_ROOT is NOT a mounted persistent volume
+    (so ALL persistent data — audit.db / demo_state.json / config_persisted.json / faults.db —
+    would be lost on each restart). Deterministic for the non-Railway case; testable for the
+    Railway case by monkeypatching ``os.path.ismount``.
+    """
+    in_railway = any(env.get(k) for k in ("RAILWAY_ENVIRONMENT", "RAILWAY_PROJECT_ID", "RAILWAY_GIT_COMMIT_SHA"))
+    if not in_railway:
+        return False  # local/dev — DATA_ROOT under the code dir is expected and fine
+    # In Railway, a persistent volume is a real mountpoint. The ephemeral fallback (the code
+    # dir, e.g. /app/engine) is NOT a mountpoint.
+    try:
+        return not os.path.ismount(str(data_root))
+    except Exception:
+        return False  # never false-positive into a scary fault on an unexpected platform
+
 CONFIG_PERSISTED_PATH = DATA_ROOT / "config_persisted.json"
 TRIGGER_CONFIG_PERSISTED_PATH = DATA_ROOT / "trigger_config_persisted.json"
 
@@ -811,6 +828,23 @@ async def lifespan(app: FastAPI):
         f"(ב-Railway: Volume בנתיב /data או DATA_ROOT זהה — אחרת הנתונים נמחקים בכל deploy)",
         flush=True,
     )
+    # Data-durability guard: if the persistent volume isn't mounted in a Railway deploy, ALL
+    # data (audit.db / demo_state / config / faults) is ephemeral and vanishes on restart.
+    try:
+        if _data_root_is_ephemeral(DATA_ROOT, dict(os.environ)):
+            _msg = (f"DATA_ROOT={DATA_ROOT} is NOT a mounted persistent volume — "
+                    f"ALL data will be LOST on restart. Attach a Railway Volume at this path.")
+            print("\n" + "=" * 72 + f"\n🛑 DATA DURABILITY: {_msg}\n" + "=" * 72 + "\n", flush=True)
+            try:
+                from fault_tracker import record_fault
+                record_fault(category="data", severity="critical",
+                             title="הדיסק הקבוע לא מחובר — נתונים יימחקו באתחול",
+                             detail=_msg, source="main.lifespan.data_durability_guard",
+                             dedup_key="data_root_not_mounted")
+            except Exception:
+                pass
+    except Exception as _e:
+        print(f"[data-guard] check failed (non-fatal): {_e!r}", flush=True)
     _load_persisted_config()
     _load_trigger_config()
     _reset_ui_runtime("lifespan_start")
