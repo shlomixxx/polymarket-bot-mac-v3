@@ -2276,7 +2276,12 @@ async def audit_edge():
     if cached is not None:
         return cached
     import audit_tracker, edge_watcher
-    cfg = {"take_profit_pct": float(getattr(runner.rt.config, "take_profit_pct", 18.0))}
+    # The real StrategyConfig always carries take_profit_pct (default 20.0), so the
+    # fallback never fires in practice. When it would, fall back to edge_watcher's
+    # own source-of-truth TP constant (TP_PCT == 18.0, per the plan) rather than a
+    # bare literal, so the recording-side default can't silently drift from the
+    # module that consumes it.
+    cfg = {"take_profit_pct": float(getattr(runner.rt.config, "take_profit_pct", edge_watcher.TP_PCT))}
 
     def _work():
         rows = audit_tracker.export_rows(labels_only=True, light=False, limit=100000)

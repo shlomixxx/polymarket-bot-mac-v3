@@ -1051,8 +1051,18 @@ def test_audit_edge_endpoint_valid_response_and_cached(_edge_client, monkeypatch
 
 def test_audit_edge_endpoint_runs_off_loop(_edge_client, monkeypatch):
     """detect_edges must run via asyncio.to_thread (off the event loop), so it
-    executes on a worker thread, not the loop thread."""
-    import asyncio
+    executes on a worker thread — NOT the event-loop thread (Invariant 3).
+
+    NB: under Starlette's TestClient the event loop itself runs on a portal
+    WORKER thread, never on threading.main_thread(). So comparing the detect
+    thread to main_thread() is a FALSE POSITIVE: an endpoint that calls
+    detect_edges INLINE on the loop thread (no to_thread) would still differ
+    from main_thread() and pass. We instead capture the *actual loop thread id*
+    via a throwaway probe route mounted on the same app (it runs on the same
+    event loop, hence the same portal thread), and assert detect ran on a
+    DIFFERENT thread than that. This fails if a maintainer drops the
+    `await asyncio.to_thread(_work)` and calls `_work()` directly.
+    """
     import threading
     import audit_tracker
     import edge_watcher
@@ -1061,12 +1071,8 @@ def test_audit_edge_endpoint_runs_off_loop(_edge_client, monkeypatch):
 
     monkeypatch.setattr(audit_tracker, "export_rows", lambda **k: [])
 
-    loop_thread_ident = {"v": None}
-
-    # Capture the event-loop thread id from inside the request, then compare to
-    # the thread detect_edges runs on.
+    # The thread detect_edges actually runs on.
     seen = {"detect_thread": None}
-
     real_detect = edge_watcher.detect_edges
 
     def _thread_aware_detect(rows, *, config=None):
@@ -1075,18 +1081,44 @@ def test_audit_edge_endpoint_runs_off_loop(_edge_client, monkeypatch):
 
     monkeypatch.setattr(edge_watcher, "detect_edges", _thread_aware_detect)
 
-    # The TestClient runs the app on a portal/worker; grab the loop's own thread
-    # id by scheduling a callback on it.
-    async def _grab_loop_thread():
-        loop_thread_ident["v"] = threading.get_ident()
-        return None
+    # Capture the real event-loop thread id by hitting a throwaway probe route
+    # that records the thread its coroutine body runs on. TestClient reuses one
+    # event loop (one portal thread) for the lifetime of the client, so this is
+    # the same thread the /api/audit/edge coroutine runs on.
+    loop_thread = {"v": None}
+    probe_path = "/__t7_loop_probe"
 
-    # Use the app's own routing to find the loop thread: call a trivially-cheap
-    # endpoint that records its thread, OR just assert detect ran on a DIFFERENT
-    # thread than the one to_thread was dispatched from. Simpler + robust:
-    r = client.get("/api/audit/edge")
-    assert r.status_code == 200
-    # asyncio.to_thread always dispatches to a worker in the default executor;
-    # that worker is never the main thread.
+    async def _loop_probe():
+        loop_thread["v"] = threading.get_ident()
+        return {"ok": True}
+
+    engine_main.app.add_api_route(probe_path, _loop_probe, methods=["GET"])
+    # The app mounts a catch-all SPA route ("/{full_path:path}") and FastAPI
+    # matches routes in registration order — a freshly-appended route is shadowed
+    # by it. Move our probe to the front so it actually runs its coroutine body.
+    _routes = engine_main.app.router.routes
+    _routes.insert(0, _routes.pop())
+    try:
+        pr = client.get(probe_path)
+        assert pr.status_code == 200
+        assert loop_thread["v"] is not None, (
+            "probe route was shadowed — it never recorded the loop thread"
+        )
+
+        r = client.get("/api/audit/edge")
+        assert r.status_code == 200
+    finally:
+        # Don't leak the probe route into other tests sharing the app singleton.
+        engine_main.app.router.routes[:] = [
+            rt for rt in engine_main.app.router.routes
+            if getattr(rt, "path", None) != probe_path
+        ]
+
     assert seen["detect_thread"] is not None
+    # The load-bearing assertion: detect_edges ran OFF the event-loop thread.
+    assert seen["detect_thread"] != loop_thread["v"], (
+        "detect_edges ran on the event-loop thread — Invariant 3 violated "
+        "(it must be dispatched via asyncio.to_thread)"
+    )
+    # And — necessarily — never on the process main thread either.
     assert seen["detect_thread"] != threading.main_thread().ident
