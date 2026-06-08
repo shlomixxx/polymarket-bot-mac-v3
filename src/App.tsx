@@ -1704,6 +1704,12 @@ export default function App() {
   const [pending, setPending] = useState<Record<string, unknown> | null>(null);
   const [err, setErr] = useState("");
   const [ob, setOb] = useState<OrderbookSummary | null>(null);
+  /** אומדן read-only: מה היה ה-P&L של הדמו בעמלות-אמת של Polymarket (קריפטו, דינמית). */
+  const [realFeePnl, setRealFeePnl] = useState<{
+    sandbox_net: number;
+    real_fee_net: number;
+    fee_drag: number;
+  } | null>(null);
   const priceStream = usePriceStream();
 
   /** טיק שנייה — מונה «נותרו…» בלוח הבקרה מתעדכן כל שנייה, לא רק כשמגיע refresh מהשרת */
@@ -2141,6 +2147,15 @@ export default function App() {
       // נשאיר את הקודם — הלולאה תנסה שוב; snapshot ממשיך לעדכן P&L חי
     } finally {
       fullStateInFlight.current = false;
+    }
+    // אומדן עמלות-אמת — endpoint נפרד, cached 45s ב-off-loop; לא שובר את טעינת ה-state אם נכשל.
+    try {
+      const rf = await api<{ sandbox_net: number; real_fee_net: number; fee_drag: number }>(
+        "/api/demo/real-fee-pnl",
+      );
+      if (rf && typeof rf.real_fee_net === "number") setRealFeePnl(rf);
+    } catch {
+      // נשאיר את הקודם
     }
   }, []);
   useEffect(() => {
@@ -3096,6 +3111,44 @@ export default function App() {
                       ).toFixed(2)}
                     </strong>
                   </div>
+                  {realFeePnl && (
+                    <div
+                      dir="rtl"
+                      style={{
+                        marginTop: 8,
+                        padding: "8px 10px",
+                        borderRadius: 6,
+                        background: "rgba(248, 113, 113, 0.08)",
+                        border: "1px solid rgba(248, 113, 113, 0.25)",
+                        fontSize: 12,
+                        lineHeight: 1.5,
+                      }}
+                    >
+                      <span style={{ color: "var(--muted)" }}>רווח דמו: </span>
+                      <strong
+                        className="tabular-nums"
+                        style={{ color: realFeePnl.sandbox_net >= 0 ? "var(--up)" : "var(--down)" }}
+                      >
+                        {realFeePnl.sandbox_net >= 0 ? "+" : "−"}$
+                        {Math.abs(realFeePnl.sandbox_net).toFixed(2)}
+                      </strong>
+                      <span style={{ color: "var(--muted)", margin: "0 6px" }}>·</span>
+                      <span style={{ color: "var(--muted)" }}>בעמלות-אמת: </span>
+                      <strong
+                        className="tabular-nums"
+                        style={{ color: realFeePnl.real_fee_net >= 0 ? "var(--up)" : "var(--down)" }}
+                      >
+                        {realFeePnl.real_fee_net >= 0 ? "+" : "−"}$
+                        {Math.abs(realFeePnl.real_fee_net).toFixed(2)}
+                      </strong>{" "}
+                      <span style={{ color: "var(--muted)" }}>
+                        (עמלות אכלו ${realFeePnl.fee_drag.toFixed(2)})
+                      </span>
+                      <div style={{ color: "var(--muted)", fontSize: 10, marginTop: 4 }}>
+                        אומדן בעמלות Polymarket האמיתיות (קריפטו, דינמית ≈7% הלוך-ושוב); הספר עצמו נשאר ב-0.2%/צד
+                      </div>
+                    </div>
+                  )}
                   {pmClobAccount?.ok ? (
                     <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--border)" }}>
                       <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
