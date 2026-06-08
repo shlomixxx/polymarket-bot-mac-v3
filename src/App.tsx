@@ -30,6 +30,7 @@ import TriggerTrader from "./TriggerTrader";
 import AnalyticsV3 from "./AnalyticsV3";
 import FaultsTab from "./FaultsTab";
 import AuditTab from "./AuditTab";
+import EdgeWatcherTab from "./EdgeWatcherTab";
 
 type Market = {
   slug: string;
@@ -58,7 +59,7 @@ type OrderbookSummary = {
   down: SideSummary;
 };
 
-type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "analytics_v3" | "faults" | "audits" | "help";
+type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "analytics_v3" | "faults" | "edge" | "audits" | "help";
 
 type Trade = {
   id?: string;
@@ -2682,6 +2683,7 @@ export default function App() {
             ["tips_v2", "ניתוח v3"],
             ["analytics_v3", "📊 אנליטיקס V3"],
             ["faults", "🐞 תקלות"],
+            ["edge", "🔭 גלאי edge"],
             ["audits", "📋 ביקורת עסקאות"],
             ["help", "עזרה ותיעוד"],
           ] as const
@@ -4022,11 +4024,13 @@ export default function App() {
               </label>
             </div>
             <div
+              id="decision-mode-block"
               style={{
                 marginTop: 14,
                 paddingTop: 14,
                 borderTop: "1px dashed #263244",
                 marginBottom: 12,
+                scrollMarginTop: 80,
               }}
             >
               <div style={{ fontWeight: 700, marginBottom: 8 }}>🤖 מצב החלטה — מי בוחר את הצד</div>
@@ -4749,6 +4753,7 @@ export default function App() {
       {tab === "tips_v2" && <TipsV2 />}
       {tab === "analytics_v3" && <AnalyticsV3 />}
       {tab === "faults" && <FaultsTab />}
+      {tab === "edge" && <EdgeWatcherTab onGoToStrategy={() => setTab("strategy")} />}
       {tab === "audits" && <AuditTab />}
       {tab === "signals" && <SignalsPanel />}
       {tab === "trigger" && <TriggerTrader />}
