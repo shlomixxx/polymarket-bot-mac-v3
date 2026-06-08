@@ -214,6 +214,10 @@ _SIGNALS_CACHE = TTLCache(ttl_sec=1.0)
 # Cache 30s so the dashboard's 12s poll doesn't recompute every time, and the compute runs off-loop.
 _AUDIT_LESSONS_CACHE = TTLCache(ttl_sec=30.0)
 
+# Edge-Watcher runs the full slice-scan over the whole labeled ledger — heavier and slower-moving
+# than lessons. Cache 60s so the dashboard's 12s poll never re-scans, and the scan runs off-loop.
+_AUDIT_EDGE_CACHE = TTLCache(ttl_sec=60.0)
+
 
 def _bot_run_win_rate_stats() -> dict[str, Any]:
     """אחוז ניצחונות ביציאות ממומשות מתחילת סשן הבוט (כמו חישוב win rate בלשונית סטטיסטיקה)."""
@@ -2255,6 +2259,30 @@ async def audit_lessons():
         return trade_coach.compute_lessons(rows, config=cfg_snapshot)
     out = await asyncio.to_thread(_work)
     _AUDIT_LESSONS_CACHE.set("lessons", out)
+    return out
+
+
+@app.get("/api/audit/edge")
+async def audit_edge():
+    """Edge-Watcher — ONE statistically-honest verdict (collecting/watching/forming/
+    confirmed) mined from the audit ledger (read-only, recording-only).
+
+    Cached 60s + computed off-loop on the FULL labeled projection (detect_edges reads
+    the nested context.* blobs, so light=False) so the dashboard's 12s poll can't choke
+    the event loop on a large ledger. detect_edges NEVER raises — a malformed/empty
+    ledger returns a safe `collecting` response.
+    """
+    cached = _AUDIT_EDGE_CACHE.get("edge")
+    if cached is not None:
+        return cached
+    import audit_tracker, edge_watcher
+    cfg = {"take_profit_pct": float(getattr(runner.rt.config, "take_profit_pct", 18.0))}
+
+    def _work():
+        rows = audit_tracker.export_rows(labels_only=True, light=False, limit=100000)
+        return edge_watcher.detect_edges(rows, config=cfg)
+    out = await asyncio.to_thread(_work)
+    _AUDIT_EDGE_CACHE.set("edge", out)
     return out
 
 
