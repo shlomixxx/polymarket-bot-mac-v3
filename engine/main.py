@@ -1682,6 +1682,35 @@ async def strategy_mode(body: ModeBody):
     return {"ok": True, "mode": body.mode}
 
 
+@app.post("/api/strategy/reset-loss-recovery")
+async def reset_loss_recovery():
+    """Reset the loss-recovery RUNTIME state (demo.state) to defaults: clears a stale
+    multiplier (left at e.g. 3.0 from a prior martingale-on incident) and the
+    consecutive-loss streak. Behavior-neutral while loss_recovery_enabled=False —
+    sizing ignores the multiplier (strategy_runner._effective_investment_usd returns
+    the base stake when loss-recovery is off) and the consec-loss circuit-breaker
+    latch is disabled — so this ONLY removes a misleading 'martingale-live' display
+    and re-arms an honest streak counter. Does NOT touch balance / positions / trade
+    history / audit ledger. Requires X-Bot-Token (global POST auth)."""
+    prev_mult = float(demo.state.loss_recovery_multiplier)
+    prev_streak = int(demo.state.loss_recovery_streak)
+    demo.state.loss_recovery_multiplier = 1.0
+    demo.state.loss_recovery_streak = 0
+    demo.save()
+    append_event(
+        "loss_recovery_reset",
+        {"prev_multiplier": prev_mult, "prev_streak": prev_streak},
+    )
+    write_strategy_snapshot(runner, demo)
+    return {
+        "ok": True,
+        "loss_recovery_multiplier": 1.0,
+        "loss_recovery_streak": 0,
+        "prev_multiplier": prev_mult,
+        "prev_streak": prev_streak,
+    }
+
+
 @app.get("/api/logs/run-dir")
 async def api_logs_run_dir():
     """מחזיר את נתיב תיקיית הלוגים של הריצה הנוכחית (אם הוגדר LOG_RUN_DIR)."""
