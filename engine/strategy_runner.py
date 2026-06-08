@@ -199,6 +199,14 @@ class StrategyRuntime:
     # decision snapshot records signals_missing=true. Optional[dict] (JSON-safe).
     _last_signal_result: Optional[dict] = None
     _last_signal_refresh_ts: float = 0.0  # throttle for the audit signal refresh (>=15s apart)
+    # Audit (recording-only): BTC spot captured at the START of the current window
+    # (stamped at the rollover point from the cached signal's TA current_price). Lets a
+    # future learner compute spot_vs_open_pct at entry. None until the first rollover.
+    window_open_btc: Optional[float] = None
+    # Audit (recording-only): the top-of-book snapshots the cached signal was computed
+    # from (reused for raw_book_up/raw_book_down so we don't re-fetch). JSON-safe dicts.
+    _last_signal_book_up: Optional[dict] = None
+    _last_signal_book_down: Optional[dict] = None
 
     def log(self, msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -1442,6 +1450,16 @@ class StrategyRunner:
             self.rt.last_tp_ts = 0.0
             self.rt.last_tp_side = None
             self.rt._last_book_log_ts = 0.0
+            # ── Audit (recording-only): capture BTC spot at the START of the new window. ──
+            # Taken from the latest cached signal's TA current_price (in-memory, NO network).
+            # A future learner uses it for spot_vs_open_pct at entry. Best-effort: on any
+            # miss leave it None — must never disturb the rollover / trade.
+            try:
+                _ta_open = ((self.rt._last_signal_result or {}).get("sub", {}).get("ta", {}) or {})
+                _open_px = _ta_open.get("current_price")
+                self.rt.window_open_btc = float(_open_px) if _open_px is not None else None
+            except Exception:
+                self.rt.window_open_btc = None
             # FIX #22: גם persistence מתאפס ל-epoch החדש (לא להציל DCA ישן)
             self._persist_dca_counters()
 
@@ -1508,6 +1526,10 @@ class StrategyRunner:
                     _down_book = _price_stream.get_book(token_down, max_age_sec=30.0)
                 except Exception:
                     _up_book = _down_book = None
+                # Audit (recording-only): stash the SAME book snapshots the signal was
+                # computed from so the audit_inputs raw_book_* reuses them (no re-fetch).
+                self.rt._last_signal_book_up = _up_book
+                self.rt._last_signal_book_down = _down_book
                 self.rt._last_signal_result = await asyncio.wait_for(
                     _compute_signals(
                         up_book=_up_book, down_book=_down_book,
@@ -1535,6 +1557,57 @@ class StrategyRunner:
             # BTC spot at entry, taken from the same cached signal TA (can be ~30s stale — an
             # approximate spot is far more useful to a learner than NULL).
             _btc_spot_at_entry = _ta.get("current_price")
+
+            # ── PART 2 (recording-only): prediction-market features. ─────────────────
+            # The Polymarket share asks ARE the market's implied probabilities. The edge
+            # (model vs market) MUST be captured at decision time — it cannot be rebuilt
+            # later. None-safe via clob_imbalance.market_features. Does NOT affect trade.
+            _market_feats = None
+            try:
+                from clob_imbalance import market_features as _market_features
+                _model_up_prob = (_sig_result or {}).get("up_confidence") or 0.0
+                _market_feats = _market_features(
+                    up_ask=ask_u, down_ask=ask_d, model_up_prob=_model_up_prob)
+            except Exception as _mfe:
+                print(f"[audit] market_features skipped (non-fatal): {_mfe!r}", flush=True)
+                _market_feats = None
+
+            # ── PART 3 (recording-only): RAW capture (lossless future-proofing). ─────
+            # raw_book_up/down: full top-10-level snapshot REUSED from the cached signal's
+            # books (no re-fetch) as compact [[price,size],...]. raw_funding: the raw
+            # funding-rate value (rate_pct) from sub.sentiment.funding. window_open_btc +
+            # spot_vs_open_pct: the BTC spot at window start vs now. All None-safe.
+            def _compact_book(_bk, _n=10):
+                try:
+                    if not _bk:
+                        return None
+                    _bids = [[float(x.get("price", 0)), float(x.get("size", 0))]
+                             for x in (_bk.get("bids") or [])[:_n]]
+                    _asks = [[float(x.get("price", 0)), float(x.get("size", 0))]
+                             for x in (_bk.get("asks") or [])[:_n]]
+                    return {"bids": _bids, "asks": _asks}
+                except Exception:
+                    return None
+            _raw_book_up = _compact_book(getattr(self.rt, "_last_signal_book_up", None))
+            _raw_book_down = _compact_book(getattr(self.rt, "_last_signal_book_down", None))
+            try:
+                _funding = (_sig_result or {}).get("sub", {}).get("sentiment", {}).get("funding", {}) or {}
+                _raw_funding = _funding.get("rate_pct")
+            except Exception:
+                _raw_funding = None
+            _window_open_btc = getattr(self.rt, "window_open_btc", None)
+            try:
+                if (_window_open_btc is not None and float(_window_open_btc) != 0
+                        and _btc_spot_at_entry is not None):
+                    _spot_vs_open_pct = (
+                        (float(_btc_spot_at_entry) - float(_window_open_btc))
+                        / float(_window_open_btc) * 100.0
+                    )
+                else:
+                    _spot_vs_open_pct = None
+            except Exception:
+                _spot_vs_open_pct = None
+
             base_ctx["audit_inputs"] = {
                 "mode": ("live" if getattr(self.rt, "live_trading", False) else "demo"),
                 "slug": m.slug, "epoch": int(m.epoch), "window_sec": int(m.window_sec),
@@ -1555,6 +1628,15 @@ class StrategyRunner:
                                "btc_spot_stale": True, "entry_logic": "cheaper_ask"},
                 "regime": {"vol_bucket": _vol_bucket, "seconds_remaining_at_entry": sec_left,
                            "entry_minute_in_window": int((int(m.window_sec) - sec_left) // 60)},
+                # PART 2 — prediction-market features (recording-only; edge captured at
+                # decision time). None if asks/model-prob unavailable.
+                "market": _market_feats,
+                # PART 3 — RAW capture (recording-only, lossless future-proofing).
+                "raw_book_up": _raw_book_up,
+                "raw_book_down": _raw_book_down,
+                "raw_funding": _raw_funding,
+                "window_open_btc": _window_open_btc,
+                "spot_vs_open_pct": _spot_vs_open_pct,
             }
         except Exception as _e:
             print(f"[audit] audit_inputs build failed (non-fatal): {_e!r}", flush=True)
