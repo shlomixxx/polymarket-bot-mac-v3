@@ -39,10 +39,11 @@ All targets restrict to settled, labeled rows: **`settlement_status IN ('WIN','L
 The original design's gates were sound in shape but had false-positive vectors. The build MUST implement the **fixed** versions below.
 
 ### 3.1 Real-fee, stake-normalized net P&L (fixes I3, I6)
-The ledger's `realized_pnl` is netted at the **demo** `FEE_RATE=0.002`, not the real ~3–4% Polymarket round-trip. And under martingale, stakes vary. Therefore compute economics on **per-unit-stake, real-notional** P&L:
+The ledger's `realized_pnl` is netted at the **demo** `FEE_RATE=0.002`, not the real Polymarket round-trip. Polymarket's Jan-2026 **dynamic crypto taker fee** is `feeRate*p*(1-p)` per share, levied per side (crypto `feeRate≈0.07`), which at 50/50 is ≈3.6% of notional **per side** → **≈7.2% round-trip** (+spread ≈ ~8% all-in). And under martingale, stakes vary. Therefore compute economics on **per-unit-stake, real-notional** P&L:
 ```
 r_net(row) = (realized_pnl - (REAL_RATE - 2*FEE_RATE) * fill_price * contracts) / max(loss_recovery_multiplier, 1.0)
-   REAL_RATE = 0.035 (real round-trip wedge)   FEE_RATE = 0.002 (already booked, demo)
+   REAL_RATE = 0.072 (real ~7.2% round-trip crypto wedge, Jan-2026 dynamic taker fee)
+   FEE_RATE  = 0.002 (already booked, demo)
 ```
 Use the row's **actual fill price × contracts** (available on `light=False`), NOT a flat per-$5 wedge — a flat wedge is biased *optimistic* on cheap long-shot fills, which is exactly where the TP mechanic lives. If a future ledger books real fees, set `REAL_RATE=2*FEE_RATE`.
 
@@ -107,7 +108,7 @@ Ambiguity -> always return the lower (safer) state.
 - **collecting / watching** — calm, no button: "אין עדיין edge מובהק — ממשיכים לאסוף נתונים. הכול תקין… אל תפעיל אוטונומיה עכשיו — אין מה להפעיל." + honest progress bar.
 - **forming** — "סימן מקדים ל-edge — עדיין לא מאושר. אל תפעל על סמך זה." plain-language what-we-saw + "צריך עוד ~N עסקאות + מבחן קדימה שטרם עבר." Cards show `נמוך`/`בינוני` + `🧪 טרם אומת ✗`.
 - **confirmed** — the ONLY state with a button. Softened headline (fix M3): **"סימן ל-edge שעבר את כל הבדיקות — שקול להפעיל אוטונומיה"**, one plain sentence of evidence (hit-rate vs baseline, lift, N, net $/trade after real fees, forward-OOS ✓, #confirmations). The button calls `setTab("strategy")` + scroll-anchors to the existing `🤖 מצב החלטה` block — it **never** calls `setDecisionMode`. Verb is always **"שקול"** (consider).
-- **HonestyFooter (always):** "'edge' נחשב אמיתי רק אחרי מבחן קדימה (out-of-sample בזמן אמת), תיקון לריבוי-בדיקות, וסף רווחיות אחרי עמלות אמיתיות (~3-4%)."
+- **HonestyFooter (always):** "'edge' נחשב אמיתי רק אחרי מבחן קדימה (out-of-sample בזמן אמת), תיקון לריבוי-בדיקות, וסף רווחיות אחרי עמלות אמיתיות (~7-8%)."
 
 **The single autonomy-nudge guard** (the only place autonomy is ever encouraged):
 ```tsx
@@ -131,7 +132,7 @@ T1 planted edge → `confirmed`. **T2 — pure noise stays silent across a seed 
 ## 7. Defaults (the 3 user-facing knobs — all conservative)
 
 1. **Min raw lift to ever announce:** +5 percentage points.
-2. **Min economic edge after real costs:** +$0.10 net per unit stake (~+2%, clears the ~3–4% wedge).
+2. **Min economic edge after real costs:** +$0.10 net per unit stake (~+2%, measured *net of* the real ~7.2% round-trip wedge — i.e. the slice must clear the fee and still leave this much).
 3. **Total labeled trades before any slice analysis:** 800 (`collecting` below it), with the per-slice effective gate (`N_SLICE_MIN` effective ≈400–600 at ≥5% fire) being the real binding constraint surfaced honestly in the progress UI.
 
 All three err toward silence. They can be loosened later for more (riskier) alerts.

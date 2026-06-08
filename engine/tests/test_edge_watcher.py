@@ -15,7 +15,7 @@ import edge_watcher as ew
 # ── constants are the single source of truth (spec §3.1, §7) ────────────────
 def test_constants_present_and_sane():
     assert ew.TP_PCT == 18.0
-    assert ew.REAL_RATE == 0.035
+    assert ew.REAL_RATE == 0.072
     assert ew.DEMO_FEE_RATE == 0.002
     assert ew.STAKE_USD == 5.0
     assert ew.TOTAL_MIN == 800
@@ -530,11 +530,17 @@ def test_evaluate_slice_baseline_is_complement_not_constant():
 
 # ── A planted clean economic edge passes G0–G5 ──────────────────────────────
 def test_evaluate_slice_planted_edge_passes_all_gates():
-    # Slice: high TP rate AND net-positive economics; complement: poor on both.
-    disc = _make_disc(slice_tp_rate=0.78, comp_tp_rate=0.42,
-                      slice_net=-0.5, comp_net=-4.0, n_per_side=400, n_days=10)
-    vault = _make_disc(slice_tp_rate=0.78, comp_tp_rate=0.42,
-                       slice_net=-0.5, comp_net=-4.0, n_per_side=200, n_days=10,
+    # Slice: high TP rate AND net-positive economics AFTER the real ~7.2% Polymarket
+    # crypto fee (REAL_RATE=0.072) — a genuinely tradeable edge whose post-real-fee
+    # margin still clears ECON_MIN_NET and a 0.95 day-block DSR; complement: poor on
+    # both. (Recalibrated for the Jan-2026 dynamic taker fee: the bigger wedge shrinks
+    # every r_net, so a 0.78-TP/−0.5-loser slice that was profitable under the old
+    # 3.5% wedge is now too thin to clear DSR; a genuinely tradeable edge must be
+    # stronger.)
+    disc = _make_disc(slice_tp_rate=0.85, comp_tp_rate=0.42,
+                      slice_net=-0.3, comp_net=-4.0, n_per_side=400, n_days=10)
+    vault = _make_disc(slice_tp_rate=0.85, comp_tp_rate=0.42,
+                       slice_net=-0.3, comp_net=-4.0, n_per_side=200, n_days=10,
                        seed=7)
     res = ew._evaluate_slice(disc, vault, _slice_mask, "tp_reach")
     assert res["passes_g0"] is True, res

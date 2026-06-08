@@ -30,7 +30,10 @@ import edge_stats as es
 
 # ── Constants: single source of truth (spec §3.1, §7) ───────────────────────
 TP_PCT = 18.0
-REAL_RATE = 0.035          # real Polymarket round-trip wedge
+REAL_RATE = 0.072          # real Polymarket crypto round-trip wedge: the Jan-2026
+                           # dynamic taker fee (feeRate*p*(1-p) per share, crypto
+                           # feeRate≈0.07 → ≈3.6% of notional per side at 50/50)
+                           # ≈ 7.2% round-trip (+spread ≈ ~8% all-in)
 DEMO_FEE_RATE = 0.002      # already booked in the ledger (per side)
 STAKE_USD = 5.0
 TOTAL_MIN = 800            # below -> "collecting"
@@ -100,7 +103,8 @@ def r_net(row: Any) -> Optional[float]:
     """Stake-normalized, real-fee net $ per unit stake (spec §3.1, fixes I3/I6).
 
     The ledger's realized_pnl is netted at the DEMO fee (DEMO_FEE_RATE per side), not
-    the real ~3-4% Polymarket round-trip. Under martingale, stakes also vary. So:
+    the real ~7.2% Polymarket crypto round-trip (Jan-2026 dynamic taker fee). Under
+    martingale, stakes also vary. So:
 
         r_net = (realized_pnl - wedge) / max(loss_recovery_multiplier, 1.0)
 
@@ -1118,7 +1122,7 @@ def _empty_response(state: str, trades_collected: int, note: str) -> dict:
 
 _COLLECTING_NOTE = (
     "ממשיכים לאסוף נתונים — 'edge' נחשב אמיתי רק אחרי מבחן קדימה (out-of-sample בזמן אמת), "
-    "תיקון לריבוי-בדיקות, וסף רווחיות אחרי עמלות אמיתיות (~3-4%)."
+    "תיקון לריבוי-בדיקות, וסף רווחיות אחרי עמלות אמיתיות (~7-8%)."
 )
 
 
