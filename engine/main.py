@@ -218,6 +218,11 @@ _AUDIT_LESSONS_CACHE = TTLCache(ttl_sec=30.0)
 # than lessons. Cache 60s so the dashboard's 12s poll never re-scans, and the scan runs off-loop.
 _AUDIT_EDGE_CACHE = TTLCache(ttl_sec=60.0)
 
+# Real-fee-adjusted P&L re-derives the round-trip cost at Polymarket's real dynamic crypto fee for
+# EVERY settled trade — an O(N) scan we must keep off the hot /api/demo/snapshot path. Cache 45s so
+# the dashboard's slow refresh (4-10s) never recomputes, and the scan runs off-loop via to_thread.
+_REAL_FEE_PNL_CACHE = TTLCache(ttl_sec=45.0)
+
 
 def _bot_run_win_rate_stats() -> dict[str, Any]:
     """אחוז ניצחונות ביציאות ממומשות מתחילת סשן הבוט (כמו חישוב win rate בלשונית סטטיסטיקה)."""
@@ -2317,6 +2322,36 @@ async def audit_edge():
         return edge_watcher.detect_edges(rows, config=cfg)
     out = await asyncio.to_thread(_work)
     _AUDIT_EDGE_CACHE.set("edge", out)
+    return out
+
+
+@app.get("/api/demo/real-fee-pnl")
+async def demo_real_fee_pnl():
+    """Derived, READ-ONLY view: what the demo's cumulative realized P&L WOULD be at
+    Polymarket's real dynamic crypto TAKER fee (≈7% round-trip), vs the flat 0.2%/side
+    the sandbox actually books. Does NOT touch the demo's FEE_RATE or simulation — it
+    only re-derives the extra fee drag per settled trade.
+
+    Cached 45s + computed off-loop on a snapshot of the trades list (an O(N) per-trade
+    scan), so the dashboard's slow refresh can't add load to the hot snapshot path.
+    Honors stats_epoch_ts so the figure matches the displayed (post-reset) ledger.
+    """
+    cached = _REAL_FEE_PNL_CACHE.get("pnl")
+    if cached is not None:
+        return cached
+    # Snapshot the inputs on the loop (cheap), do the per-trade math off-loop.
+    trades_snapshot = list(demo.state.trades) if demo.state.trades else []
+    since_ts = getattr(demo.state, "stats_epoch_ts", None)
+
+    def _work():
+        from demo_engine import real_fee_adjusted_pnl, CRYPTO_TAKER_FEE_RATE
+        res = real_fee_adjusted_pnl(trades_snapshot, since_ts=since_ts)
+        res["crypto_taker_fee_rate"] = CRYPTO_TAKER_FEE_RATE
+        res["note"] = "אומדן בעמלות-אמת של Polymarket (קריפטו, דינמית); הספר עצמו נשאר ב-0.2%/צד"
+        return res
+
+    out = await asyncio.to_thread(_work)
+    _REAL_FEE_PNL_CACHE.set("pnl", out)
     return out
 
 

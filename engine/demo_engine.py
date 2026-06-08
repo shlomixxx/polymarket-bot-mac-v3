@@ -23,6 +23,109 @@ from order_validation import validate_contracts_for_market
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
 
 FEE_RATE = 0.002  # 0.2% לצד כהערכה
+
+# ── עמלת-אמת (read-only, נגזרת) ──────────────────────────────────────────────
+# מחקר עמידה-בדרישות (2026-06-08): Polymarket הוסיפה ב-ינואר 2026 עמלת TAKER
+# דינמית לשווקי קריפטו. העמלה לכל מניה = feeRate*p*(1-p), feeRate≈0.07 לקריפטו.
+# כשבר-מהנפח (notional) במחיר p, העמלה-לצד = feeRate*(1-p) (≈3.5% ב-p=0.5, ~2% ב-p=0.7).
+# נגבית על שתי הרגליים (כניסה + יציאה) ⇒ round-trip ≈ 7% + spread ≈ ~8% all-in.
+# הדמו רושם flat 0.2%/צד (FEE_RATE) — נמוך פי ~18 מהמציאות. אסור לגעת ב-FEE_RATE
+# או בסימולציה החיה; הפונקציה כאן רק *נגזרת* מה-P&L היה בעמלות-אמת.
+CRYPTO_TAKER_FEE_RATE = 0.07
+
+
+def _real_fee_fraction_of_notional(price: float) -> float:
+    """העמלה-לצד כשבר-מהנפח במחיר ``price``: feeRate*(1-price). מוגבל לטווח [0,1]."""
+    p = max(0.0, min(1.0, float(price)))
+    return CRYPTO_TAKER_FEE_RATE * (1.0 - p)
+
+
+def _is_settled_exit_trade(t: dict) -> bool:
+    """עסקת *סגירה* ממומשת שיש לה realized_pnl מספרי ושני מחירי-רגל ניתנים לשחזור.
+
+    כולל SETTLE_WIN/SETTLE_LOSS/EXPIRE_0 ו-SELL_TP/SELL_STOP. מוציא BUY (פתיחה),
+    RECONCILE (דלתא חשבונאית), SETTLE_UNKNOWN (בוטל, realized_pnl=None) ופוזיציות
+    שנטענו מה-chain דרך reconcile (reconcile_origin) — בדיוק כמו סטטיסטיקת win_rate.
+    """
+    if not isinstance(t, dict):
+        return False
+    if t.get("reconcile_origin") or t.get("voided"):
+        return False
+    rp = t.get("realized_pnl")
+    if rp is None:
+        return False
+    try:
+        float(rp)
+    except (TypeError, ValueError):
+        return False
+    typ = str(t.get("type") or "")
+    if typ == "RECONCILE" or typ == "BUY" or typ.startswith("BUY"):
+        return False
+    if not (typ == "EXPIRE_0" or typ in ("SETTLE_WIN", "SETTLE_LOSS")
+            or typ.startswith("SELL")):
+        return False
+    # נדרשים leg_cost (לשחזור מחיר-הכניסה) ו-contracts חיוביים.
+    try:
+        lc = float(t.get("leg_cost") or 0.0)
+        c = float(t.get("contracts") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return lc > 0.0 and c > 1e-9
+
+
+def real_fee_adjusted_pnl(trades: list[dict], *, since_ts: Optional[float] = None) -> dict[str, float]:
+    """נגזרת read-only: מה ה-P&L הממומש המצטבר *היה* בעמלות-אמת של Polymarket.
+
+    לכל עסקת-סגירה ממומשת משחזרים את שתי הרגליים (כניסה+יציאה), מחשבים את עלות
+    ה-round-trip בעמלה הדינמית האמיתית (``CRYPTO_TAKER_FEE_RATE*(1-price)`` כשבר-
+    מהנפח לכל צד), ומחסירים מ-``realized_pnl`` רק את ה*תוספת* מעבר למה שהדמו כבר
+    גבה (0.2%/צד). אינו משנה את הסימולציה — רק מסכם מה היה קורה בעמלות-אמת.
+
+    מחזיר {sandbox_net, real_fee_net, fee_drag} בדולרים.
+      • sandbox_net  — סך ה-realized_pnl שהדמו רשם (האמת ההיסטורית של הספר).
+      • real_fee_net — sandbox_net פחות תוספת-העמלה האמיתית.
+      • fee_drag     — כמה דולרים תוספת-העמלה האמיתית הייתה אוכלת (sandbox-real).
+    """
+    sandbox_net = 0.0
+    extra_fee_drag = 0.0
+    for t in trades or []:
+        if not _is_settled_exit_trade(t):
+            continue
+        if since_ts is not None:
+            try:
+                if float(t.get("ts") or 0.0) < float(since_ts):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        realized = float(t.get("realized_pnl"))
+        sandbox_net += realized
+
+        contracts = float(t.get("contracts") or 0.0)
+        leg_cost = float(t.get("leg_cost") or 0.0)
+        # מחיר-הכניסה (fill) משוחזר מ-leg_cost = avg_cost*contracts*(1+FEE_RATE).
+        denom = contracts * (1.0 + FEE_RATE)
+        entry_p = (leg_cost / denom) if denom > 1e-12 else 0.0
+        entry_p = max(0.0, min(1.0, entry_p))
+        # מחיר-היציאה: SETTLE_WIN⇒1.0, SETTLE_LOSS/EXPIRE_0⇒0.0, SELL⇒bid (שדה price).
+        exit_p = max(0.0, min(1.0, float(t.get("price") or 0.0)))
+
+        # עמלה שהדמו כבר גבה לכל רגל = FEE_RATE * leg_price * contracts.
+        demo_fee = FEE_RATE * entry_p * contracts + FEE_RATE * exit_p * contracts
+        # עמלת-אמת לכל רגל = feeRate*(1-leg_price) * (leg_price*contracts) [שבר-מהנפח × נפח].
+        real_fee = (
+            _real_fee_fraction_of_notional(entry_p) * entry_p * contracts
+            + _real_fee_fraction_of_notional(exit_p) * exit_p * contracts
+        )
+        extra_fee_drag += max(0.0, real_fee - demo_fee)
+
+    real_fee_net = sandbox_net - extra_fee_drag
+    return {
+        "sandbox_net": round(sandbox_net, 4),
+        "real_fee_net": round(real_fee_net, 4),
+        "fee_drag": round(extra_fee_drag, 4),
+    }
+
+
 # PR-D: השהיית persist (כתיבת 6MB) מחוץ ל-event-loop + throttle ל-backfill הכבד.
 PERSIST_INTERVAL_SEC = 20.0   # לכל היותר כתיבת state אחת כל 20s מנתיב הקריאה (fire-and-forget)
 BACKFILL_THROTTLE_SEC = 30.0  # ה-backfill הכבד (רשת + סריקה) רץ לכל היותר כל 30s, לא בכל poll
