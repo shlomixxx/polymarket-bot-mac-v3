@@ -1574,8 +1574,8 @@ class StrategyRunner:
 
             # ── PART 3 (recording-only): RAW capture (lossless future-proofing). ─────
             # raw_book_up/down: full top-10-level snapshot REUSED from the cached signal's
-            # books (no re-fetch) as compact [[price,size],...]. raw_funding: the raw
-            # funding-rate value (rate_pct) from sub.sentiment.funding. window_open_btc +
+            # books (no re-fetch) as compact [[price,size],...]. funding_rate_pct: the
+            # funding-rate value (rate_pct, a PERCENT) from sub.sentiment.funding. window_open_btc +
             # spot_vs_open_pct: the BTC spot at window start vs now. All None-safe.
             def _compact_book(_bk, _n=10):
                 try:
@@ -1592,9 +1592,9 @@ class StrategyRunner:
             _raw_book_down = _compact_book(getattr(self.rt, "_last_signal_book_down", None))
             try:
                 _funding = (_sig_result or {}).get("sub", {}).get("sentiment", {}).get("funding", {}) or {}
-                _raw_funding = _funding.get("rate_pct")
+                _funding_rate_pct = _funding.get("rate_pct")
             except Exception:
-                _raw_funding = None
+                _funding_rate_pct = None
             _window_open_btc = getattr(self.rt, "window_open_btc", None)
             try:
                 if (_window_open_btc is not None and float(_window_open_btc) != 0
@@ -1634,7 +1634,7 @@ class StrategyRunner:
                 # PART 3 — RAW capture (recording-only, lossless future-proofing).
                 "raw_book_up": _raw_book_up,
                 "raw_book_down": _raw_book_down,
-                "raw_funding": _raw_funding,
+                "funding_rate_pct": _funding_rate_pct,
                 "window_open_btc": _window_open_btc,
                 "spot_vs_open_pct": _spot_vs_open_pct,
             }

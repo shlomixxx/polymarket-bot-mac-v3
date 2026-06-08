@@ -41,7 +41,15 @@ def build_decision_snapshot(
     policy: dict[str, Any], book: dict[str, Any], provenance: dict[str, Any],
     regime: dict[str, Any], execution: dict[str, Any],
     btc_spot_at_entry: Optional[float],
+    **extra: Any,
 ) -> dict[str, Any]:
+    """Build the immutable decision snapshot.
+
+    `**extra` is a forward-compatible catch-all: any NEW audit_inputs key (e.g. market,
+    raw_book_up/down, funding_rate_pct, window_open_btc, spot_vs_open_pct added by the
+    enrichment batch) is merged into the snapshot below so the pipeline never raises
+    TypeError when callers stash additional context. Existing keys are NEVER clobbered.
+    """
     sig = signal_result or {}
     sub = sig.get("sub") or {}
     signals_missing = signal_result is None
@@ -50,7 +58,7 @@ def build_decision_snapshot(
     prov.setdefault("signals_missing", signals_missing)
     prov.setdefault("signals_stale", False)
 
-    return {
+    snapshot = {
         "schema_version": SCHEMA_VERSION,
         "code_version": code_version,
         "decision_ts": decision_ts_ms,
@@ -74,6 +82,15 @@ def build_decision_snapshot(
         "action_propensity": 1.0,
         "exploration_flag": False,
     }
+
+    # Merge any forward-compatible extra audit_inputs keys WITHOUT clobbering the
+    # fixed snapshot fields above. The new keys (market/raw_book_up/window_open_btc/...)
+    # carry distinct names, so they land readably at the top level of the recorded context.
+    if extra:
+        for _k, _v in extra.items():
+            snapshot.setdefault(_k, _v)
+
+    return snapshot
 
 
 def _with_book(clob: dict[str, Any], book: dict[str, Any]) -> dict[str, Any]:

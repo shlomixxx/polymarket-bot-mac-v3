@@ -348,7 +348,10 @@ async def test_compute_ta_signals_contract_and_new_fields(monkeypatch):
 @pytest.mark.asyncio
 async def test_compute_ta_signals_score_unchanged_by_recording(monkeypatch):
     """The score/signals must be identical to what the *legacy* logic produces
-    from the same closes — proving the recording features don't leak in."""
+    from the score-relevant inputs — proving the recording features don't leak in.
+
+    The legacy indicators are computed on the LAST 60 candles (the original window
+    pre limit-bump), so the independent recomputation uses the same 60-candle slice."""
     synthetic = _synthetic_klines(250)
 
     async def fake_fetch(interval="1m", limit=250):
@@ -357,9 +360,9 @@ async def test_compute_ta_signals_score_unchanged_by_recording(monkeypatch):
     monkeypatch.setattr(ta_signals, "fetch_btc_klines", fake_fetch)
     result = await ta_signals.compute_ta_signals()
 
-    # Recompute the score independently using only the legacy inputs.
-    closes = [c["close"] for c in synthetic]
-    cur = closes[-1]
+    # Recompute the score independently using only the legacy inputs (last 60 candles).
+    closes = [c["close"] for c in synthetic][-60:]
+    cur = [c["close"] for c in synthetic][-1]
     rsi = compute_rsi(closes)
     ema9 = _ema(closes, 9)[-1]
     ema21 = _ema(closes, 21)[-1]
@@ -384,6 +387,45 @@ async def test_compute_ta_signals_score_unchanged_by_recording(monkeypatch):
         expected_score -= 1
 
     assert result["score"] == expected_score
+
+
+@pytest.mark.asyncio
+async def test_compute_ta_signals_score_invariant_to_klines_limit_bump(monkeypatch):
+    """SCORE-INVARIANCE (regression for the 60->250 fetch limit bump): the legacy
+    score/rsi/ema9/ema21 computed from a 250-candle series MUST equal those computed
+    from just its LAST 60 candles. Proves the limit bump (recording-only) cannot shift
+    the warmup-dependent trading indicators that feed `score` -> recommendation -> side."""
+    full = _synthetic_klines(250)
+    last60 = full[-60:]
+
+    async def fetch_full(interval="1m", limit=250):
+        return full
+
+    async def fetch_60(interval="1m", limit=250):
+        return last60
+
+    # Run compute_ta_signals over the FULL 250-candle history.
+    monkeypatch.setattr(ta_signals, "fetch_btc_klines", fetch_full)
+    res_full = await ta_signals.compute_ta_signals()
+
+    # Run it over ONLY the last 60 candles (the pre-bump window).
+    monkeypatch.setattr(ta_signals, "fetch_btc_klines", fetch_60)
+    res_60 = await ta_signals.compute_ta_signals()
+
+    # The score-relevant legacy outputs must be byte-identical.
+    assert res_full["score"] == res_60["score"]
+    assert res_full["rsi"] == res_60["rsi"]
+    assert res_full["ema9"] == res_60["ema9"]
+    assert res_full["ema21"] == res_60["ema21"]
+    assert res_full["atr"] == res_60["atr"]
+    assert res_full["momentum_3m_pct"] == res_60["momentum_3m_pct"]
+    assert res_full["momentum_5m_pct"] == res_60["momentum_5m_pct"]
+    # The signal sub-dicts (which carry the per-indicator up/down votes) match too.
+    assert res_full["signals"] == res_60["signals"]
+    # Sanity: the RECORDING features DO use the full history (so they differ / are richer).
+    # EMA200 needs >200 candles -> present on full, None on the 60-candle run.
+    assert res_full["features"]["ema200"] is not None
+    assert res_60["features"]["ema200"] is None
 
 
 @pytest.mark.asyncio

@@ -391,26 +391,36 @@ async def compute_ta_signals() -> dict[str, Any]:
     if not candles:
         return {"error": "no candles", "available": False}
 
+    # SCORE-INVARIANCE GUARD: the trading score's legacy indicators (RSI14/EMA9/EMA21/ATR/
+    # momentum) are warmup-dependent, so they shift slightly if computed over more history.
+    # The fetch limit was bumped 60->250 purely to feed the NEW recording features. To keep
+    # the actual trading score byte-identical to pre-bump behavior, the legacy fields are
+    # computed on the LAST 60 candles only (the original window), while the new recording
+    # features (_build_features / _build_raw_candles) consume the FULL 250-candle history.
+    LEGACY_CANDLE_COUNT = 60
+    candles_legacy = candles[-LEGACY_CANDLE_COUNT:] if len(candles) > LEGACY_CANDLE_COUNT else candles
+    closes_legacy = [c["close"] for c in candles_legacy]
+
     closes = [c["close"] for c in candles]
     current_price = closes[-1]
 
-    rsi = compute_rsi(closes)
-    atr = compute_atr(candles)
+    rsi = compute_rsi(closes_legacy)
+    atr = compute_atr(candles_legacy)
 
-    ema9_series = _ema(closes, 9)
-    ema21_series = _ema(closes, 21)
+    ema9_series = _ema(closes_legacy, 9)
+    ema21_series = _ema(closes_legacy, 21)
     ema9 = ema9_series[-1] if ema9_series else None
     ema21 = ema21_series[-1] if ema21_series else None
 
     # מומנטום 3 דקות
     momentum_3m: Optional[float] = None
-    if len(closes) >= 4 and closes[-4] > 0:
-        momentum_3m = (current_price - closes[-4]) / closes[-4] * 100
+    if len(closes_legacy) >= 4 and closes_legacy[-4] > 0:
+        momentum_3m = (current_price - closes_legacy[-4]) / closes_legacy[-4] * 100
 
     # מומנטום 5 דקות
     momentum_5m: Optional[float] = None
-    if len(closes) >= 6 and closes[-6] > 0:
-        momentum_5m = (current_price - closes[-6]) / closes[-6] * 100
+    if len(closes_legacy) >= 6 and closes_legacy[-6] > 0:
+        momentum_5m = (current_price - closes_legacy[-6]) / closes_legacy[-6] * 100
 
     score = 0
     signals: list[dict] = []

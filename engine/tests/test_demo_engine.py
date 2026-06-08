@@ -168,6 +168,57 @@ def test_audit_buy_hook_creates_row_and_excludes_audit_inputs(tmp_path: Path, mo
     assert row["settlement_status"] == "PENDING"
 
 
+def test_audit_buy_hook_records_row_with_new_ledger_keys(tmp_path: Path, monkeypatch):
+    """Regression: the audit-enrichment batch added new audit_inputs keys (market, raw_book_up,
+    raw_book_down, raw_funding/funding_rate_pct, window_open_btc, spot_vs_open_pct). They are
+    spread via **_inp into build_decision_snapshot, which previously had a FIXED keyword-only
+    signature with no **extra -> TypeError -> open_row never ran -> NO audit row was written for
+    ANY trade. This drives the REAL open_row path with those keys present and asserts (a) a row IS
+    written, and (b) the new keys survive into the stored audit context."""
+    import importlib
+    monkeypatch.setenv("DATA_ROOT", str(tmp_path))
+    import audit_tracker
+    importlib.reload(audit_tracker)  # bind audit.db to the temp DATA_ROOT
+
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1_000.0)
+    audit_inputs = {
+        "mode": "live", "slug": "s", "epoch": 1, "window_sec": 300, "code_version": "t",
+        "signal_result": None, "policy": {"loss_recovery_multiplier": 1.0},
+        "book": {"ask_u": 0.5, "bid_u": 0.48, "ask_d": 0.5, "bid_d": 0.48},
+        "provenance": {}, "regime": {"vol_bucket": "mid"},
+        # --- the NEW ledger keys added by the enrichment batch ---
+        "market": {"edge_up": 0.03, "implied_up_prob": 0.5},
+        "raw_book_up": {"bids": [[0.48, 100.0]], "asks": [[0.5, 80.0]]},
+        "raw_book_down": {"bids": [[0.48, 90.0]], "asks": [[0.5, 70.0]]},
+        "funding_rate_pct": 0.0123,
+        "window_open_btc": 65000.0,
+        "spot_vs_open_pct": 0.25,
+    }
+    eng.record_live_buy("Up", "tok-NEW", 10.0, 0.5,
+                        context={"audit_inputs": audit_inputs, "gate": "test"})
+
+    persisted = eng.state.trades[-1]
+    assert "audit_inputs" not in persisted          # still not persisted onto the trade
+    sid = persisted["session_id"]
+    row = audit_tracker.get_audit(sid)
+    assert row is not None                            # (a) a row WAS written despite the new keys
+    assert row["side"] == "Up"
+    assert row["settlement_status"] == "PENDING"
+    # (b) the new keys survive into the stored audit context (top-level, readable names)
+    ctx = row["context"]
+    assert ctx["market"] == {"edge_up": 0.03, "implied_up_prob": 0.5}
+    assert ctx["raw_book_up"] == {"bids": [[0.48, 100.0]], "asks": [[0.5, 80.0]]}
+    assert ctx["raw_book_down"] == {"bids": [[0.48, 90.0]], "asks": [[0.5, 70.0]]}
+    assert ctx["funding_rate_pct"] == pytest.approx(0.0123)
+    assert ctx["window_open_btc"] == pytest.approx(65000.0)
+    assert ctx["spot_vs_open_pct"] == pytest.approx(0.25)
+    # existing snapshot keys must NOT be clobbered by the extra merge
+    assert ctx["side"] == "Up"
+    assert ctx["window_sec"] == 300
+    assert ctx["schema_version"] == 1
+
+
 def test_settlement_pnl_if_held_pure_arithmetic():
     """Recording-only counterfactual: payoff (=contracts if side==resolved, else 0) minus stake."""
     from demo_engine import _settlement_pnl_if_held
