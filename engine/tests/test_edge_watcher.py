@@ -614,6 +614,81 @@ def test_evaluate_slice_economic_gate_rejects_high_tp_but_unprofitable():
     # economic gate is the MASTER gate: even a real TP-rate edge can't pass.
 
 
+# ── abstention (E): the economic gate is MIRRORED (costly, not profitable) ────
+def _arow(ts, *, in_slice, abstain, pnl, vol_bucket="mid"):
+    """A settled row for the abstention target. `abstain` rows are NOT TP and
+    would have LOST if held (the directional counterfactual), so the abstention
+    label = 1 (skipping them is correct). The slice membership is the rsi7-high
+    feature so `_slice_mask` selects it."""
+    r = _row(ts, ta={"rsi7": 90.0 if in_slice else 10.0}, vol_bucket=vol_bucket)
+    r["exit_type"] = "settle" if abstain else "TP"
+    r["realized_pnl"] = pnl
+    r["fill_price"] = 0.30
+    r["contracts"] = 16.0
+    r["settlement_status"] = "LOSS" if pnl <= 0 else "WIN"
+    r["resolved_outcome"] = "Up"
+    # held-to-resolution counterfactual: abstain -> would have lost; else won.
+    r["cf_exit_variants"] = {"pnl_if_held_to_resolution": -1.0 if abstain else 1.0}
+    r["loss_recovery_multiplier"] = 1.0
+    r["exploration_flag"] = 0
+    r["rule_flags"] = {"recovery_active": False}
+    return r
+
+
+def _make_abstain_disc(*, slice_abstain_rate, comp_abstain_rate,
+                       n_per_side=240, n_days=8, seed=0):
+    """Discovery set with a planted abstention gap: the slice (rsi7 high) is
+    mostly costly-to-trade (abstain=1, big negative r_net) with a sampled winning
+    tail; the complement (rsi7 low) is mostly fine."""
+    import random as _r
+    rng = _r.Random(seed)
+    rows = []
+    vols = ["low", "mid", "high"]
+    for k, (rate, ins) in enumerate(
+        [(slice_abstain_rate, True), (comp_abstain_rate, False)]
+    ):
+        for i in range(n_per_side):
+            day = i % n_days
+            ts = day * _DAY + (k * n_per_side + i)
+            ab = rng.random() < rate
+            # costly abstain rows lose ~ -3.0; the rest win ~ +0.90 (sampled tail)
+            pnl = -3.0 if ab else 0.90
+            rows.append(_arow(ts, in_slice=ins, abstain=ab, pnl=pnl,
+                              vol_bucket=vols[i % 3]))
+    rng.shuffle(rows)
+    return rows
+
+
+def test_evaluate_slice_abstention_passes_costly_slice():
+    """The abstention economic gate is the MIRROR of tp_reach: a slice that
+    reliably LOSES money (mean r_net <= ECON_ABSTAIN_NET) passes G3 for the
+    abstention target — and the SAME slice fails G3 for tp_reach (it's not
+    profitable). This is the fix for the inverted-gate / dead-ECON_ABSTAIN_NET gap."""
+    disc = _make_abstain_disc(slice_abstain_rate=0.80, comp_abstain_rate=0.30)
+    vault = _make_abstain_disc(slice_abstain_rate=0.80, comp_abstain_rate=0.30,
+                               n_per_side=120, seed=7)
+    res_e = ew._evaluate_slice(disc, vault, _slice_mask, "abstention")
+    assert res_e["r_net_mean"] <= ew.ECON_ABSTAIN_NET, res_e
+    assert res_e["n_winners"] >= ew.N_LOSERS_MIN, res_e
+    assert res_e["r_net_p95_boot"] < 0.0, res_e
+    assert res_e["passes_g3"] is True, res_e
+    # the very same costly slice is NOT a tp_reach edge (it loses money).
+    res_b = ew._evaluate_slice(disc, vault, _slice_mask, "tp_reach")
+    assert res_b["passes_g3"] is False, res_b
+
+
+def test_evaluate_slice_abstention_rejects_profitable_slice():
+    """A PROFITABLE slice must NOT pass the abstention gate — skipping a winning
+    setup would be wrong. Errs toward silence."""
+    disc = _make_disc(slice_tp_rate=0.75, comp_tp_rate=0.45,
+                      slice_net=-1.0, comp_net=-3.5, n_per_side=300, n_days=8)
+    vault = _make_disc(slice_tp_rate=0.75, comp_tp_rate=0.45,
+                       slice_net=-1.0, comp_net=-3.5, n_per_side=150, n_days=8,
+                       seed=3)
+    res_e = ew._evaluate_slice(disc, vault, _slice_mask, "abstention")
+    assert res_e["passes_g3"] is False, res_e
+
+
 # ── G5 / T6: a martingale-only slice fails the clean() survival gate ─────────
 def test_evaluate_slice_martingale_only_fails_g5():
     """T6 — if the slice's edge exists ONLY on loss-recovery (martingale) rows,

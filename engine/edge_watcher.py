@@ -643,7 +643,9 @@ def _empty_slice_result() -> dict:
         "n_dayblocks": 0,
         "r_net_mean": 0.0,
         "r_net_p5_boot": 0.0,
+        "r_net_p95_boot": 0.0,
         "n_losers": 0,
+        "n_winners": 0,
         "dsr": 0.0,
         "stability": {
             "folds_ok": 0,
@@ -664,12 +666,14 @@ def _empty_slice_result() -> dict:
     }
 
 
-def _stability(in_rows: list, label_fn) -> dict:
+def _stability(in_rows: list, label_fn, econ_sign: float = 1.0) -> dict:
     """Regime stability over the in-slice rows (spec §3.7):
       * sign of mean(r_net) holds in >=3 of 4 contiguous calendar folds,
       * worst-fold mean(r_net) > WORST_FOLD_MIN_NET,
       * single top UTC day holds < TOP_DAY_MAX_FRAC of |slice P&L|,
       * edge positive in >=2 of 3 vol-buckets.
+    `econ_sign` orients the economics: +1 for tp_reach (edge = profitable), −1 for
+    abstention (edge = reliably COSTLY, so the favorable sign is negative r_net).
     Never raises.
     """
     out = {
@@ -701,8 +705,8 @@ def _stability(in_rows: list, label_fn) -> dict:
                 if chunk:
                     fold_means.append(_mean(chunk))
         out["folds_total"] = len(fold_means)
-        out["folds_ok"] = sum(1 for m in fold_means if m > 0.0)
-        out["worst_fold_net"] = min(fold_means) if fold_means else 0.0
+        out["folds_ok"] = sum(1 for m in fold_means if econ_sign * m > 0.0)
+        out["worst_fold_net"] = min((econ_sign * m for m in fold_means), default=0.0)
 
         # ── top single UTC day as a fraction of |slice P&L| ──
         by_day: dict[Any, float] = {}
@@ -723,7 +727,7 @@ def _stability(in_rows: list, label_fn) -> dict:
             by_vol.setdefault(vb, []).append(v)
         vol_means = {vb: _mean(vs) for vb, vs in by_vol.items() if vs}
         out["vol_regimes_total"] = len(vol_means)
-        out["vol_regimes_ok"] = sum(1 for m in vol_means.values() if m > 0.0)
+        out["vol_regimes_ok"] = sum(1 for m in vol_means.values() if econ_sign * m > 0.0)
 
         out["ok"] = (
             out["folds_total"] >= STABILITY_FOLDS_MIN_OK
@@ -805,18 +809,22 @@ def _evaluate_slice(disc_rows: Any, vault_rows: Any, mask_fn: Any, target: str) 
         r_in = [v for v in r_in if v is not None]
         res["r_net_mean"] = _mean(r_in)
         res["n_losers"] = sum(1 for v in r_in if v < 0.0)
+        res["n_winners"] = sum(1 for v in r_in if v > 0.0)
 
-        # day-block bootstrap of mean(r_net) -> 5th-percentile tail.
+        # day-block bootstrap of mean(r_net) -> 5th / 95th-percentile tails.
+        # tp_reach gates on the lower tail (p5 > 0); abstention on the upper tail
+        # (p95 < 0 -> even the best resample is still costly).
         econ_days = [_day_key(r) for r in in_rows if r_net(r) is not None]
         boots = es.day_block_bootstrap(
             r_in, econ_days, _mean, iters=_BOOT_ITERS, seed=_BOOT_SEED
         )
         if boots:
             s = sorted(boots)
-            idx = int(0.05 * (len(s) - 1))
-            res["r_net_p5_boot"] = s[idx]
+            res["r_net_p5_boot"] = s[int(0.05 * (len(s) - 1))]
+            res["r_net_p95_boot"] = s[int(0.95 * (len(s) - 1))]
         else:
             res["r_net_p5_boot"] = 0.0
+            res["r_net_p95_boot"] = 0.0
 
         # Deflated Sharpe on the DAY-BLOCK-AVERAGED r_net stream (one return per UTC
         # day), haircut for the honest per-scan trial count. Aggregating to the day
@@ -833,7 +841,9 @@ def _evaluate_slice(disc_rows: Any, vault_rows: Any, mask_fn: Any, target: str) 
         res["dsr"] = es.deflated_sharpe(day_means, n_trials=max(len(FEATURES) * 6, 1))
 
         # ── stability (folds / top-day / vol regimes) ──
-        res["stability"] = _stability(in_rows, label_fn)
+        # abstention's favorable economics are NEGATIVE -> flip the sign.
+        econ_sign = -1.0 if target == "abstention" else 1.0
+        res["stability"] = _stability(in_rows, label_fn, econ_sign)
 
         # ── clean() survival: edge holds on the martingale/exploration-free subset ──
         clean_in = [r for r in in_rows if clean(r)]
@@ -844,12 +854,17 @@ def _evaluate_slice(disc_rows: Any, vault_rows: Any, mask_fn: Any, target: str) 
         clean_r = [r_net(r) for r in clean_in]
         clean_r = [v for v in clean_r if v is not None]
         clean_net = _mean(clean_r)
-        # The slice must retain BOTH its directional lift AND positive economics
-        # once the confounded rows are removed, on a non-trivial clean sample.
+        # The slice must retain BOTH its directional lift AND its economics (the
+        # right SIGN per target) once the confounded rows are removed, on a
+        # non-trivial clean sample.
+        clean_econ_ok = (
+            clean_net <= ECON_ABSTAIN_NET if target == "abstention"
+            else clean_net >= ECON_MIN_NET
+        )
         res["clean_survives"] = bool(
             cn1 >= max(1, int(0.5 * N_SLICE_MIN_EFFECTIVE))
             and c_lift >= MIN_RAW_LIFT_PTS
-            and clean_net >= ECON_MIN_NET
+            and clean_econ_ok
         )
 
         # ── forward-OOS slice-vs-complement on the vault (G1) ──
@@ -875,12 +890,23 @@ def _evaluate_slice(disc_rows: Any, vault_rows: Any, mask_fn: Any, target: str) 
             and res["wilson_ok"]
             and n_slice_dayblocks >= MIN_SLICE_DAYBLOCKS
         )
-        res["passes_g3"] = bool(
-            res["r_net_mean"] >= ECON_MIN_NET
-            and res["r_net_mean"] > 0.0
-            and res["r_net_p5_boot"] > 0.0
-            and res["n_losers"] >= N_LOSERS_MIN
-        )
+        if target == "abstention":
+            # E edge = the slice is genuinely COSTLY (skipping it is the win):
+            # reliably-negative economics, the opposite (winning) tail actually
+            # sampled, and even the best day-block resample still loses money.
+            res["passes_g3"] = bool(
+                res["r_net_mean"] <= ECON_ABSTAIN_NET
+                and res["r_net_mean"] < 0.0
+                and res["r_net_p95_boot"] < 0.0
+                and res["n_winners"] >= N_LOSERS_MIN
+            )
+        else:
+            res["passes_g3"] = bool(
+                res["r_net_mean"] >= ECON_MIN_NET
+                and res["r_net_mean"] > 0.0
+                and res["r_net_p5_boot"] > 0.0
+                and res["n_losers"] >= N_LOSERS_MIN
+            )
         res["passes_g4"] = bool(res["stability"].get("ok"))
         res["passes_g5"] = bool(res["clean_survives"])
         return res
