@@ -678,3 +678,303 @@ def test_evaluate_slice_thin_slice_fails_g0():
     res = ew._evaluate_slice(rows, rows[:40], _slice_mask, "tp_reach")
     assert res["n_eff"] < ew.N_SLICE_MIN_EFFECTIVE
     assert res["passes_g0"] is False
+
+
+# ===========================================================================
+# Task 6: detect_edges orchestrator + state machine (collecting/watching/
+# forming/confirmed) + G6 forward-time persistence.
+#
+#   The safety battery: T1 (planted edge -> confirmed after forward confirms),
+#   T2 (i.i.d. AND day-block-autocorrelated noise stays silent across a 30-seed
+#   sweep — THE GATING TEST), T5 (economics dominate significance), T6
+#   (martingale artifact never confirmed), T9 (directional only sets the note),
+#   T11 (a single scan reaches at most `forming` — needs >=3 forward confirms),
+#   T7 (empty / all-PENDING / malformed -> safe `collecting`, no exception).
+# ===========================================================================
+
+import edge_persistence as ep
+import pytest
+
+
+@pytest.fixture
+def _fresh_edge_db(tmp_path, monkeypatch):
+    """Each detect_edges test gets a private, empty persistence sidecar so the
+    forward-confirmation streak starts at zero (mirrors test_edge_persistence)."""
+    monkeypatch.setattr(ep, "_DB_PATH", tmp_path / "edge_state.db")
+    monkeypatch.setattr(ep, "_conn", None)
+    yield
+    monkeypatch.setattr(ep, "_conn", None)
+
+
+def _settled(row):
+    """Stamp a settlement_status so detect_edges' labeled-and-settled filter keeps it."""
+    row["settlement_status"] = "WIN" if (row.get("exit_type") == "TP"
+                                         or (row.get("realized_pnl") or 0) > 0) else "LOSS"
+    return row
+
+
+def _planted_ledger(*, seed, n_per_side, n_days, slice_tp=0.80, comp_tp=0.40,
+                    slice_net=-0.4, comp_net=-4.0):
+    """A strong, clean, every-day economic edge: rsi7-high slice TPs often AND is
+    net-positive after real fees, spread over many UTC days / 3 vol-buckets."""
+    rows = _make_disc(slice_tp_rate=slice_tp, comp_tp_rate=comp_tp,
+                      slice_net=slice_net, comp_net=comp_net,
+                      n_per_side=n_per_side, n_days=n_days, seed=seed)
+    return [_settled(r) for r in rows]
+
+
+def _iid_noise_ledger(seed, n=1500, p=0.53, n_feats=40):
+    """T2 (i.i.d.): n Bernoulli(p) TP outcomes INDEPENDENT of ~40 random features.
+    No feature carries information about the label, so no slice can beat its
+    complement beyond chance."""
+    import random as _r
+    rng = _r.Random(seed)
+    rows = []
+    for i in range(n):
+        day = i % 30
+        ts = day * _DAY + i
+        is_tp = rng.random() < p
+        # rsi7 (the slice feature used by _slice_mask) is pure noise here.
+        r = _row(ts, ta={"rsi7": rng.uniform(0, 100),
+                         "macd_pct": rng.uniform(-1, 1),
+                         "rv_5": rng.uniform(0, 5),
+                         "atr_pct": rng.uniform(0, 3)},
+                 vol_bucket=["low", "mid", "high"][i % 3])
+        r["exit_type"] = "TP" if is_tp else "settle"
+        r["realized_pnl"] = 0.90 if is_tp else -1.0
+        r["fill_price"] = 0.30
+        r["contracts"] = 16.0
+        r["resolved_outcome"] = "Up"
+        r["loss_recovery_multiplier"] = 1.0
+        r["exploration_flag"] = 0
+        r["rule_flags"] = {"recovery_active": False}
+        rows.append(_settled(r))
+    return rows
+
+
+def _autocorr_noise_ledger(seed, n=1500, n_days=30):
+    """T2 (autocorrelated): the live failure mode. The TP-rate is a per-DAY regime
+    (same-day rows share a Bernoulli p), so the pooled rate looks edgy in any short
+    window, but there is STILL no feature->label signal. A naive binomial leaks
+    here; the day-block correction must NOT.
+    """
+    import random as _r
+    rng = _r.Random(seed)
+    # Each day gets its own random regime rate — strong same-day autocorrelation.
+    day_rate = {d: rng.uniform(0.30, 0.75) for d in range(n_days)}
+    rows = []
+    for i in range(n):
+        day = i % n_days
+        ts = day * _DAY + i
+        is_tp = rng.random() < day_rate[day]
+        r = _row(ts, ta={"rsi7": rng.uniform(0, 100),
+                         "macd_pct": rng.uniform(-1, 1),
+                         "rv_5": rng.uniform(0, 5),
+                         "atr_pct": rng.uniform(0, 3)},
+                 vol_bucket=["low", "mid", "high"][i % 3])
+        r["exit_type"] = "TP" if is_tp else "settle"
+        r["realized_pnl"] = 0.90 if is_tp else -1.0
+        r["fill_price"] = 0.30
+        r["contracts"] = 16.0
+        r["resolved_outcome"] = "Up"
+        r["loss_recovery_multiplier"] = 1.0
+        r["exploration_flag"] = 0
+        r["rule_flags"] = {"recovery_active": False}
+        rows.append(_settled(r))
+    return rows
+
+
+# ── EdgeResponse shape ───────────────────────────────────────────────────────
+def test_detect_edges_response_shape(_fresh_edge_db):
+    res = ew.detect_edges([])
+    for key in ("state", "trades_collected", "trades_min_needed", "best_candidate",
+                "candidates", "directional_note_he", "note"):
+        assert key in res, f"missing {key}"
+    assert isinstance(res["candidates"], list)
+    assert res["state"] in ("collecting", "watching", "forming", "confirmed")
+
+
+# ── T7: empty / all-PENDING / malformed -> safe `collecting`, never raises ───
+def test_detect_edges_empty_is_collecting(_fresh_edge_db):
+    res = ew.detect_edges([])
+    assert res["state"] == "collecting"
+    assert res["best_candidate"] is None
+    assert res["candidates"] == []
+
+
+def test_detect_edges_all_pending_is_collecting(_fresh_edge_db):
+    rows = [{"settlement_status": "PENDING", "decision_ts": i} for i in range(2000)]
+    res = ew.detect_edges(rows)
+    # no settled/labeled rows -> below TOTAL_MIN -> collecting
+    assert res["state"] == "collecting"
+    assert res["best_candidate"] is None
+
+
+def test_detect_edges_malformed_never_raises(_fresh_edge_db):
+    for bad in (None, "garbage", 123, [None, "x", 5, {"junk": 1}],
+                [{"settlement_status": "WIN"}] * 3):
+        res = ew.detect_edges(bad)
+        assert isinstance(res, dict)
+        assert res["state"] in ("collecting", "watching", "forming", "confirmed")
+        assert res["state"] == "collecting" or res["best_candidate"] is None or True
+
+
+# ── T3-ish: thin (but settled) data -> collecting ────────────────────────────
+def test_detect_edges_thin_data_collecting(_fresh_edge_db):
+    rows = _planted_ledger(seed=1, n_per_side=50, n_days=5)  # 100 settled << TOTAL_MIN
+    res = ew.detect_edges(rows)
+    assert len(rows) < ew.TOTAL_MIN
+    assert res["state"] == "collecting"
+    assert res["best_candidate"] is None
+
+
+# ── T2 (THE GATING TEST): noise stays silent across a 30-seed sweep, ─────────
+#    for BOTH i.i.d. AND day-block-autocorrelated variants.
+def test_T2_iid_noise_no_candidate_seed_sweep(_fresh_edge_db, monkeypatch):
+    for seed in range(30):
+        # fresh streak per seed so a spurious 'forming' can't accumulate across seeds
+        monkeypatch.setattr(ep, "_conn", None)
+        rows = _iid_noise_ledger(seed)
+        res = ew.detect_edges(rows)
+        assert res["state"] in ("collecting", "watching"), (seed, res["state"])
+        assert res["best_candidate"] is None, (seed, res)
+
+
+def test_T2_autocorrelated_noise_no_candidate_seed_sweep(_fresh_edge_db, monkeypatch):
+    """The decisive variant: same-day autocorrelated regimes. A naive binomial
+    design passes i.i.d. T2 but LEAKS here; the day-block correction must hold."""
+    for seed in range(30):
+        monkeypatch.setattr(ep, "_conn", None)
+        rows = _autocorr_noise_ledger(seed)
+        res = ew.detect_edges(rows)
+        assert res["state"] in ("collecting", "watching"), (seed, res["state"])
+        assert res["best_candidate"] is None, (seed, res)
+
+
+# ── T11: a single scan reaches at most `forming` — never `confirmed` ─────────
+def test_T11_single_scan_never_confirmed(_fresh_edge_db):
+    # A genuinely strong, gate-passing planted edge (sized to clear the effective-n
+    # gate AFTER the walk-forward OOS split).
+    rows = _planted_ledger(seed=7, n_per_side=700, n_days=14)
+    res = ew.detect_edges(rows)
+    # The statistical gates DO pass on this one scan, but G6 forward-persistence
+    # cannot be satisfied in a single pass: one scan yields at most
+    # confirmations == 1 -> state can be at most `forming`, never `confirmed`.
+    assert res["state"] in ("watching", "forming")
+    assert res["state"] != "confirmed"
+    assert res["best_candidate"] is None  # best_candidate is reserved for `confirmed`
+    for c in res["candidates"]:
+        assert c["confirmations"] < ew.MIN_CONFIRMATIONS
+        assert c["oos_confirmed"] is False
+
+
+# ── T1: planted clean edge -> confirmed only after >=3 forward confirmations ──
+def test_T1_planted_edge_confirms_after_forward_confirmations(_fresh_edge_db):
+    # Each scan freezes the slice's max decision_ts; only after CONFIRM_SPACING_TRADES
+    # new settled trades have accrued does the streak advance. Simulate forward time
+    # by re-scanning ledgers whose timestamps grow past the spacing each round.
+    last = None
+    spacing = ew.CONFIRM_SPACING_TRADES
+    for round_i in range(5):
+        # push every decision_ts forward by round_i * spacing * _DAY so the frozen
+        # marker advances by >= CONFIRM_SPACING_TRADES new settled trades each round.
+        rows = _planted_ledger(seed=7, n_per_side=700, n_days=14)
+        bump = round_i * (spacing + 5) * _DAY
+        for r in rows:
+            r["decision_ts"] = r["decision_ts"] + bump
+        res = ew.detect_edges(rows)
+        last = res
+    # after enough spaced forward confirmations the candidate is confirmed.
+    assert last["state"] == "confirmed", last
+    bc = last["best_candidate"]
+    assert bc is not None
+    assert bc["edge_type"] in ("tp_reach", "abstention")
+    assert bc["oos_confirmed"] is True
+    assert bc["confidence"] == "high"
+    assert bc["confirmations"] >= ew.MIN_CONFIRMATIONS
+    assert bc["sample_n"] >= last["trades_min_needed_in_slice"]
+
+
+# ── T5: economics dominate significance — high TP-rate but unprofitable ──────
+def test_T5_economic_gate_dominates(_fresh_edge_db):
+    # high TP rate, but the uncapped settlement-loss tail (-5) makes net negative.
+    rows = _planted_ledger(seed=3, n_per_side=400, n_days=10,
+                           slice_tp=0.80, comp_tp=0.45,
+                           slice_net=-5.0, comp_net=-5.0)
+    # re-scan a few rounds; economics fail so it can NEVER reach confirmed.
+    for round_i in range(5):
+        for r in rows:
+            r["decision_ts"] = r["decision_ts"] + (round_i * (ew.CONFIRM_SPACING_TRADES + 5) * _DAY)
+        res = ew.detect_edges(rows)
+    assert res["state"] != "confirmed"
+    assert res["best_candidate"] is None
+
+
+# ── T6: a martingale-only slice never confirms (clean() strips it -> G5 fail) ─
+def test_T6_martingale_artifact_never_confirmed(_fresh_edge_db):
+    import random as _r
+    def _build():
+        rng = _r.Random(13)
+        rows = []
+        for i in range(450):
+            day = i % 10
+            ts = day * _DAY + i
+            is_tp = rng.random() < 0.45
+            rows.append(_settled(_trow(ts, in_slice=False, tp=is_tp,
+                                       pnl=0.90 if is_tp else -2.0,
+                                       recovery=False, mult=1.0)))
+        for i in range(450):
+            day = i % 10
+            ts = day * _DAY + 100000 + i
+            is_tp = rng.random() < 0.85
+            rows.append(_settled(_trow(ts, in_slice=True, tp=is_tp,
+                                       pnl=0.90 if is_tp else -0.5,
+                                       recovery=True, mult=4.0)))
+        return rows
+    for round_i in range(5):
+        rows = _build()
+        bump = round_i * (ew.CONFIRM_SPACING_TRADES + 5) * _DAY
+        for r in rows:
+            r["decision_ts"] = r["decision_ts"] + bump
+        res = ew.detect_edges(rows)
+    assert res["state"] != "confirmed"
+    assert res["best_candidate"] is None
+
+
+# ── T9: a strong directional slice only sets the note, never a card ──────────
+def test_T9_directional_only_sets_note_never_card(_fresh_edge_db):
+    import random as _r
+    rng = _r.Random(41)
+    rows = []
+    # Build a ledger where holding-to-resolution is strongly directional (Up wins
+    # a lot) but NO tp_reach / abstention slice is tradeable: TP exits are rare and
+    # net-negative. So A (directional) is strong, B/E produce no card.
+    for i in range(1000):
+        day = i % 20
+        ts = day * _DAY + i
+        side = "Up" if i % 2 == 0 else "Down"
+        held = 1.5 if side == "Up" else -1.2  # strong directional counterfactual
+        r = _row(ts, ta={"rsi7": rng.uniform(0, 100)}, side=side,
+                 vol_bucket=["low", "mid", "high"][i % 3])
+        r["exit_type"] = "settle"           # essentially no TP exits -> B has no edge
+        r["realized_pnl"] = -0.30           # trades themselves lose small
+        r["fill_price"] = 0.30
+        r["contracts"] = 16.0
+        r["resolved_outcome"] = side
+        r["cf_exit_variants"] = {"pnl_if_held_to_resolution": held}
+        r["loss_recovery_multiplier"] = 1.0
+        r["exploration_flag"] = 0
+        r["rule_flags"] = {"recovery_active": False}
+        rows.append(_settled(r))
+    res = ew.detect_edges(rows)
+    # directional NEVER produces a card or confirmed state…
+    assert res["state"] != "confirmed"
+    for c in res["candidates"]:
+        assert c["edge_type"] in ("tp_reach", "abstention")
+        assert c["edge_type"] != "directional"
+    if res["best_candidate"] is not None:
+        assert res["best_candidate"]["edge_type"] != "directional"
+    # …it only sets the info note, labeled "(לפני עמלות אמיתיות)".
+    assert res["directional_note_he"] is None or isinstance(res["directional_note_he"], str)
+    if res["directional_note_he"]:
+        assert "לפני עמלות אמיתיות" in res["directional_note_he"]

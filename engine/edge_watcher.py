@@ -886,3 +886,378 @@ def _evaluate_slice(disc_rows: Any, vault_rows: Any, mask_fn: Any, target: str) 
         return res
     except Exception:
         return _empty_slice_result()
+
+
+# ── Task 6: detect_edges orchestrator + state machine + G6 persistence ───────
+#
+# Pure-Python over a list of light=False ledger rows. Filters to settled & labeled
+# rows; below TOTAL_MIN -> "collecting". Otherwise enumerates B (tp_reach) and E
+# (abstention) feature-slices, scores each against its complement with the full
+# G0-G5 gate battery, applies per-scan BH-FDR over the honest hypothesis count m,
+# then applies G6 forward-time persistence (edge_persistence) so a single scan can
+# reach at most "forming" — never "confirmed". The directional (A) diagnostic only
+# sets directional_note_he, never a card, never confirmed (spec §3.8).
+#
+# NEVER RAISES: any malformed / empty input returns a safe "collecting" response.
+
+try:  # the sidecar is optional at import time (recording-only; never trading code)
+    import edge_persistence as _ep
+except Exception:  # pragma: no cover - import guard
+    _ep = None
+
+
+# A row is analyzable only once it is settled AND labeled WIN/LOSS (mirrors the
+# audit_tracker labels_only filter: settlement_status IN ('WIN','LOSS')).
+_SETTLED_LABELS = ("WIN", "LOSS")
+
+
+def _is_settled_labeled(row: Any) -> bool:
+    try:
+        return isinstance(row, dict) and row.get("settlement_status") in _SETTLED_LABELS
+    except Exception:
+        return False
+
+
+def _slice_mask_for(bucket_fn: Callable[[Any], Optional[str]], label: str) -> Callable[[Any], bool]:
+    """A membership predicate: the row's frozen bucket equals `label`. Never raises."""
+
+    def _mask(row: Any) -> bool:
+        try:
+            return bucket_fn(row) == label
+        except Exception:
+            return False
+
+    return _mask
+
+
+def _enumerate_slices(disc_rows: list) -> list[tuple[str, Callable[[Any], bool]]]:
+    """Every (slice_key, mask_fn) candidate: each FEATURE bucketized (frozen on the
+    DISCOVERY set as the train segment — leak guard) yields one mask per bucket label
+    seen in discovery. slice_key is a stable "<feature>:<bucket>" string. Never raises.
+    """
+    slices: list[tuple[str, Callable[[Any], bool]]] = []
+    try:
+        for feat in FEATURES:
+            try:
+                bucket_fn = bucketize(disc_rows, feat)
+            except Exception:
+                continue
+            labels: set[str] = set()
+            for r in disc_rows:
+                try:
+                    lbl = bucket_fn(r)
+                except Exception:
+                    lbl = None
+                if isinstance(lbl, str):
+                    labels.add(lbl)
+            for lbl in sorted(labels):
+                slices.append((lbl, _slice_mask_for(bucket_fn, lbl)))
+    except Exception:
+        return slices
+    return slices
+
+
+def _max_decision_ts(rows: list) -> float:
+    """Frozen forward-position marker: the max decision_ts across settled rows.
+    Empty -> 0.0; never raises."""
+    try:
+        best = 0.0
+        seen = False
+        for r in rows:
+            ts = _decision_ts(r)
+            if math.isfinite(ts):
+                if not seen or ts > best:
+                    best = ts
+                    seen = True
+        return best if seen else 0.0
+    except Exception:
+        return 0.0
+
+
+def _confidence_for(res: dict, confirmations: int) -> str:
+    """Plain-language confidence label. `high` requires the full gate battery AND
+    forward confirmation; otherwise `מבינוני`/`נמוך` per how much cleared."""
+    try:
+        gates = sum(
+            1
+            for g in ("passes_g0", "passes_g1", "passes_g2", "passes_g3", "passes_g4", "passes_g5")
+            if res.get(g)
+        )
+        if gates == 6 and confirmations >= MIN_CONFIRMATIONS:
+            return "high"
+        if gates >= 4:
+            return "medium"
+        return "low"
+    except Exception:
+        return "low"
+
+
+def _setup_he(slice_key: str, edge_type: str) -> str:
+    """Plain-Hebrew setup description for a candidate card. Never raises."""
+    kind = "פגיעה ב-TP" if edge_type == "tp_reach" else "הימנעות (לדלג)"
+    try:
+        return f"כשמתקיים: {slice_key} → {kind}"
+    except Exception:
+        return kind
+
+
+def _build_card(slice_key: str, edge_type: str, res: dict, confirmations: int,
+                oos_confirmed: bool) -> dict:
+    """Build one EdgeCard (spec §4 shape). JSON-safe; never raises."""
+    try:
+        sample_n = int(round(res.get("n_eff", 0.0)))
+        more = max(MIN_CONFIRMATIONS - max(int(confirmations), 0), 0)
+        return {
+            "setup_he": _setup_he(slice_key, edge_type),
+            "edge_type": edge_type,
+            "hit_rate_pct": round(float(res.get("hit_rate_pct", 0.0)), 1),
+            "baseline_pct": round(float(res.get("baseline_pct", 0.0)), 1),
+            "lift_pct": round(float(res.get("lift_pct", 0.0)), 1),
+            "sample_n": sample_n,
+            "net_dollars_per_trade": round(float(res.get("r_net_mean", 0.0)), 3),
+            "oos_confirmed": bool(oos_confirmed),
+            "confirmations": int(max(confirmations, 0)),
+            "confidence": _confidence_for(res, confirmations),
+            "more_trades_to_confirm": int(more * CONFIRM_SPACING_TRADES),
+            "slice_key": slice_key,
+        }
+    except Exception:
+        return {
+            "setup_he": _setup_he(slice_key, edge_type),
+            "edge_type": edge_type,
+            "hit_rate_pct": 0.0,
+            "baseline_pct": 0.0,
+            "lift_pct": 0.0,
+            "sample_n": 0,
+            "net_dollars_per_trade": 0.0,
+            "oos_confirmed": False,
+            "confirmations": 0,
+            "confidence": "low",
+            "more_trades_to_confirm": MIN_CONFIRMATIONS * CONFIRM_SPACING_TRADES,
+            "slice_key": slice_key,
+        }
+
+
+def _diagnose_directional(settled: list) -> Optional[str]:
+    """A (DIAGNOSTIC-ONLY): is held-to-resolution directionally informative? Returns
+    a plain-Hebrew note labeled "(לפני עמלות אמיתיות)" when a side's hold-win-rate is
+    notably off 50%, else None. NEVER a card / confirmed / nudge (spec §3.8). Never raises.
+    """
+    try:
+        by_side: dict[str, list[int]] = {"Up": [], "Down": []}
+        for r in settled:
+            yd = y_dir(r)
+            if yd is None:
+                continue
+            side = r.get("side") if isinstance(r, dict) else None
+            if side in ("Up", "Down"):
+                by_side[side].append(yd)
+        notes = []
+        for side, ys in by_side.items():
+            if len(ys) < 100:
+                continue
+            wr = 100.0 * sum(ys) / len(ys)
+            if abs(wr - 50.0) >= 8.0:
+                notes.append(f"{side}: {wr:.0f}% החזקה-עד-הכרעה (n={len(ys)})")
+        if not notes:
+            return None
+        return (
+            "אבחון כיווני (לפני עמלות אמיתיות): "
+            + " · ".join(notes)
+            + " — מידע בלבד, לא איתות מסחר."
+        )
+    except Exception:
+        return None
+
+
+def _empty_response(state: str, trades_collected: int, note: str) -> dict:
+    """A safe EdgeResponse with no candidate (spec §4 shape)."""
+    return {
+        "state": state,
+        "trades_collected": int(trades_collected),
+        "trades_min_needed": TOTAL_MIN,
+        # The per-slice effective gate (what an EdgeCard's sample_n is measured
+        # against in the mayNudgeAutonomy guard — fix M1).
+        "trades_min_needed_in_slice": int(N_SLICE_MIN_EFFECTIVE),
+        # The honest progress denominator for the UI (fix M4): to expect
+        # N_SLICE_MIN effective samples in a >=5%-fire slice you need this many
+        # TOTAL labeled trades.
+        "trades_min_total_for_slice": int(round(N_SLICE_MIN_EFFECTIVE / FIRE_RATE_MIN)),
+        "best_candidate": None,
+        "candidates": [],
+        "directional_note_he": None,
+        "note": note,
+    }
+
+
+_COLLECTING_NOTE = (
+    "ממשיכים לאסוף נתונים — 'edge' נחשב אמיתי רק אחרי מבחן קדימה (out-of-sample בזמן אמת), "
+    "תיקון לריבוי-בדיקות, וסף רווחיות אחרי עמלות אמיתיות (~3-4%)."
+)
+
+
+def detect_edges(rows: Any, *, config: Any = None) -> dict:
+    """Top-level Edge-Watcher verdict (spec §3.8). NEVER raises.
+
+    Filters to settled & labeled rows; below TOTAL_MIN -> "collecting". Otherwise
+    runs the B (tp_reach) + E (abstention) slice scans + the A directional diagnostic,
+    applies per-scan BH-FDR over the honest hypothesis count m, then G6 forward-time
+    persistence. A single scan can reach at most "forming"; "confirmed" requires
+    >= MIN_CONFIRMATIONS spaced forward confirmations. Ambiguity collapses to the
+    lower (safer) state.
+    """
+    try:
+        if not isinstance(rows, (list, tuple)):
+            return _empty_response("collecting", 0, _COLLECTING_NOTE)
+
+        settled = [r for r in rows if _is_settled_labeled(r)]
+        n_total = len(settled)
+
+        # Allow a config override of the TP definition target (Task 7 passes
+        # take_profit_pct); the constant is the default. We only read it defensively.
+        if isinstance(config, dict):
+            pass  # take_profit_pct is informational; gates use the booked exit_type.
+
+        if n_total < TOTAL_MIN:
+            return _empty_response("collecting", n_total, _COLLECTING_NOTE)
+
+        directional_note = _diagnose_directional(settled)
+
+        disc, vault = _walk_forward_split(settled)
+        if not disc:
+            return _empty_response("watching", n_total, _COLLECTING_NOTE)
+
+        slices = _enumerate_slices(disc)
+        max_ts = _max_decision_ts(settled)
+
+        # ── score every (target, slice): collect raw day-block p-values for BH-FDR ──
+        scored: list[dict] = []
+        pvals: list[float] = []
+        for target in ("tp_reach", "abstention"):
+            for slice_key, mask_fn in slices:
+                res = _evaluate_slice(disc, vault, mask_fn, target)
+                # Cheap pre-screen: a slice that doesn't even clear the raw data /
+                # lift floor can't be a candidate — skip it from the m count too,
+                # exactly as the trading layer would never test it (honest m).
+                if not res.get("passes_g0"):
+                    continue
+                entry = {
+                    "target": target,
+                    "slice_key": f"{target}|{slice_key}",
+                    "res": res,
+                    "mask_fn": mask_fn,
+                }
+                scored.append(entry)
+                pvals.append(float(res.get("pvalue", 1.0)))
+
+        # Honest per-scan multiplicity m == number of G0-passing hypotheses tested.
+        m = len(scored)
+        if _ep is not None:
+            try:
+                _ep.record_scan(m)
+            except Exception:
+                pass
+
+        reject = es.bh_fdr(pvals, q=BH_Q) if pvals else []
+
+        candidates: list[dict] = []
+        best: Optional[dict] = None
+        any_forming = False
+
+        for i, entry in enumerate(scored):
+            res = entry["res"]
+            slice_key = entry["slice_key"]
+            # ALL statistical + economic gates (G1-G5) AND BH-FDR survival (part of G2).
+            bh_ok = bool(reject[i]) if i < len(reject) else False
+            stat_ok = bool(
+                res.get("passes_g1")
+                and res.get("passes_g2")
+                and res.get("passes_g3")
+                and res.get("passes_g4")
+                and res.get("passes_g5")
+                and bh_ok
+            )
+
+            # ── G6 forward-time persistence (the live-safety gate) ──
+            if stat_ok:
+                if _ep is not None:
+                    try:
+                        confirmations = _ep.bump_confirmation(slice_key, max_ts)
+                    except Exception:
+                        confirmations = 1
+                else:
+                    confirmations = 1
+            else:
+                if _ep is not None:
+                    try:
+                        _ep.reset_confirmation(slice_key)
+                    except Exception:
+                        pass
+                confirmations = 0
+
+            oos_confirmed = bool(stat_ok and confirmations >= MIN_CONFIRMATIONS)
+            # slice_key is "<target>|<feature>:<bucket>"; the card's setup uses the
+            # human-readable "<feature>:<bucket>" tail.
+            feature_label = slice_key.split("|", 1)[1] if "|" in slice_key else slice_key
+            card = _build_card(feature_label, entry["target"], res, confirmations, oos_confirmed)
+            card["slice_key"] = slice_key
+
+            if stat_ok:
+                any_forming = True
+                candidates.append(card)
+                if best is None or _card_rank(card) > _card_rank(best):
+                    best = card
+
+        # ── state machine (spec §3.8) — ambiguity collapses to the safer state ──
+        if best is not None and best.get("oos_confirmed") and best.get("confidence") == "high" \
+                and best.get("confirmations", 0) >= MIN_CONFIRMATIONS:
+            state = "confirmed"
+        elif any_forming:
+            state = "forming"
+            best = None  # forming has a preliminary signal but NO confirmed best card
+        else:
+            state = "watching"
+
+        # In forming we still surface the cards (as unconfirmed), but best_candidate is
+        # reserved for confirmed (the only state the UI nudges from).
+        candidates_out = candidates if state in ("forming", "confirmed") else []
+
+        note = _STATE_NOTES.get(state, _COLLECTING_NOTE)
+        resp = _empty_response(state, n_total, note)
+        resp["candidates"] = candidates_out
+        resp["best_candidate"] = best if state == "confirmed" else None
+        resp["directional_note_he"] = directional_note
+        return resp
+    except Exception as e:  # the whole watcher must never break the endpoint
+        print(f"[edge_watcher] detect_edges failed: {e!r}", flush=True)
+        return _empty_response("collecting", 0, _COLLECTING_NOTE)
+
+
+def _card_rank(card: dict) -> tuple:
+    """Rank candidates: confirmed-and-high first, then by confirmations, net $, lift."""
+    try:
+        return (
+            1 if card.get("oos_confirmed") else 0,
+            int(card.get("confirmations", 0)),
+            float(card.get("net_dollars_per_trade", 0.0)),
+            float(card.get("lift_pct", 0.0)),
+        )
+    except Exception:
+        return (0, 0, 0.0, 0.0)
+
+
+_STATE_NOTES = {
+    "collecting": _COLLECTING_NOTE,
+    "watching": (
+        "מספיק נתונים, אבל אף מועמד לא עובר אפילו את הסף המקדים. הכול תקין — אל תפעיל "
+        "אוטונומיה עכשיו, אין מה להפעיל."
+    ),
+    "forming": (
+        "סימן מקדים ל-edge — עדיין לא מאושר. אל תפעל על סמך זה: צריך עוד עסקאות ומבחן "
+        "קדימה שטרם עבר."
+    ),
+    "confirmed": (
+        "סימן ל-edge שעבר את כל הבדיקות (מבחן קדימה, תיקון ריבוי-בדיקות, ורווחיות אחרי "
+        "עמלות אמיתיות) — שקול להפעיל אוטונומיה."
+    ),
+}
