@@ -22,6 +22,7 @@ bucketizer, slice evaluator, persistence wiring and the detect_edges orchestrato
 from __future__ import annotations
 
 import math
+import random
 from typing import Any, Callable, Optional
 
 import edge_stats as es
@@ -407,3 +408,481 @@ def bucketize(train_rows: Any, feat: tuple[Callable[[Any], Any], str, str]) -> C
             return None
 
     return _bucket_cont
+
+
+# ── Task 4: slice evaluator — gates G0–G5 (spec §3.2–3.7, §3.8) ──────────────
+#
+# Statistical heart. Given a slice-membership predicate `mask_fn`, score the slice
+# against ITS COMPLEMENT (never a constant) with the adversarial fixes intact:
+#   * slice-vs-complement two-proportion (baseline = discovery complement) — G2/G1
+#   * DAY-BLOCK permutation p-value (NOT a plain binomial) — G2
+#   * effective-n via the design-effect 1+(m̄−1)ρ — G0
+#   * economic MASTER gate with a day-block-bootstrapped 5th-pct tail + losers floor — G3
+#   * regime stability across folds / UTC days / vol-buckets — G4
+#   * clean() martingale-confound survival — G5
+# Every public entry never raises: malformed input -> an all-False safe verdict.
+
+# Regime / stability / economic-gate constants (spec §3.6, §3.7).
+WORST_FOLD_MIN_NET = -0.05      # worst calendar fold mean(r_net) must exceed this
+TOP_DAY_MAX_FRAC = 0.40        # a single UTC day may hold < 40% of |slice P&L|
+STABILITY_FOLDS = 4            # 4 contiguous calendar folds; sign must hold in >=3
+STABILITY_FOLDS_MIN_OK = 3
+VOL_REGIMES_MIN_OK = 2         # edge positive in >=2 of 3 vol-buckets
+N_LOSERS_MIN = 10             # the loss tail must actually be sampled (spec §3.6)
+MIN_SLICE_DAYBLOCKS = 3      # an edge confined to <3 UTC days is autocorrelation,
+                             # never a real edge (spec §3.3 — the dominant FP vector)
+_DAY_SECONDS = 86400.0
+_PERM_ITERS = 1000
+_BOOT_ITERS = 1000
+_PERM_SEED = 1234567
+_BOOT_SEED = 7654321
+
+
+def _day_key(row: Any) -> Any:
+    """UTC-day block key for a row (floor(decision_ts / 86400)). Unstamped rows
+    fall into a single sentinel block. Never raises."""
+    ts = _decision_ts(row)
+    if ts == float("-inf") or not math.isfinite(ts):
+        return "_nodate_"
+    return int(ts // _DAY_SECONDS)
+
+
+def _label_fn_for(target: str) -> Callable[[Any], Optional[int]]:
+    """Binary label extractor for a target.
+
+    * "tp_reach"   -> y_tp (1 iff realized TP exit).
+    * "abstention" -> 1 iff the trade was NOT a TP AND held-to-resolution lost,
+                       i.e. skipping it would have been correct. None when the
+                       directional counterfactual is unavailable.
+    """
+    if target == "abstention":
+        def _lab(row: Any) -> Optional[int]:
+            yd = y_dir(row)
+            if yd is None:
+                return None
+            # "correct abstention" = holding loses (yd == 0) and it wasn't a TP.
+            return 1 if (yd == 0 and y_tp(row) == 0) else 0
+        return _lab
+    # default / "tp_reach"
+    return lambda row: y_tp(row)
+
+
+def _intraclass_rho(labels: list[float], day_keys: list[Any]) -> float:
+    """One-way-ANOVA intraclass correlation of a 0/1 (or real) label across day
+    blocks, clamped to [0, 1]. Drives the design-effect for effective-n. The more
+    same-day rows move together, the closer ρ -> 1 (and effective-n collapses).
+    Degenerate -> 0.0; never raises.
+    """
+    try:
+        n = len(labels)
+        if n < 2 or len(day_keys) != n:
+            return 0.0
+        groups: dict[Any, list[float]] = {}
+        for lab, dk in zip(labels, day_keys):
+            groups.setdefault(dk, []).append(float(lab))
+        k = len(groups)
+        if k < 2:
+            # everything in one block -> maximally correlated.
+            return 1.0
+        grand = sum(labels) / n
+        ss_between = 0.0
+        ss_within = 0.0
+        for vals in groups.values():
+            m = len(vals)
+            gm = sum(vals) / m
+            ss_between += m * (gm - grand) ** 2
+            for v in vals:
+                ss_within += (v - gm) ** 2
+        ms_between = ss_between / (k - 1)
+        ms_within = ss_within / (n - k) if n > k else 0.0
+        # Mean cluster size correction (m0).
+        sum_m2 = sum(len(v) ** 2 for v in groups.values())
+        m0 = (n - sum_m2 / n) / (k - 1)
+        if m0 <= 0:
+            return 0.0
+        denom = ms_between + (m0 - 1.0) * ms_within
+        if denom <= 0:
+            return 0.0
+        rho = (ms_between - ms_within) / denom
+        return min(max(rho, 0.0), 1.0)
+    except Exception:
+        return 0.0
+
+
+def _effective_n(n_raw: int, labels: list[float], day_keys: list[Any]) -> float:
+    """Design-effect-adjusted effective sample size: n_eff = n_raw / (1+(m̄−1)ρ).
+    m̄ = mean rows per day-block, ρ = intraclass correlation. Never raises.
+    """
+    try:
+        if n_raw <= 0:
+            return 0.0
+        uniq_days = len(set(day_keys)) or 1
+        mbar = n_raw / uniq_days
+        rho = _intraclass_rho(labels, day_keys)
+        design_effect = 1.0 + (mbar - 1.0) * rho
+        if design_effect <= 0:
+            design_effect = 1.0
+        return float(n_raw) / design_effect
+    except Exception:
+        return 0.0
+
+
+def _mean(xs: list[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _day_block_lift_pvalue(
+    disc: list, mask_fn, label_fn, iters: int = _BOOT_ITERS, seed: int = _PERM_SEED
+) -> float:
+    """DAY-BLOCK bootstrap one-sided p-value for "slice mean(label) > complement
+    mean(label)" on a feature slice that may appear WITHIN every day.
+
+    Unlike a whole-day reassignment permutation, this resamples whole UTC DAY
+    BLOCKS with replacement (keeping each day's slice/complement mix intact, so
+    same-day autocorrelation is preserved) and reports the fraction of replicates
+    in which the slice no longer beats its complement. An edge that lives in only
+    one or two lucky day-blocks collapses here (those days are frequently absent
+    from a replicate), while a genuine every-day feature edge survives.
+
+    Deterministic for a fixed seed. Degenerate input -> 1.0; never raises.
+    """
+    try:
+        # Group each labeled row's (in_slice, label) by its day-block.
+        by_day: dict[Any, list[tuple[bool, float]]] = {}
+        for r in disc:
+            lab = label_fn(r)
+            if lab is None:
+                continue
+            dk = _day_key(r)
+            by_day.setdefault(dk, []).append(
+                (_safe_call_mask(mask_fn, r), float(lab))
+            )
+        day_order = list(by_day.keys())
+        n_days = len(day_order)
+        if n_days < 2:
+            return 1.0
+
+        def _lift(blocks: list) -> Optional[float]:
+            s_sum = s_cnt = c_sum = c_cnt = 0.0
+            for dk in blocks:
+                for is_in, lab in by_day[dk]:
+                    if is_in:
+                        s_sum += lab
+                        s_cnt += 1
+                    else:
+                        c_sum += lab
+                        c_cnt += 1
+            if s_cnt == 0 or c_cnt == 0:
+                return None
+            return s_sum / s_cnt - c_sum / c_cnt
+
+        observed = _lift(day_order)
+        if observed is None:
+            return 1.0
+
+        rng = random.Random(seed)
+        try:
+            iters = int(iters)
+        except (TypeError, ValueError):
+            iters = _BOOT_ITERS
+        if iters <= 0:
+            iters = _BOOT_ITERS
+        le = 0  # replicates where the slice did NOT beat its complement
+        for _ in range(iters):
+            sample = [day_order[rng.randrange(n_days)] for _ in range(n_days)]
+            lift = _lift(sample)
+            if lift is None or lift <= 0.0:
+                le += 1
+        return (le + 1) / (iters + 1)
+    except Exception:
+        return 1.0
+
+
+def _two_prop_lift(in_rows: list, comp_rows: list, label_fn) -> tuple:
+    """(k1, n1, k2, n2, hit_rate_pct, baseline_pct, lift_pct) for slice vs
+    complement on a binary label, skipping rows whose label is None. Never raises.
+    """
+    try:
+        k1 = n1 = k2 = n2 = 0
+        for r in in_rows:
+            lab = label_fn(r)
+            if lab is None:
+                continue
+            n1 += 1
+            k1 += 1 if lab else 0
+        for r in comp_rows:
+            lab = label_fn(r)
+            if lab is None:
+                continue
+            n2 += 1
+            k2 += 1 if lab else 0
+        hit = (k1 / n1 * 100.0) if n1 else 0.0
+        base = (k2 / n2 * 100.0) if n2 else 0.0
+        return (k1, n1, k2, n2, hit, base, hit - base)
+    except Exception:
+        return (0, 0, 0, 0, 0.0, 0.0, 0.0)
+
+
+def _safe_call_mask(mask_fn, row) -> bool:
+    try:
+        return bool(mask_fn(row))
+    except Exception:
+        return False
+
+
+def _empty_slice_result() -> dict:
+    """The all-False safe verdict returned on degenerate / malformed input."""
+    return {
+        "n_eff": 0.0,
+        "fire_rate": 0.0,
+        "lift_pct": 0.0,
+        "hit_rate_pct": 0.0,
+        "baseline_pct": 0.0,
+        "wilson_ok": False,
+        "pvalue": 1.0,
+        "n_dayblocks": 0,
+        "r_net_mean": 0.0,
+        "r_net_p5_boot": 0.0,
+        "n_losers": 0,
+        "dsr": 0.0,
+        "stability": {
+            "folds_ok": 0,
+            "folds_total": 0,
+            "worst_fold_net": 0.0,
+            "top_day_frac": 1.0,
+            "vol_regimes_ok": 0,
+            "vol_regimes_total": 0,
+            "ok": False,
+        },
+        "clean_survives": False,
+        "passes_g0": False,
+        "passes_g1": False,
+        "passes_g2": False,
+        "passes_g3": False,
+        "passes_g4": False,
+        "passes_g5": False,
+    }
+
+
+def _stability(in_rows: list, label_fn) -> dict:
+    """Regime stability over the in-slice rows (spec §3.7):
+      * sign of mean(r_net) holds in >=3 of 4 contiguous calendar folds,
+      * worst-fold mean(r_net) > WORST_FOLD_MIN_NET,
+      * single top UTC day holds < TOP_DAY_MAX_FRAC of |slice P&L|,
+      * edge positive in >=2 of 3 vol-buckets.
+    Never raises.
+    """
+    out = {
+        "folds_ok": 0,
+        "folds_total": 0,
+        "worst_fold_net": 0.0,
+        "top_day_frac": 1.0,
+        "vol_regimes_ok": 0,
+        "vol_regimes_total": 0,
+        "ok": False,
+    }
+    try:
+        ordered = sorted([r for r in in_rows if isinstance(r, dict)], key=_decision_ts)
+        nets = [(r, r_net(r)) for r in ordered]
+        nets = [(r, v) for (r, v) in nets if v is not None]
+        if not nets:
+            return out
+
+        # ── contiguous calendar folds (by time order, STABILITY_FOLDS chunks) ──
+        n = len(nets)
+        kfolds = min(STABILITY_FOLDS, n)
+        fold_means: list[float] = []
+        if kfolds >= 1:
+            size = n / kfolds
+            for f in range(kfolds):
+                lo = int(round(f * size))
+                hi = int(round((f + 1) * size)) if f < kfolds - 1 else n
+                chunk = [v for (_, v) in nets[lo:hi]]
+                if chunk:
+                    fold_means.append(_mean(chunk))
+        out["folds_total"] = len(fold_means)
+        out["folds_ok"] = sum(1 for m in fold_means if m > 0.0)
+        out["worst_fold_net"] = min(fold_means) if fold_means else 0.0
+
+        # ── top single UTC day as a fraction of |slice P&L| ──
+        by_day: dict[Any, float] = {}
+        total_abs = 0.0
+        for (r, v) in nets:
+            dk = _day_key(r)
+            by_day[dk] = by_day.get(dk, 0.0) + v
+            total_abs += abs(v)
+        if total_abs > 0:
+            out["top_day_frac"] = max(abs(s) for s in by_day.values()) / total_abs
+        else:
+            out["top_day_frac"] = 1.0
+
+        # ── vol-bucket regimes: edge (mean r_net) positive in >=2 of 3 ──
+        by_vol: dict[Any, list[float]] = {}
+        for (r, v) in nets:
+            vb = r.get("vol_bucket") if isinstance(r, dict) else None
+            by_vol.setdefault(vb, []).append(v)
+        vol_means = {vb: _mean(vs) for vb, vs in by_vol.items() if vs}
+        out["vol_regimes_total"] = len(vol_means)
+        out["vol_regimes_ok"] = sum(1 for m in vol_means.values() if m > 0.0)
+
+        out["ok"] = (
+            out["folds_total"] >= STABILITY_FOLDS_MIN_OK
+            and out["folds_ok"] >= STABILITY_FOLDS_MIN_OK
+            and out["worst_fold_net"] > WORST_FOLD_MIN_NET
+            and out["top_day_frac"] < TOP_DAY_MAX_FRAC
+            and out["vol_regimes_total"] >= 1
+            and out["vol_regimes_ok"] >= min(VOL_REGIMES_MIN_OK, out["vol_regimes_total"])
+        )
+        return out
+    except Exception:
+        return out
+
+
+def _evaluate_slice(disc_rows: Any, vault_rows: Any, mask_fn: Any, target: str) -> dict:
+    """Score one slice against ITS COMPLEMENT with the full G0–G5 gate battery.
+
+    Returns a dict with n_eff / fire_rate / lift_pct / hit_rate_pct / baseline_pct
+    / wilson_ok / pvalue (DAY-BLOCK permutation, NOT binomial) / r_net_mean /
+    r_net_p5_boot / n_losers / dsr / stability{...} / clean_survives / passes_g0..g5.
+
+    Never raises — any malformed/degenerate input yields an all-False safe verdict.
+    """
+    try:
+        if not isinstance(disc_rows, (list, tuple)):
+            disc_rows = []
+        if not isinstance(vault_rows, (list, tuple)):
+            vault_rows = []
+        disc = [r for r in disc_rows if isinstance(r, dict)]
+        vault = [r for r in vault_rows if isinstance(r, dict)]
+        if not disc:
+            return _empty_slice_result()
+
+        label_fn = _label_fn_for(target)
+        res = _empty_slice_result()
+
+        # ── partition discovery into slice / complement ──
+        in_rows = [r for r in disc if _safe_call_mask(mask_fn, r)]
+        comp_rows = [r for r in disc if not _safe_call_mask(mask_fn, r)]
+        n_slice = len(in_rows)
+        n_disc = len(disc)
+        res["fire_rate"] = (n_slice / n_disc) if n_disc else 0.0
+
+        # ── binary-label slice-vs-COMPLEMENT (discovery) ──
+        k1, n1, k2, n2, hit, base, lift = _two_prop_lift(in_rows, comp_rows, label_fn)
+        res["hit_rate_pct"] = hit
+        res["baseline_pct"] = base
+        res["lift_pct"] = lift
+        lo, hi = es.wilson_bounds(k1, n1)
+        # Wilson lower bound of the slice clears the complement point estimate.
+        res["wilson_ok"] = bool(n1 > 0 and n2 > 0 and lo > (k2 / n2 if n2 else 1.0))
+
+        # ── per-row slice-label stream (for effective-n / day-block count) ──
+        slice_labels: list[float] = []
+        slice_days: list[Any] = []
+        for r in in_rows:
+            lab = label_fn(r)
+            if lab is None:
+                continue
+            slice_labels.append(float(lab))
+            slice_days.append(_day_key(r))
+        # DAY-BLOCK bootstrap p-value for the lift (slice mean > complement mean),
+        # resampling whole UTC day-blocks so same-day autocorrelation is preserved.
+        # This is the GATE — never the plain row-level binomial (spec §3.3).
+        res["pvalue"] = _day_block_lift_pvalue(
+            disc, mask_fn, label_fn, iters=_PERM_ITERS, seed=_PERM_SEED
+        )
+
+        # Distinct UTC day-blocks the slice actually spans — an edge confined to a
+        # handful of contiguous days is autocorrelation, not signal (spec §3.3).
+        n_slice_dayblocks = len(set(slice_days))
+        res["n_dayblocks"] = n_slice_dayblocks
+
+        # ── effective-n (design-effect adjusted) on the slice's label stream ──
+        res["n_eff"] = _effective_n(len(slice_labels), slice_labels, slice_days)
+
+        # ── economics: r_net stream over the slice (real-fee, stake-normalized) ──
+        r_in = [r_net(r) for r in in_rows]
+        r_in = [v for v in r_in if v is not None]
+        res["r_net_mean"] = _mean(r_in)
+        res["n_losers"] = sum(1 for v in r_in if v < 0.0)
+
+        # day-block bootstrap of mean(r_net) -> 5th-percentile tail.
+        econ_days = [_day_key(r) for r in in_rows if r_net(r) is not None]
+        boots = es.day_block_bootstrap(
+            r_in, econ_days, _mean, iters=_BOOT_ITERS, seed=_BOOT_SEED
+        )
+        if boots:
+            s = sorted(boots)
+            idx = int(0.05 * (len(s) - 1))
+            res["r_net_p5_boot"] = s[idx]
+        else:
+            res["r_net_p5_boot"] = 0.0
+
+        # Deflated Sharpe on the DAY-BLOCK-AVERAGED r_net stream (one return per UTC
+        # day), haircut for the honest per-scan trial count. Aggregating to the day
+        # level is the day-block-resampled DSR the spec asks for (§3.3): it both
+        # respects same-day autocorrelation and collapses an edge that lives in only
+        # a few high-variance days, while a steady every-day edge clears DSR_MIN.
+        day_net: dict[Any, list[float]] = {}
+        for r in in_rows:
+            v = r_net(r)
+            if v is None:
+                continue
+            day_net.setdefault(_day_key(r), []).append(v)
+        day_means = [_mean(vs) for vs in day_net.values() if vs]
+        res["dsr"] = es.deflated_sharpe(day_means, n_trials=max(len(FEATURES) * 6, 1))
+
+        # ── stability (folds / top-day / vol regimes) ──
+        res["stability"] = _stability(in_rows, label_fn)
+
+        # ── clean() survival: edge holds on the martingale/exploration-free subset ──
+        clean_in = [r for r in in_rows if clean(r)]
+        clean_comp = [r for r in comp_rows if clean(r)]
+        ck1, cn1, ck2, cn2, c_hit, c_base, c_lift = _two_prop_lift(
+            clean_in, clean_comp, label_fn
+        )
+        clean_r = [r_net(r) for r in clean_in]
+        clean_r = [v for v in clean_r if v is not None]
+        clean_net = _mean(clean_r)
+        # The slice must retain BOTH its directional lift AND positive economics
+        # once the confounded rows are removed, on a non-trivial clean sample.
+        res["clean_survives"] = bool(
+            cn1 >= max(1, int(0.5 * N_SLICE_MIN_EFFECTIVE))
+            and c_lift >= MIN_RAW_LIFT_PTS
+            and clean_net >= ECON_MIN_NET
+        )
+
+        # ── forward-OOS slice-vs-complement on the vault (G1) ──
+        v_in = [r for r in vault if _safe_call_mask(mask_fn, r)]
+        v_comp = [r for r in vault if not _safe_call_mask(mask_fn, r)]
+        vk1, vn1, vk2, vn2, v_hit, v_base, v_lift = _two_prop_lift(
+            v_in, v_comp, label_fn
+        )
+        vault_p = es.two_proportion_p(vk1, vn1, vk2, vn2, alternative="greater")
+
+        # ── gates ──
+        res["passes_g0"] = bool(
+            res["n_eff"] >= N_SLICE_MIN_EFFECTIVE
+            and res["fire_rate"] >= FIRE_RATE_MIN
+            and res["lift_pct"] >= MIN_RAW_LIFT_PTS
+        )
+        res["passes_g1"] = bool(
+            vn1 > 0 and vn2 > 0 and v_lift >= MIN_RAW_LIFT_PTS and vault_p <= BH_Q
+        )
+        res["passes_g2"] = bool(
+            res["pvalue"] <= BH_Q
+            and res["dsr"] >= DSR_MIN
+            and res["wilson_ok"]
+            and n_slice_dayblocks >= MIN_SLICE_DAYBLOCKS
+        )
+        res["passes_g3"] = bool(
+            res["r_net_mean"] >= ECON_MIN_NET
+            and res["r_net_mean"] > 0.0
+            and res["r_net_p5_boot"] > 0.0
+            and res["n_losers"] >= N_LOSERS_MIN
+        )
+        res["passes_g4"] = bool(res["stability"].get("ok"))
+        res["passes_g5"] = bool(res["clean_survives"])
+        return res
+    except Exception:
+        return _empty_slice_result()
