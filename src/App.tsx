@@ -1710,6 +1710,14 @@ export default function App() {
     real_fee_net: number;
     fee_drag: number;
   } | null>(null);
+  /** נגזרת read-only: דיוק כיווני אמיתי (side==resolved_outcome) מול אחוז-הרווח (TP) המטעה. */
+  const [accuracy, setAccuracy] = useState<{
+    directional_accuracy_pct: number | null;
+    n_resolved: number;
+    mean_fill_price_pct: number | null;
+    tp_win_rate_pct: number | null;
+    n_total: number;
+  } | null>(null);
   const priceStream = usePriceStream();
 
   /** טיק שנייה — מונה «נותרו…» בלוח הבקרה מתעדכן כל שנייה, לא רק כשמגיע refresh מהשרת */
@@ -2154,6 +2162,19 @@ export default function App() {
         "/api/demo/real-fee-pnl",
       );
       if (rf && typeof rf.real_fee_net === "number") setRealFeePnl(rf);
+    } catch {
+      // נשאיר את הקודם
+    }
+    // דיוק כיווני אמיתי — endpoint נפרד, cached 60s ב-off-loop; לא שובר את טעינת ה-state אם נכשל.
+    try {
+      const acc = await api<{
+        directional_accuracy_pct: number | null;
+        n_resolved: number;
+        mean_fill_price_pct: number | null;
+        tp_win_rate_pct: number | null;
+        n_total: number;
+      }>("/api/demo/accuracy");
+      if (acc && typeof acc.n_resolved === "number") setAccuracy(acc);
     } catch {
       // נשאיר את הקודם
     }
@@ -4638,6 +4659,45 @@ export default function App() {
                       {winRate.toFixed(1)}%
                     </strong>
                   </div>
+                  {accuracy && accuracy.directional_accuracy_pct != null && accuracy.n_resolved > 0 && (
+                    <div
+                      style={{
+                        width: "100%",
+                        padding: "10px 12px",
+                        borderRadius: 8,
+                        background: "rgba(250, 204, 21, 0.10)",
+                        border: "1px solid rgba(250, 204, 21, 0.30)",
+                      }}
+                      title="הדיוק הכיווני האמיתי נמדד מול resolved_outcome (האם הצד שנבחר באמת נפתר נכון), לא מול תווית ה-TP/רווח. זהו ה-ground-truth."
+                    >
+                      <div style={{ fontSize: 13.5, fontWeight: 700 }}>
+                        דיוק כיווני אמיתי:{" "}
+                        <strong
+                          style={{
+                            color:
+                              accuracy.mean_fill_price_pct != null &&
+                              accuracy.directional_accuracy_pct > accuracy.mean_fill_price_pct
+                                ? "var(--up)"
+                                : "var(--down)",
+                          }}
+                        >
+                          {accuracy.directional_accuracy_pct.toFixed(0)}%
+                        </strong>
+                        {accuracy.mean_fill_price_pct != null && (
+                          <> (מחיר הוגן ~{accuracy.mean_fill_price_pct.toFixed(0)}%)</>
+                        )}
+                        {" · "}
+                        אחוז-רווח (TP):{" "}
+                        <strong>
+                          {(accuracy.tp_win_rate_pct ?? winRate).toFixed(0)}%
+                        </strong>
+                      </div>
+                      <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 3 }}>
+                        אחוז-הרווח הגבוה הוא ניצחונות-TP קטנים; הדיוק-הכיווני ≈ המחיר ההוגן = אין edge
+                        {" "}(לפי {accuracy.n_resolved} עסקאות שנפתרו).
+                      </div>
+                    </div>
+                  )}
                   <div className="stat-pill">
                     יחס רווח מול סיכון ממוצע:{" "}
                     <strong style={{ color: rr >= 1 ? "var(--up)" : "var(--down)" }}>
