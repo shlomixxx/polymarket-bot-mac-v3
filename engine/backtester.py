@@ -40,6 +40,7 @@ result, never an exception.
 """
 from __future__ import annotations
 
+import bisect as _bisect
 import json
 import math
 import os
@@ -445,12 +446,39 @@ def _backtest_inner(
     trade_R: list[float] = []        # realised return in R units (PnL / risk$)
     total_costs = 0.0
 
+    # Pre-clean every tf ONCE (the loop used to _clean each tf twice per bar,
+    # which is O(N) per bar -> O(N^2) overall). Precompute each tf's bar-CLOSE
+    # times so _slice_len can binary-search instead of rescanning every bar.
+    clean_by_tf: dict[str, list[dict]] = {}
+    close_times_by_tf: dict[str, list[float]] = {}
+    base_dur = _bar_duration_ms(base) or 0.0
+    for tf, cs in candles_by_tf.items():
+        if not isinstance(cs, (list, tuple)):
+            continue
+        cl = _clean(cs)
+        clean_by_tf[tf] = cl
+        tf_dur = _bar_duration_ms(cl) or base_dur
+        cts: list[float] = []
+        for c in cl:
+            ot = _f(c.get("open_time"))
+            cts.append((ot + tf_dur) if ot is not None else float("inf"))
+        close_times_by_tf[tf] = cts
+
     i = 0
     # We need bar i+1 to fill, so the last index we can SIGNAL on is n-2.
     while i <= n - 2:
-        # The strategy sees only CLOSED bars [0..i]. Build a sliced VIEW per tf.
-        view = {tf: _clean(cs)[: _slice_len(_clean(cs), base, i)]
-                for tf, cs in candles_by_tf.items() if isinstance(cs, (list, tuple))}
+        # The strategy sees only CLOSED bars [0..i]. Build a sliced VIEW per tf,
+        # hiding any higher-tf bar whose CLOSE time is after this base bar's close.
+        base_ot = _f(base[i].get("open_time"))
+        base_close = (base_ot + base_dur) if base_ot is not None else None
+        view = {}
+        for tf, cl in clean_by_tf.items():
+            if base_close is None or not close_times_by_tf[tf] or \
+                    close_times_by_tf[tf][0] == float("inf"):
+                view[tf] = cl[: _slice_len(cl, base, i)]
+            else:
+                k = _bisect.bisect_right(close_times_by_tf[tf], base_close)
+                view[tf] = cl[:k]
         # Guarantee the base tf view is exactly [0..i] (the look-ahead contract).
         view[base_tf] = base[: i + 1]
 
@@ -543,27 +571,52 @@ def _backtest_inner(
     }
 
 
+def _bar_duration_ms(candles: list[dict]) -> Optional[float]:
+    """Infer a series' bar duration from the spacing of its first two open_times.
+    Returns None if it cannot be determined (missing/garbled timestamps)."""
+    if len(candles) < 2:
+        return None
+    t0 = _f(candles[0].get("open_time"))
+    t1 = _f(candles[1].get("open_time"))
+    if t0 is None or t1 is None:
+        return None
+    d = t1 - t0
+    return d if d > 0 else None
+
+
 def _slice_len(tf_candles: list[dict], base: list[dict], i: int) -> int:
     """How many bars of a (possibly higher) timeframe are CLOSED as of base bar i.
 
     No look-ahead across timeframes: a higher-tf bar is only visible once its
-    close time is <= the current base bar's close time. When timestamps are
-    missing we fall back to i+1 (treats the tf as bar-aligned with the base) —
-    which the tests exercise with a single base tf.
+    CLOSE time is <= the current base bar's CLOSE time. Close time is derived as
+    open_time + the series' own inferred bar duration; this correctly hides an
+    in-progress higher-tf bar (e.g. a 4h bar that merely OPENED at this 1h bar's
+    open is not yet closed and must NOT be seen). When timestamps are missing we
+    fall back to i+1 (treats the tf as bar-aligned with the base) — which the
+    tests exercise with a single base tf.
     """
     if not tf_candles:
         return 0
     if tf_candles is base:
         return i + 1
-    # Use open_time alignment when available.
     base_ot = base[i].get("open_time") if i < len(base) else None
     base_ot = _f(base_ot)
     if base_ot is None or _f(tf_candles[0].get("open_time")) is None:
         return min(len(tf_candles), i + 1)
+    # Close times: open_time + inferred duration. If a duration can't be
+    # inferred, assume bar-aligned with the base (duration == base duration),
+    # which degrades to the previous open-time comparison only when both are
+    # single-bar series.
+    base_dur = _bar_duration_ms(base) or 0.0
+    tf_dur = _bar_duration_ms(tf_candles) or base_dur
+    base_close = base_ot + base_dur
     count = 0
     for c in tf_candles:
         ot = _f(c.get("open_time"))
-        if ot is not None and ot <= base_ot:
+        if ot is None:
+            break
+        tf_close = ot + tf_dur
+        if tf_close <= base_close:
             count += 1
         else:
             break

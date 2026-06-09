@@ -309,3 +309,36 @@ def test_backtest_never_raises_on_garbage_input():
                        funding=False)
         assert "strategy" in res
         assert res["strategy"]["n_trades"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. Cross-timeframe NO look-ahead: a higher-tf bar is visible only once its
+#    CLOSE time is at/before the base bar's close — NOT merely when it opens.
+# ---------------------------------------------------------------------------
+
+def test_higher_tf_bar_hidden_until_it_actually_closes():
+    """A 4h bar that merely OPENS at the same time as the current 1h bar is
+    still in progress (it closes 3 hours later) and MUST NOT be visible. This
+    locks the close-time guard against an off-by-one open-time look-ahead leak
+    that would let the strategy peek at an unfinished higher-tf candle."""
+    hour = 3_600_000
+    # 1h base bars at t = 0,1h,2h,3h,4h,5h...
+    base = [c(100 + i, 101 + i, 99 + i, 100 + i, t=i * hour) for i in range(8)]
+    # 4h bars opening at t=0 and t=4h. The bar opening at 4h CLOSES at 8h.
+    h4 = [c(100, 110, 90, 105, t=0), c(105, 130, 100, 125, t=4 * hour)]
+    seen = {}
+
+    def strat(view, i):
+        seen[i] = len(view.get("4h", []))
+        return {"signal": "flat", "entry": None, "stop": None, "target": None}
+
+    backtest(strat, {"1h": base, "4h": h4}, funding=False)
+    # The first 4h bar (open 0, close 4h) is only fully closed at base bar
+    # whose close >= 4h, i.e. the 1h bar opening at t=3h (closes at 4h). So at
+    # base bars i=0,1,2 the strategy must see ZERO closed 4h bars; from i=3 it
+    # sees exactly one; the SECOND 4h bar (closes at 8h) is never visible here.
+    assert seen[0] == 0 and seen[1] == 0 and seen[2] == 0, (
+        f"look-ahead: a 4h bar was visible before it closed: {seen}")
+    assert seen[3] == 1, f"first 4h bar should be visible once closed: {seen}"
+    assert max(seen.values()) == 1, (
+        f"the in-progress second 4h bar must never be seen: {seen}")
