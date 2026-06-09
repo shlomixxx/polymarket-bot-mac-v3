@@ -126,6 +126,80 @@ def real_fee_adjusted_pnl(trades: list[dict], *, since_ts: Optional[float] = Non
     }
 
 
+def true_directional_accuracy(rows: list[dict]) -> dict[str, Any]:
+    """נגזרת read-only מתוך ה-AUDIT ledger: הדיוק-הכיווני *האמיתי* של הבוט.
+
+    ה-dashboard מציג ~72% "אחוז ניצחונות", אבל זו תווית ה-TP/P&L (עסקאות שנעלו רווח,
+    רובן יציאות-TP +18%). היא איננה מודדת אם הצד שנבחר באמת נפתר נכון. ה*אמת* היא
+    האם ``side`` שווה ל-``resolved_outcome`` בפועל. נגזרת זו מחשבת אותה ישירות.
+
+    קלט: שורות מה-ledger (audit_tracker.export_rows). חובה: שדות מקודמים (light=True)
+    שכוללים ``side``, ``resolved_outcome``, ``settlement_status``, ``avg_fill_price``.
+
+    מחזיר:
+      • directional_accuracy_pct — count(side == resolved_outcome) / count(rows שבהם
+        resolved_outcome ∈ {Up,Down}) × 100. זהו ה-GROUND-TRUTH — לעולם לא נשתמש
+        ב-settlement_status כדי לחשב אותו (settlement_status היא תווית ה-TP-win וממליצה
+        בטעות ~13.5% מה-TP-wins ככיוון-נכון).
+      • n_resolved — מספר השורות עם resolved_outcome ∈ {Up,Down} (המכנה של הדיוק).
+      • mean_fill_price_pct — מחיר-המילוי הממוצע (avg_fill_price) על אותן שורות-resolved,
+        כאחוז. זהו ה"מחיר ההוגן" הייחוס: דיוק 44% ≈ מחיר 47% ⇒ אין edge.
+      • tp_win_rate_pct — מתוך settlement_status בלבד: WIN/(WIN+LOSS) × 100. זו ה"מטעה".
+      • n_total — מספר השורות שנבחנו.
+
+    נחסנת מקלט פגום (None/חוסר שדות) — מחזירה None במדדים שאי אפשר לחשב.
+    """
+    n_total = len(rows or [])
+    correct = 0
+    n_resolved = 0
+    fill_sum = 0.0
+    fill_n = 0
+    n_win = 0
+    n_loss = 0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        # ── tp_win_rate: settlement_status בלבד (התווית המטעה) ──
+        status = str(r.get("settlement_status") or "").upper()
+        if status == "WIN":
+            n_win += 1
+        elif status == "LOSS":
+            n_loss += 1
+        # ── דיוק כיווני: resolved_outcome מול side (האמת הקרקעית) ──
+        resolved = r.get("resolved_outcome")
+        resolved = str(resolved) if resolved is not None else ""
+        if resolved not in ("Up", "Down"):
+            continue  # שורות לא-פתורות (PENDING/UNKNOWN/void) מוחרגות מהמכנה
+        n_resolved += 1
+        side = r.get("side")
+        if side is not None and str(side) == resolved:
+            correct += 1
+        fp = r.get("avg_fill_price")
+        if fp is not None:
+            try:
+                fill_sum += float(fp)
+                fill_n += 1
+            except (TypeError, ValueError):
+                pass
+
+    directional_accuracy_pct = (
+        round(100.0 * correct / n_resolved, 2) if n_resolved > 0 else None
+    )
+    # avg_fill_price נשמר כשבר [0,1]; מציגים אותו כאחוז (×100).
+    mean_fill_price_pct = (
+        round(100.0 * fill_sum / fill_n, 2) if fill_n > 0 else None
+    )
+    tp_denom = n_win + n_loss
+    tp_win_rate_pct = round(100.0 * n_win / tp_denom, 2) if tp_denom > 0 else None
+    return {
+        "directional_accuracy_pct": directional_accuracy_pct,
+        "n_resolved": n_resolved,
+        "mean_fill_price_pct": mean_fill_price_pct,
+        "tp_win_rate_pct": tp_win_rate_pct,
+        "n_total": n_total,
+    }
+
+
 # PR-D: השהיית persist (כתיבת 6MB) מחוץ ל-event-loop + throttle ל-backfill הכבד.
 PERSIST_INTERVAL_SEC = 20.0   # לכל היותר כתיבת state אחת כל 20s מנתיב הקריאה (fire-and-forget)
 BACKFILL_THROTTLE_SEC = 30.0  # ה-backfill הכבד (רשת + סריקה) רץ לכל היותר כל 30s, לא בכל poll

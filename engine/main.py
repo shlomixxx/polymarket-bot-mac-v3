@@ -223,6 +223,11 @@ _AUDIT_EDGE_CACHE = TTLCache(ttl_sec=60.0)
 # the dashboard's slow refresh (4-10s) never recomputes, and the scan runs off-loop via to_thread.
 _REAL_FEE_PNL_CACHE = TTLCache(ttl_sec=45.0)
 
+# True directional accuracy is mined from the whole audit ledger (side == resolved_outcome), an O(N)
+# scan over a light projection — slow-moving and must stay off the hot /api/demo/snapshot path. Cache
+# 60s (mirrors /api/audit/lessons) so the dashboard's slow refresh never recomputes, scan runs off-loop.
+_ACCURACY_CACHE = TTLCache(ttl_sec=60.0)
+
 
 def _bot_run_win_rate_stats() -> dict[str, Any]:
     """אחוז ניצחונות ביציאות ממומשות מתחילת סשן הבוט (כמו חישוב win rate בלשונית סטטיסטיקה)."""
@@ -2352,6 +2357,40 @@ async def demo_real_fee_pnl():
 
     out = await asyncio.to_thread(_work)
     _REAL_FEE_PNL_CACHE.set("pnl", out)
+    return out
+
+
+@app.get("/api/demo/accuracy")
+async def demo_accuracy():
+    """Derived, READ-ONLY GROUND-TRUTH: the bot's TRUE directional accuracy (did the chosen
+    side actually settle correct), mined from the audit ledger via side == resolved_outcome.
+
+    This is NOT the dashboard's ~72% "win rate" — that figure is the TP/P&L win label
+    (mostly small +18% TP exits) and mislabels ~13.5% of TP-wins as direction-correct. The
+    honest metric uses resolved_outcome, never settlement_status, and also returns the mean
+    fill price (the fair-odds reference): accuracy 44% ≈ fair price 47% ⇒ no edge.
+
+    Cached 60s + computed off-loop on the LIGHT projection (promoted columns only — side,
+    resolved_outcome, settlement_status, avg_fill_price are all promoted, no JSON-blob
+    parsing) so the dashboard's slow refresh can't add load to the hot snapshot path.
+    """
+    cached = _ACCURACY_CACHE.get("accuracy")
+    if cached is not None:
+        return cached
+    import audit_tracker
+
+    def _work():
+        from demo_engine import true_directional_accuracy
+        rows = audit_tracker.export_rows(limit=100000, light=True)
+        res = true_directional_accuracy(rows)
+        res["note"] = (
+            "דיוק כיווני אמיתי = side==resolved_outcome (אמת קרקעית); "
+            "אחוז-הרווח (TP) הגבוה הוא ניצחונות-TP קטנים, לא דיוק כיווני"
+        )
+        return res
+
+    out = await asyncio.to_thread(_work)
+    _ACCURACY_CACHE.set("accuracy", out)
     return out
 
 
