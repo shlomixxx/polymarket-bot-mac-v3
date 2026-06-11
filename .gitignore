@@ -18,5 +18,12 @@ tips_v2_cache.json
 # מסד הביקורת (audit.db) — runtime store, נוצר ע"י audit_tracker/בדיקות; לא לקומיט
 engine/audit.db
 
+# Binance cockpit — sidecar audit ledger (runtime) ומאגר המפתחות fallback.
+# המפתחות לעולם לא נכנסים ל-git: גם keyring וגם קובץ fallback בהרשאות 600.
+**/binance_audit.db
+**/.binance-futures-bot_pk
+**/.polymarket_pk
+*_pk
+
 # גיבויי-נתונים מקומיים (off-Railway) — לא לקומיט (גדול/פרטי)
 backups/

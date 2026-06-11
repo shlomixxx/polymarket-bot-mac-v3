@@ -1,0 +1,29 @@
+==============================================================================================================
+BTC trend_pullback_v1 — REAL-history backtest vs BUY-AND-HOLD (HARMLESS half; no live code)
+==============================================================================================================
+History: 1d: source=binance n=2200; 4h: source=binance n=11000; 1h: source=binance n=28000
+Base (1h): 28000 bars, 2023-03-31 .. 2026-06-09
+Costs: fee 0.05%/side, slippage 0.02%/fill, funding on (0.001%/1h bar)
+Grid: 16 combos (auto-counted n_trials for the deflated Sharpe)
+
+Walk-forward split @ 1h index 19600: in-sample 2023-03-31..2025-06-24 (19600 bars), OOS 2025-06-24..2026-06-09 (8400 bars, FROZEN)
+
+AUTO-COUNTED n_trials (multiple-testing burden): 16
+Best in-sample params: {'trigger_body_k': 0.5, 'rsi_pullback_lo': 40.0, 'pullback_band_atr': 1.0, 'use_liquidity_gate': True}
+
+                              Return  Sharpe     DSR     MaxDD      PF     Win%  Trades    avgR
+--------------------------------------------------------------------------------------------------------------
+IN-SAMPLE
+  trend_pullback_v1           -12.6%   -1.77   0.000    -14.6%    0.70   +34.0%     103   -0.26
+  buy-and-hold               +272.6%    2.20     -      -32.3%    1.05   +50.9%       1    2.73
+--------------------------------------------------------------------------------------------------------------
+OUT-OF-SAMPLE (frozen)
+  trend_pullback_v1            -3.8%   -0.78   0.000     -6.1%    0.78   +37.2%      43   -0.17
+  buy-and-hold                -42.0%   -1.10     -      -52.9%    0.96   +50.0%       1   -0.42
+==============================================================================================================
+
+HONEST VERDICT (out-of-sample, after fees + slippage + funding)
+--------------------------------------------------------------------------------------------------------------
+trend_pullback_v1 does NOT clear the bar OOS. The honest answer is HOLD BTC.
+Why: deflated Sharpe 0.000 < 0.95 (could be luck after 16 trials).
+Per the spec, "don't trade" is the SUCCESSFUL outcome of this tool, not a failure.

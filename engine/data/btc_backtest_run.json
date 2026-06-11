@@ -1,0 +1,79 @@
+{
+  "generated_utc": "2026-06-09T15:30:18.945081+00:00",
+  "strategy": "trend_pullback_v1",
+  "base_tf": "1h",
+  "window": {
+    "start": "2023-03-31",
+    "end": "2026-06-09",
+    "n_1h_bars": 28000
+  },
+  "costs": {
+    "fee_pct_per_side": 0.05,
+    "slippage_pct": 0.02,
+    "funding_pct_per_1h_bar": 0.001
+  },
+  "walk_forward": {
+    "oos_frac": 0.3,
+    "oos_start_index": 19600,
+    "in_sample": {
+      "start": "2023-03-31",
+      "end": "2025-06-24"
+    },
+    "oos": {
+      "start": "2025-06-24",
+      "end": "2026-06-09"
+    }
+  },
+  "n_trials_auto_counted": 16,
+  "best_in_sample_params": {
+    "trigger_body_k": 0.5,
+    "rsi_pullback_lo": 40.0,
+    "pullback_band_atr": 1.0,
+    "use_liquidity_gate": true
+  },
+  "in_sample": {
+    "strategy": {
+      "final_return": -0.126,
+      "sharpe": -1.77,
+      "deflated_sharpe": 0.0,
+      "max_drawdown": -0.146,
+      "profit_factor": 0.7,
+      "win_rate": 0.34,
+      "n_trades": 103,
+      "avg_R": -0.26
+    },
+    "buy_and_hold": {
+      "final_return": 2.726,
+      "sharpe": 2.2,
+      "max_drawdown": -0.323,
+      "profit_factor": 1.05,
+      "win_rate": 0.509,
+      "n_trades": 1,
+      "avg_R": 2.73
+    }
+  },
+  "out_of_sample": {
+    "strategy": {
+      "final_return": -0.03789314499520047,
+      "sharpe": -0.7768162646884876,
+      "max_drawdown": -0.061008384671442206,
+      "profit_factor": 0.7764905198142225,
+      "win_rate": 0.37209302325581395,
+      "n_trades": 43,
+      "avg_R": -0.1743140882369929,
+      "total_costs": 0.04647798353197497,
+      "deflated_sharpe": 0.0
+    },
+    "buy_and_hold": {
+      "final_return": -0.42288952740619323,
+      "sharpe": -1.1164876878235543,
+      "max_drawdown": -0.5286450773653576,
+      "profit_factor": 0.9636578583460201,
+      "win_rate": 0.5000595308965353,
+      "n_trades": 1,
+      "avg_R": -0.42288952740619323,
+      "total_costs": 0.0
+    }
+  },
+  "verdict": "HOLD BTC \u2014 trend_pullback_v1 does NOT beat risk-adjusted buy-and-hold OOS after fees (negative Sharpe, profit factor <1, deflated Sharpe 0.0). Per spec, do-not-trade is the successful outcome."
+}
