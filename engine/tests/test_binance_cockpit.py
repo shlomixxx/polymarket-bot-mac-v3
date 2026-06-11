@@ -337,6 +337,45 @@ def test_fault_injection_stop_api_error_also_flattens(ex, mock):
     assert close_calls, "a failed stop must trigger an auto-flatten"
 
 
+def test_naked_guard_message_is_honest_when_emergency_close_is_rejected(ex, mock):
+    # WORST case: stop won't go live AND the emergency reduceOnly close is itself
+    # rejected by the exchange. The position is genuinely still open & naked, so
+    # the raised error must NOT claim it was market-closed — it must scream that
+    # the human has to flatten it manually NOW.
+    mock.stop_goes_live = False
+    # raise ONLY on the reduceOnly close, never on the entry (so we really reach
+    # the naked-guard with a position open and an emergency close that fails).
+    base_new_order = mock.new_order
+
+    def reject_only_reduce_only(**params):
+        if str(params.get("reduceOnly")).lower() == "true":
+            mock.calls.append(("new_order", params))
+            raise MockClientError(-2022, "ReduceOnly Order is rejected.")
+        return base_new_order(**params)
+
+    mock.new_order = reject_only_reduce_only
+
+    with pytest.raises(NakedPositionError) as excinfo:
+        binance_cockpit.place_manual_trade(ex, {
+            "symbol": "BTCUSDT", "side": "long", "entry": 60000, "stop": 57000,
+            "target": 66000, "equity": 10000, "risk_pct": 2.0,
+        }, GOOD_RS)
+    msg = str(excinfo.value)
+    # the message must be TRUTHFUL: not "was market-closed", but a manual-flatten alarm
+    assert "market-closed (no naked" not in msg
+    assert "OPEN AND NAKED" in msg
+    assert "manually" in msg.lower()
+    # the emergency close WAS attempted (reduceOnly), it just got rejected
+    close_calls = [c for c in mock.calls if c[0] == "new_order"
+                   and str(c[1].get("reduceOnly")).lower() == "true"]
+    assert close_calls, "an emergency close must still be ATTEMPTED even if it fails"
+    # and the fault context must honestly record the rejected close (ok=False)
+    faults = [t for t in binance_cockpit.list_trades() if t["event"] == "fault"]
+    assert faults, "a loud fault must still be recorded"
+    assert any(f["context_json"].find('"ok": false') >= 0
+               or f["context_json"].find("close_res") >= 0 for f in faults)
+
+
 # ===========================================================================
 # reconcile_on_start — flatten a position that has NO live stop.
 # ===========================================================================

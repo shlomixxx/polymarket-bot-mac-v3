@@ -587,9 +587,15 @@ def place_manual_trade(client: Any, params: dict[str, Any],
             "risk_dollars": gate.get("risk_dollars"), "stop_verified": False,
             "context": {"reason": "stop_unverified_autoflatten", "close_res": close_res},
         })
+        if close_res.get("ok"):
+            raise NakedPositionError(
+                f"{symbol} {norm_side}: stop could not be verified live; position was "
+                f"market-closed (no naked leveraged risk). See fault log."
+            )
         raise NakedPositionError(
-            f"{symbol} {norm_side}: stop could not be verified live; position was "
-            f"market-closed (no naked leveraged risk). See fault log."
+            f"{symbol} {norm_side}: stop could not be verified live AND the emergency "
+            f"market-close was REJECTED ({close_res.get('error')}). Position may still be "
+            f"OPEN AND NAKED — flatten it manually NOW. See fault log."
         )
 
     # --- 7. log the protected trade. ---
