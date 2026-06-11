@@ -185,6 +185,34 @@ class BinanceFuturesClient:
             _log.warning("get_balance failed: %s", exc)
             return None
 
+    def get_equity(self) -> Optional[float]:
+        """Account EQUITY in USDT = total wallet balance + total unrealized PnL.
+
+        This is the number the account-level loss caps run against (today's P&L vs
+        the day's start, drawdown from the peak), NOT the free `availableBalance`
+        that get_balance returns. Reads the futures account() endpoint, which
+        exposes totalWalletBalance and totalUnrealizedProfit (a.k.a. totalCrossUnPnl
+        on some payloads). None on failure / unreadable — callers MUST treat None
+        as 'cannot read equity' and stay inert (read path: never raises)."""
+        try:
+            acct = self._client.account() or {}
+        except Exception as exc:
+            _log.warning("get_equity: account() failed: %s", exc)
+            return None
+        wallet = _D(acct.get("totalWalletBalance"))
+        # Different payloads name unrealized PnL differently; accept either.
+        upnl = _D(
+            acct.get("totalUnrealizedProfit")
+            if acct.get("totalUnrealizedProfit") is not None
+            else acct.get("totalCrossUnPnl")
+        )
+        if wallet is None:
+            # No wallet balance -> can't form equity. Prefer marginBalance if present.
+            margin = _D(acct.get("totalMarginBalance"))
+            return float(margin) if margin is not None else None
+        equity = wallet + (upnl if upnl is not None else Decimal("0"))
+        return float(equity)
+
     def get_position(self, symbol: str) -> dict[str, Any]:
         """Current position for `symbol`. Empty dict if flat / on failure.
 

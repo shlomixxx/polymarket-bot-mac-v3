@@ -1989,7 +1989,19 @@ async def live_mode_set(body: LiveModeBody):
 import risk_engine
 import binance_cockpit
 import binance_secrets
+import binance_equity
 from binance_exchange import BinanceFuturesClient
+
+# Persisted equity tracker state (peak + day-start) for the account-level loss
+# caps. Lives on the DATA_ROOT volume so it survives a restart (a mid-day restart
+# must not re-anchor the daily cap). Written atomically by binance_equity.
+BINANCE_EQUITY_STATE_PATH = DATA_ROOT / "binance_equity_state.json"
+
+# Cache the EQUITY read briefly so the cap inputs aren't hammered: /state and
+# /preview can each fetch it, and a UI may poll /state. 8s TTL keeps it fresh
+# enough for a manual cockpit while staying off the exchange. Only read by the
+# cockpit endpoints — never on the demo/trading hot loop.
+_BINANCE_EQUITY_CACHE = TTLCache(ttl_sec=8.0)
 
 # Symbols the boot-time reconcile guard scans when the account can't enumerate
 # positions itself (e.g. an injected client without get_open_positions). Live
@@ -2032,11 +2044,55 @@ def _binance_equity(client: Any) -> Optional[float]:
         return None
 
 
-def _binance_risk_state() -> dict[str, Any]:
-    """Risk-cap inputs for the gate. The manual cockpit has no running P&L feed
-    yet, so day/drawdown default to 0.0 (caps not breached). Wired to a real feed
-    later; gate_order still enforces per-trade risk/leverage/R:R regardless."""
-    return {"day_pnl_pct": 0.0, "peak_drawdown_pct": 0.0}
+def _binance_account_equity(client: Any = None) -> Optional[float]:
+    """Current account EQUITY (wallet balance + unrealized PnL), briefly cached
+    (8s TTL) so the cap inputs aren't hammered. Reuses the caller's `client` when
+    given (so the trade path reads equity from the SAME forced-testnet/live client
+    it executes on, never a second one). None if there's no client/keys or the read
+    fails — callers stay inert. NEVER raises (read path)."""
+    cached = _BINANCE_EQUITY_CACHE.get("equity")
+    if cached is not None:
+        # 0.0 is a legitimate equity; we cache the float, None is "not cached".
+        return cached
+    try:
+        if client is None:
+            client = _get_binance_client()
+        # Older injected/mock clients may lack get_equity -> treat as unreadable.
+        getter = getattr(client, "get_equity", None)
+        equity = getter() if callable(getter) else None
+    except Exception:
+        equity = None
+    if equity is not None:
+        _BINANCE_EQUITY_CACHE.set("equity", float(equity))
+    return float(equity) if equity is not None else None
+
+
+def _binance_risk_state(client: Any = None) -> dict[str, Any]:
+    """Risk-cap inputs for the gate: today's P&L% and drawdown-from-peak%.
+
+    Wired to the LIVE account: fetch current equity (wallet + unrealized PnL) and
+    fold it through the persistent binance_equity tracker (resets the daily anchor
+    on a new UTC day, raises the all-time peak). When there's no client/keys or the
+    equity can't be read, returns inert 0/0 (caps not breached) — exactly the prior
+    behaviour, so a glitch can never wrongly flatten/halt. gate_order still enforces
+    per-trade risk/leverage/R:R regardless. NEVER raises (read path)."""
+    try:
+        equity = _binance_account_equity(client)
+        if equity is None:
+            return {"day_pnl_pct": 0.0, "peak_drawdown_pct": 0.0}
+        now_ts = time.time()
+        utc_date = time.strftime("%Y-%m-%d", time.gmtime(now_ts))
+        res = binance_equity.update_and_compute(
+            equity, now_ts=now_ts, utc_date=utc_date,
+            state_path=BINANCE_EQUITY_STATE_PATH,
+        )
+        return {
+            "day_pnl_pct": res.get("day_pnl_pct", 0.0),
+            "peak_drawdown_pct": res.get("peak_drawdown_pct", 0.0),
+        }
+    except Exception:
+        # Absolute fail-safe: never let the cap-input read trip a cap on a glitch.
+        return {"day_pnl_pct": 0.0, "peak_drawdown_pct": 0.0}
 
 
 @app.get("/api/binance/state")
@@ -2063,7 +2119,7 @@ async def binance_state(request: Request):
         out["position"] = pos or None
         out["unrealized_pnl"] = (pos or {}).get("unrealized_pnl")
         out["liquidation_price"] = client.get_liquidation_price(symbol)
-        rs = _binance_risk_state()
+        rs = _binance_risk_state(client)
         caps = risk_engine.check_caps(rs.get("day_pnl_pct"), rs.get("peak_drawdown_pct"))
         out["caps"] = {
             "allow_new": caps["allow_new"], "flatten": caps["flatten"],
@@ -2109,7 +2165,7 @@ async def binance_preview(body: BinancePreviewBody):
         symbol=body.symbol.strip().upper(), side=body.side, entry=body.entry,
         stop=body.stop, target=body.target, equity=equity,
         risk_pct=risk_pct, leverage=int(body.leverage or 3),
-        risk_state=_binance_risk_state(),
+        risk_state=_binance_risk_state(client),
     )
 
 
@@ -2155,7 +2211,7 @@ async def binance_trade(body: BinanceTradeBody):
 
     try:
         result = binance_cockpit.place_manual_trade(
-            client, params, risk_state=_binance_risk_state(),
+            client, params, risk_state=_binance_risk_state(client),
         )
     except binance_cockpit.NakedPositionError as exc:
         # The cockpit already flattened (or loudly reported it couldn't). Surface
