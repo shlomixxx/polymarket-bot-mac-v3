@@ -1,0 +1,752 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api, isPageHidden } from "./api";
+
+/**
+ * BtcCockpitTab — "קוקפיט מסחר ידני" for the owner's REAL Binance USDⓈ-M Futures account.
+ *
+ * This is a RESPONSIBLE MANUAL-TRADING COCKPIT, not an auto-bot and not an edge claim.
+ * The owner makes EVERY decision. The tool's job is SAFETY ENFORCEMENT + transparency:
+ *   - every order routes through risk_engine.gate_order (the only approve path),
+ *   - a stop-loss is ALWAYS attached on the exchange and verified,
+ *   - daily/global loss caps are enforced,
+ *   - the execute button is DISABLED until the preview is approved and every check is green.
+ *
+ * Backend contract:
+ *   GET  /api/binance/state    -> account header + position + caps + live/testnet
+ *   GET  /api/binance/trades   -> recent sidecar-ledger rows (net P&L)
+ *   POST /api/binance/preview  -> qty/costs/net target/liquidation + itemised checks + approved
+ *   POST /api/binance/trade    -> execute (gate + atomic stop); 409 = naked-position guard
+ *   POST /api/binance/close    -> flatten + cancel resting orders + log exit
+ */
+
+const STATE_TIMEOUT_MS = 20_000;
+const STATE_POLL_MS = 15_000; // slow loop — this is a manual cockpit, not a hot loop
+
+// ── backend types ────────────────────────────────────────────────────────────
+type LiveStatus = {
+  live_enabled: boolean;
+  binance_live_flag: boolean;
+  testnet: boolean;
+  has_keys: boolean;
+  reason_blocked: string | null;
+};
+type Position = {
+  symbol?: string;
+  qty?: number;
+  entry_price?: number;
+  side?: "long" | "short" | "flat" | string;
+  leverage?: number;
+  unrealized_pnl?: number;
+};
+type Caps = { allow_new: boolean; flatten: boolean; halt: boolean; reason: string };
+type BinanceState = {
+  live: LiveStatus;
+  symbol: string;
+  testnet: boolean;
+  balance_usdt: number | null;
+  position: Position | null;
+  liquidation_price: number | null;
+  unrealized_pnl: number | null;
+  caps: Caps | null;
+  error: string | null;
+};
+
+type Check = { name: string; ok: boolean; reason: string };
+type Preview = {
+  approved: boolean;
+  symbol?: string;
+  side?: string;
+  qty?: number;
+  notional?: number;
+  entry?: number | null;
+  stop?: number | null;
+  target?: number | null;
+  fee_est?: number;
+  slippage_est?: number;
+  total_cost?: number;
+  liquidation_price?: number | null;
+  net_target?: number | null;
+  net_if_stopped?: number | null;
+  risk_dollars?: number;
+  leverage?: number | null;
+  rr?: number | null;
+  checks?: Check[];
+  reason?: string;
+};
+
+type TradeResult = {
+  ok?: boolean;
+  approved?: boolean;
+  placed_order?: boolean;
+  reason?: string;
+  live_enabled?: boolean;
+  testnet?: boolean;
+  note?: string;
+  naked_position_guard?: boolean;
+  qty?: number;
+  entry_price?: number;
+  stop_price?: number;
+  target_price?: number;
+  stop_verified?: boolean;
+};
+
+type LedgerRow = {
+  id: number;
+  ts: number;
+  mode: string;
+  event: string; // 'entry' | 'exit' | 'fault'
+  symbol: string | null;
+  side: string | null;
+  qty: number | null;
+  entry_price: number | null;
+  stop_price: number | null;
+  target_price: number | null;
+  exit_price: number | null;
+  fee: number | null;
+  realized_pnl: number | null;
+  leverage: number | null;
+  risk_dollars: number | null;
+  stop_verified: number | null;
+  context_json: string | null;
+};
+type LedgerResponse = { rows: LedgerRow[]; count: number };
+
+// ── formatters ───────────────────────────────────────────────────────────────
+function fmtUsd(v: number | null | undefined, digits = 2): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  const sign = v < 0 ? "-" : "";
+  return `${sign}$${Math.abs(v).toFixed(digits)}`;
+}
+function fmtPrice(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return v.toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+function fmtNum(v: number | null | undefined, digits = 4): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return v.toFixed(digits);
+}
+function fmtTime(ts: number | null | undefined): string {
+  if (!ts || !Number.isFinite(ts)) return "—";
+  try {
+    // sidecar ledger ts is in SECONDS (time.time())
+    return new Date(ts * 1000).toLocaleString("he-IL", {
+      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+    });
+  } catch {
+    return String(ts);
+  }
+}
+function pnlColor(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "var(--muted,#94a3b8)";
+  return v >= 0 ? "#6ee7b7" : "#fca5a5";
+}
+function sideColor(side: string | null | undefined): string {
+  const s = String(side || "").toLowerCase();
+  if (s === "long" || s === "buy") return "#6ee7b7";
+  if (s === "short" || s === "sell") return "#fca5a5";
+  return "#e2e8f0";
+}
+function sideLabel(side: string | null | undefined): string {
+  const s = String(side || "").toLowerCase();
+  if (s === "long" || s === "buy") return "לונג";
+  if (s === "short" || s === "sell") return "שורט";
+  if (s === "flat") return "אין פוזיציה";
+  return side ? String(side) : "—";
+}
+
+// human-readable Hebrew labels for the safety checks (keys come from binance_cockpit)
+const CHECK_LABELS: Record<string, string> = {
+  inputs: "קלט תקין (צד/כניסה/סטופ/הון)",
+  stop_direction: "סטופ בצד המגן של הכניסה",
+  risk_gate: "שער הסיכון (gate_order)",
+  exchange_filters: "מסנני הבורסה נקראו",
+  lot_step: "כמות עוגלה לפי צעד הלוט",
+  min_notional: "מעל המינימום הנדרש לעסקה",
+  liquidation_vs_stop: "הסטופ מופעל לפני הליקווידציה",
+  internal: "תקינות פנימית",
+};
+function checkLabel(name: string): string {
+  return CHECK_LABELS[name] ?? name;
+}
+
+// ── small UI atoms ───────────────────────────────────────────────────────────
+function Bar({ label, value, max, danger, color }: {
+  label: string; value: number; max: number; danger: boolean; color: string;
+}) {
+  const pct = Math.max(0, Math.min(100, (Math.abs(value) / (max || 1)) * 100));
+  return (
+    <div style={{ flex: "1 1 160px", minWidth: 150 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
+        <span style={{ color: "var(--muted,#94a3b8)", fontWeight: 700 }}>{label}</span>
+        <span style={{ color: danger ? "#fca5a5" : color, fontWeight: 700 }}>{value.toFixed(2)}%</span>
+      </div>
+      <div style={{ height: 8, borderRadius: 999, background: "#1e293b", overflow: "hidden" }}>
+        <div style={{
+          width: `${pct}%`, height: "100%", borderRadius: 999,
+          background: danger ? "#dc2626" : color, transition: "width .3s",
+        }} />
+      </div>
+      <div style={{ fontSize: 11, color: "var(--muted,#64748b)", marginTop: 2 }}>סף: {max}%</div>
+    </div>
+  );
+}
+
+function Pill({ children, color, bg }: { children: React.ReactNode; color: string; bg: string }) {
+  return (
+    <span style={{
+      fontSize: 11, fontWeight: 800, padding: "3px 9px", borderRadius: 999,
+      color, background: bg, whiteSpace: "nowrap",
+    }}>{children}</span>
+  );
+}
+
+export default function BtcCockpitTab() {
+  const [state, setState] = useState<BinanceState | null>(null);
+  const [stateErr, setStateErr] = useState<string | null>(null);
+  const [ledger, setLedger] = useState<LedgerRow[]>([]);
+
+  // manual trade form
+  const [symbol, setSymbol] = useState("BTCUSDT");
+  const [side, setSide] = useState<"long" | "short">("long");
+  const [riskDollars, setRiskDollars] = useState<string>("10"); // default SMALL
+  const [entry, setEntry] = useState<string>("");
+  const [stop, setStop] = useState<string>("");
+  const [target, setTarget] = useState<string>("");
+  const [leverage, setLeverage] = useState<string>("3");
+
+  const [preview, setPreview] = useState<Preview | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewErr, setPreviewErr] = useState<string | null>(null);
+
+  const [executing, setExecuting] = useState(false);
+  const [tradeMsg, setTradeMsg] = useState<{ kind: "ok" | "err" | "warn"; text: string } | null>(null);
+  const [closing, setClosing] = useState(false);
+
+  // any change to the trade inputs invalidates a stale preview — the execute
+  // button must never act on a preview that no longer matches the form.
+  const invalidatePreview = useCallback(() => {
+    setPreview(null);
+    setPreviewErr(null);
+  }, []);
+
+  // ── state poll (slow loop) ─────────────────────────────────────────────────
+  const refreshState = useCallback(async () => {
+    try {
+      const res = await api<BinanceState>(
+        `/api/binance/state?symbol=${encodeURIComponent(symbol)}`,
+        { timeoutMs: STATE_TIMEOUT_MS },
+      );
+      setState(res);
+      setStateErr(res.error ?? null);
+    } catch (e) {
+      setStateErr(e instanceof Error ? e.message : String(e));
+    }
+  }, [symbol]);
+
+  const refreshLedger = useCallback(async () => {
+    try {
+      const res = await api<LedgerResponse>("/api/binance/trades?limit=100", { timeoutMs: STATE_TIMEOUT_MS });
+      setLedger(res.rows ?? []);
+    } catch {
+      // ledger failure must never break the cockpit
+    }
+  }, []);
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([refreshState(), refreshLedger()]);
+  }, [refreshState, refreshLedger]);
+
+  useEffect(() => {
+    void refreshAll();
+  }, [refreshAll]);
+
+  useEffect(() => {
+    const id = setInterval(() => { if (!isPageHidden()) void refreshAll(); }, STATE_POLL_MS);
+    const onVisible = () => { if (!isPageHidden()) void refreshAll(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [refreshAll]);
+
+  // derived equity for the risk_pct conversion (risk $ -> % of equity)
+  const equity = state?.balance_usdt ?? null;
+
+  // ── preview ────────────────────────────────────────────────────────────────
+  const previewSeq = useRef(0);
+  const doPreview = useCallback(async () => {
+    setTradeMsg(null);
+    setPreviewErr(null);
+    const enN = parseFloat(entry);
+    const stN = parseFloat(stop);
+    const tgN = target.trim() === "" ? null : parseFloat(target);
+    const lev = parseInt(leverage, 10) || 3;
+    const risk = parseFloat(riskDollars);
+
+    if (!Number.isFinite(enN) || !Number.isFinite(stN) || !Number.isFinite(risk) || risk <= 0) {
+      setPreviewErr("מלא מחיר כניסה, סטופ וסכום סיכון תקין לפני התצוגה המקדימה");
+      setPreview(null);
+      return;
+    }
+    // convert the human's risk-$ to a risk_pct of equity (gate_order sizes by %).
+    // if equity is unknown we send no risk_pct and let the backend read balance.
+    const risk_pct = equity && equity > 0 ? (risk / equity) * 100 : undefined;
+
+    const seq = ++previewSeq.current;
+    setPreviewing(true);
+    try {
+      const res = await api<Preview>("/api/binance/preview", {
+        method: "POST",
+        body: JSON.stringify({
+          symbol: symbol.trim().toUpperCase(),
+          side,
+          entry: enN,
+          stop: stN,
+          target: tgN,
+          leverage: lev,
+          risk_pct,
+        }),
+        timeoutMs: STATE_TIMEOUT_MS,
+      });
+      if (seq !== previewSeq.current) return; // a newer preview superseded this one
+      setPreview(res);
+    } catch (e) {
+      if (seq !== previewSeq.current) return;
+      setPreviewErr(e instanceof Error ? e.message : String(e));
+      setPreview(null);
+    } finally {
+      if (seq === previewSeq.current) setPreviewing(false);
+    }
+  }, [symbol, side, entry, stop, target, leverage, riskDollars, equity]);
+
+  // the execute button is ENABLED only when the preview is approved AND every
+  // single safety check is green. This is the hard gate on the UI side; the
+  // backend re-runs gate_order regardless, but we never even offer the button.
+  const allChecksGreen = useMemo(() => {
+    const ch = preview?.checks ?? [];
+    return ch.length > 0 && ch.every((c) => c.ok);
+  }, [preview]);
+  const canExecute = !!preview?.approved && allChecksGreen && !executing && !previewing;
+
+  // ── execute ────────────────────────────────────────────────────────────────
+  const doExecute = useCallback(async () => {
+    if (!canExecute || !preview) return;
+    const enN = parseFloat(entry);
+    const stN = parseFloat(stop);
+    const tgN = target.trim() === "" ? null : parseFloat(target);
+    const lev = parseInt(leverage, 10) || 3;
+    const risk = parseFloat(riskDollars);
+    const risk_pct = equity && equity > 0 ? (risk / equity) * 100 : undefined;
+
+    setExecuting(true);
+    setTradeMsg(null);
+    try {
+      const res = await api<TradeResult>("/api/binance/trade", {
+        method: "POST",
+        body: JSON.stringify({
+          symbol: symbol.trim().toUpperCase(),
+          side, entry: enN, stop: stN, target: tgN, leverage: lev, risk_pct,
+        }),
+        timeoutMs: STATE_TIMEOUT_MS,
+      });
+      if (res.ok && res.placed_order) {
+        const venue = res.live_enabled ? "חשבון אמיתי" : "TESTNET (לייב כבוי)";
+        setTradeMsg({
+          kind: "ok",
+          text: `העסקה בוצעה ב-${venue} · כמות ${fmtNum(res.qty)} · כניסה ${fmtPrice(res.entry_price)} · סטופ ${fmtPrice(res.stop_price)} ${res.stop_verified ? "(סטופ אומת ✅)" : ""}`,
+        });
+      } else if (res.naked_position_guard) {
+        setTradeMsg({
+          kind: "err",
+          text: `מנגנון הגנת פוזיציה חשופה הופעל: ${res.reason ?? "הסטופ לא אומת — הפוזיציה נסגרה אוטומטית"}`,
+        });
+      } else {
+        setTradeMsg({ kind: "err", text: `העסקה נדחתה: ${res.reason ?? "סיבה לא ידועה"}` });
+      }
+    } catch (e) {
+      setTradeMsg({ kind: "err", text: `שגיאה בביצוע: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      setExecuting(false);
+      setPreview(null); // force a fresh preview before any next order
+      void refreshAll();
+    }
+  }, [canExecute, preview, symbol, side, entry, stop, target, leverage, riskDollars, equity, refreshAll]);
+
+  // ── close position ─────────────────────────────────────────────────────────
+  const pos = state?.position ?? null;
+  const hasOpenPosition = !!pos && (pos.side === "long" || pos.side === "short") && Math.abs(pos.qty ?? 0) > 0;
+
+  const doClose = useCallback(async () => {
+    if (!hasOpenPosition) return;
+    if (!window.confirm("לסגור את הפוזיציה הפתוחה עכשיו? פעולה זו סוגרת בשוק ומבטלת את הסטופ/יעד.")) return;
+    setClosing(true);
+    setTradeMsg(null);
+    try {
+      const res = await api<TradeResult & { flat?: boolean; realized_pnl?: number; exit_price?: number }>(
+        "/api/binance/close",
+        { method: "POST", body: JSON.stringify({ symbol: symbol.trim().toUpperCase() }), timeoutMs: STATE_TIMEOUT_MS },
+      );
+      if (res.ok) {
+        setTradeMsg({
+          kind: "ok",
+          text: `הפוזיציה נסגרה · יציאה ${fmtPrice(res.exit_price)} · רווח/הפסד נטו ${fmtUsd(res.realized_pnl)}`,
+        });
+      } else {
+        setTradeMsg({ kind: "err", text: `הסגירה נכשלה: ${res.reason ?? "סיבה לא ידועה"}` });
+      }
+    } catch (e) {
+      setTradeMsg({ kind: "err", text: `שגיאה בסגירה: ${e instanceof Error ? e.message : String(e)}` });
+    } finally {
+      setClosing(false);
+      void refreshAll();
+    }
+  }, [hasOpenPosition, symbol, refreshAll]);
+
+  const live = state?.live ?? null;
+  const isLive = !!live?.live_enabled;
+  const caps = state?.caps ?? null;
+
+  // net P&L on the open position = gross unrealized − round-trip fee estimate.
+  // fees are shown SEPARATELY; this is honest, not the gross number.
+  const grossUpnl = pos?.unrealized_pnl ?? null;
+  const posNotional = pos && pos.entry_price && pos.qty ? Math.abs(pos.entry_price * pos.qty) : null;
+  const feeEst = posNotional != null ? posNotional * 0.0005 * 2 : null; // 0.05%/side round-trip
+  const netUpnl = grossUpnl != null && feeEst != null ? grossUpnl - feeEst : grossUpnl;
+
+  // recent ledger rows: show entries + exits + faults, newest first
+  const ledgerRows = ledger.slice(0, 40);
+
+  return (
+    <div dir="rtl" style={{ padding: "4px 2px 40px", maxWidth: 1000, margin: "0 auto" }}>
+      {/* ── Header ── */}
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 24, fontWeight: 800, letterSpacing: "-0.02em" }}>
+            ₿ קוקפיט מסחר ידני — Binance Futures
+          </h2>
+          <p style={{ margin: "4px 0 0", color: "var(--muted,#94a3b8)", fontSize: 13 }}>
+            אתה מקבל כל החלטה. התפקיד של הכלי הוא <b>אכיפת בטיחות ושקיפות</b> — לא בוט אוטומטי ולא הבטחת רווח.
+            כל פקודה עוברת דרך שער הסיכון, סטופ-לוס תמיד מוצמד ומאומת בבורסה, ויש תקרות הפסד יומית/כוללת.
+          </p>
+        </div>
+        <button type="button" onClick={() => void refreshAll()} style={btnStyle()}>↻ רענן</button>
+      </div>
+
+      {/* ── Live / testnet banner ── */}
+      <div style={{
+        marginTop: 14, padding: "10px 14px", borderRadius: 12, display: "flex",
+        alignItems: "center", gap: 10, flexWrap: "wrap",
+        background: isLive ? "#7f1d1d22" : "#1e3a5f22",
+        border: `1px solid ${isLive ? "#7f1d1d" : "#1e3a5f"}`,
+      }}>
+        {isLive
+          ? <Pill color="#fecaca" bg="#7f1d1d">🔴 לייב — כסף אמיתי</Pill>
+          : <Pill color="#93c5fd" bg="#1e3a5f">🧪 TESTNET — בלי כסף אמיתי</Pill>}
+        <span style={{ fontSize: 13, color: "#cbd5e1" }}>
+          {isLive
+            ? "פקודות שתבצע ירוצו על החשבון האמיתי שלך."
+            : (live?.reason_blocked ?? "לייב כבוי — פקודות ירוצו על TESTNET בלבד.")}
+        </span>
+      </div>
+
+      {stateErr && (
+        <div style={{ marginTop: 12, color: "#fecaca", background: "#7f1d1d33", padding: 12, borderRadius: 10, fontSize: 13 }}>
+          שגיאת קריאה מהבורסה: {stateErr}
+        </div>
+      )}
+
+      {/* ── Account header card ── */}
+      <div style={cardStyle()}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 18, alignItems: "flex-end" }}>
+          <div>
+            <div style={labelStyle()}>יתרה (USDT)</div>
+            <div style={{ fontSize: 28, fontWeight: 800, lineHeight: 1.1 }}>{fmtUsd(equity)}</div>
+          </div>
+          <div style={{ flex: 1 }} />
+          {/* loss-cap bars */}
+          <Bar label="הפסד יומי" value={0} max={3} danger={!!caps && !caps.allow_new} color="#f59e0b" />
+          <Bar label="ירידה כוללת" value={0} max={10} danger={!!caps?.halt} color="#a855f7" />
+        </div>
+        {caps && !caps.allow_new && (
+          <div style={{ marginTop: 10, fontSize: 13, color: "#fca5a5", fontWeight: 700 }}>
+            ⛔ תקרת הפסד הופעלה — אין כניסות חדשות. {caps.reason}
+          </div>
+        )}
+      </div>
+
+      {/* ── Current position card ── */}
+      <div style={cardStyle()}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: hasOpenPosition ? 12 : 0, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 16, fontWeight: 800 }}>פוזיציה נוכחית · {state?.symbol ?? symbol}</div>
+          {hasOpenPosition
+            ? <Pill color={sideColor(pos?.side)} bg="#0b1220">{sideLabel(pos?.side)}</Pill>
+            : <span style={{ fontSize: 13, color: "var(--muted,#94a3b8)" }}>אין פוזיציה פתוחה</span>}
+        </div>
+
+        {hasOpenPosition && (
+          <>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "10px 26px" }}>
+              <Stat label="כמות" value={fmtNum(pos?.qty)} />
+              <Stat label="כניסה" value={fmtPrice(pos?.entry_price)} />
+              <Stat label="מינוף" value={pos?.leverage != null ? `×${pos.leverage}` : "—"} />
+              <Stat label="ליקווידציה" value={fmtPrice(state?.liquidation_price)} valueColor="#fca5a5" />
+              <Stat label="P&L ברוטו" value={fmtUsd(grossUpnl)} valueColor={pnlColor(grossUpnl)} />
+              <Stat label="עמלות (אומדן)" value={feeEst != null ? `-${fmtUsd(feeEst).replace("-", "")}` : "—"} valueColor="#fca5a5" />
+              <Stat label="P&L נטו" value={fmtUsd(netUpnl)} valueColor={pnlColor(netUpnl)} big />
+            </div>
+            <button
+              type="button"
+              onClick={() => void doClose()}
+              disabled={closing}
+              style={{
+                marginTop: 14, width: "100%", padding: "14px 16px", borderRadius: 12,
+                border: "1px solid #7f1d1d", background: "#dc2626", color: "#fff",
+                fontSize: 17, fontWeight: 800, cursor: closing ? "wait" : "pointer",
+                opacity: closing ? 0.7 : 1,
+              }}
+            >
+              {closing ? "סוגר…" : "✕ סגור פוזיציה עכשיו"}
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* ── Manual trade panel ── */}
+      <div style={cardStyle()}>
+        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 12 }}>פאנל מסחר ידני</div>
+
+        {/* LONG / SHORT */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          {(["long", "short"] as const).map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => { setSide(s); invalidatePreview(); }}
+              style={{
+                flex: 1, padding: "12px", borderRadius: 10, fontSize: 15, fontWeight: 800, cursor: "pointer",
+                border: `1px solid ${side === s ? (s === "long" ? "#065f46" : "#7f1d1d") : "#1e293b"}`,
+                background: side === s ? (s === "long" ? "#065f46" : "#7f1d1d") : "var(--card,#0f172a)",
+                color: side === s ? "#fff" : (s === "long" ? "#6ee7b7" : "#fca5a5"),
+              }}
+            >
+              {s === "long" ? "▲ לונג" : "▼ שורט"}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
+          <Field label="סימבול">
+            <input value={symbol} onChange={(e) => { setSymbol(e.target.value.toUpperCase()); invalidatePreview(); }} style={inputStyle()} />
+          </Field>
+          <Field label="סיכון ($)">
+            <input type="number" inputMode="decimal" value={riskDollars}
+              onChange={(e) => { setRiskDollars(e.target.value); invalidatePreview(); }} style={inputStyle()} />
+          </Field>
+          <Field label="מחיר כניסה">
+            <input type="number" inputMode="decimal" value={entry} placeholder="0.00"
+              onChange={(e) => { setEntry(e.target.value); invalidatePreview(); }} style={inputStyle()} />
+          </Field>
+          <Field label="סטופ-לוס">
+            <input type="number" inputMode="decimal" value={stop} placeholder="0.00"
+              onChange={(e) => { setStop(e.target.value); invalidatePreview(); }} style={inputStyle()} />
+          </Field>
+          <Field label="יעד (רשות)">
+            <input type="number" inputMode="decimal" value={target} placeholder="ריק = ללא"
+              onChange={(e) => { setTarget(e.target.value); invalidatePreview(); }} style={inputStyle()} />
+          </Field>
+          <Field label="מינוף">
+            <input type="number" inputMode="numeric" value={leverage} min={1}
+              onChange={(e) => { setLeverage(e.target.value); invalidatePreview(); }} style={inputStyle()} />
+          </Field>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => void doPreview()}
+          disabled={previewing}
+          style={{
+            marginTop: 14, width: "100%", padding: "12px", borderRadius: 10,
+            border: "1px solid #1e3a5f", background: "#1d4ed8", color: "#fff",
+            fontSize: 15, fontWeight: 800, cursor: previewing ? "wait" : "pointer", opacity: previewing ? 0.7 : 1,
+          }}
+        >
+          {previewing ? "מחשב תצוגה מקדימה…" : "🔍 תצוגה מקדימה + בדיקות בטיחות"}
+        </button>
+
+        {previewErr && (
+          <div style={{ marginTop: 10, color: "#fecaca", background: "#7f1d1d33", padding: 10, borderRadius: 10, fontSize: 13 }}>
+            {previewErr}
+          </div>
+        )}
+
+        {/* ── Preview output ── */}
+        {preview && (
+          <div style={{ marginTop: 14, borderRadius: 12, background: "#0b1220", border: "1px solid #1e293b", padding: 14 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "10px 24px", marginBottom: 12 }}>
+              <Stat label="כמות" value={fmtNum(preview.qty)} />
+              <Stat label="נפח עסקה" value={fmtUsd(preview.notional)} />
+              <Stat label="סיכון בפועל" value={fmtUsd(preview.risk_dollars)} />
+              <Stat label="מינוף" value={preview.leverage != null ? `×${Number(preview.leverage).toFixed(1)}` : "—"} />
+              <Stat label="יחס R:R" value={preview.rr != null ? `${Number(preview.rr).toFixed(2)}` : "—"} />
+              <Stat label="עמלות (סבב)" value={fmtUsd(preview.fee_est)} valueColor="#fca5a5" />
+              <Stat label="סליפג' (אומדן)" value={fmtUsd(preview.slippage_est)} valueColor="#fca5a5" />
+              <Stat label="ליקווידציה" value={fmtPrice(preview.liquidation_price)} valueColor="#fca5a5" />
+              <Stat label="יעד נטו" value={fmtUsd(preview.net_target)} valueColor={pnlColor(preview.net_target)} />
+              <Stat label="הפסד בסטופ (נטו)" value={fmtUsd(preview.net_if_stopped)} valueColor={pnlColor(preview.net_if_stopped)} />
+            </div>
+
+            {/* safety checks — ✅/❌ each */}
+            <div style={{ fontSize: 13, fontWeight: 800, color: "#93c5fd", marginBottom: 6 }}>בדיקות בטיחות</div>
+            <div style={{ display: "grid", gap: 5 }}>
+              {(preview.checks ?? []).map((c) => (
+                <div key={c.name} style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 13 }}>
+                  <span style={{ flexShrink: 0 }}>{c.ok ? "✅" : "❌"}</span>
+                  <span style={{ color: c.ok ? "#cbd5e1" : "#fca5a5", fontWeight: c.ok ? 600 : 700 }}>
+                    {checkLabel(c.name)}
+                    {c.reason ? <span style={{ color: "var(--muted,#94a3b8)", fontWeight: 400 }}> — {c.reason}</span> : null}
+                  </span>
+                </div>
+              ))}
+            </div>
+
+            {/* overall verdict */}
+            <div style={{
+              marginTop: 12, padding: "8px 12px", borderRadius: 10, fontSize: 14, fontWeight: 800,
+              color: preview.approved && allChecksGreen ? "#6ee7b7" : "#fca5a5",
+              background: preview.approved && allChecksGreen ? "#065f4633" : "#7f1d1d33",
+              border: `1px solid ${preview.approved && allChecksGreen ? "#065f46" : "#7f1d1d"}`,
+            }}>
+              {preview.approved && allChecksGreen
+                ? "✅ כל הבדיקות עברו — מותר לבצע"
+                : `❌ לא מאושר${preview.reason ? ` — ${preview.reason}` : ""}`}
+            </div>
+
+            {/* execute — disabled until approved && all checks green */}
+            <button
+              type="button"
+              onClick={() => void doExecute()}
+              disabled={!canExecute}
+              style={{
+                marginTop: 12, width: "100%", padding: "15px 16px", borderRadius: 12,
+                border: `1px solid ${canExecute ? "#065f46" : "#1e293b"}`,
+                background: canExecute ? "#16a34a" : "#1e293b",
+                color: canExecute ? "#fff" : "#64748b",
+                fontSize: 17, fontWeight: 800, cursor: canExecute ? "pointer" : "not-allowed",
+              }}
+            >
+              {executing ? "מבצע…" : (isLive ? "בצע עסקה (כסף אמיתי)" : "בצע עסקה (TESTNET)")}
+            </button>
+            {!canExecute && (
+              <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", marginTop: 6, textAlign: "center" }}>
+                הכפתור נפתח רק כשהתצוגה המקדימה מאושרת וכל הבדיקות ירוקות.
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* trade result message */}
+        {tradeMsg && (
+          <div style={{
+            marginTop: 12, padding: 12, borderRadius: 10, fontSize: 14, fontWeight: 700,
+            color: tradeMsg.kind === "ok" ? "#6ee7b7" : tradeMsg.kind === "warn" ? "#fde68a" : "#fca5a5",
+            background: tradeMsg.kind === "ok" ? "#065f4633" : tradeMsg.kind === "warn" ? "#713f1233" : "#7f1d1d33",
+            border: `1px solid ${tradeMsg.kind === "ok" ? "#065f46" : tradeMsg.kind === "warn" ? "#713f12" : "#7f1d1d"}`,
+          }}>
+            {tradeMsg.text}
+          </div>
+        )}
+      </div>
+
+      {/* ── Recent trades (sidecar ledger) ── */}
+      <div style={cardStyle()}>
+        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 10 }}>עסקאות אחרונות (ספר ביקורת)</div>
+        {ledgerRows.length === 0 ? (
+          <div style={{ padding: 24, textAlign: "center", color: "var(--muted,#94a3b8)", border: "1px dashed #1e293b", borderRadius: 12 }}>
+            אין עדיין רישומים
+          </div>
+        ) : (
+          <div style={{ display: "grid", gap: 6 }}>
+            {ledgerRows.map((r) => {
+              const isFault = r.event === "fault";
+              const isExit = r.event === "exit";
+              const accent = isFault ? "#7f1d1d" : isExit ? "#334155" : "#065f46";
+              const eventLabel = isFault ? "תקלה" : isExit ? "יציאה" : "כניסה";
+              return (
+                <div key={r.id} style={{
+                  display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap",
+                  padding: "9px 12px", borderRadius: 10, background: "#0b1220",
+                  border: "1px solid #1e293b", borderInlineStart: `4px solid ${accent}`, overflowX: "auto",
+                }}>
+                  <Pill color="#cbd5e1" bg={accent}>{eventLabel}</Pill>
+                  <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>{fmtTime(r.ts)}</span>
+                  <span style={{ fontSize: 12, color: "#e2e8f0", whiteSpace: "nowrap" }}>{r.symbol ?? "—"}</span>
+                  {r.side && <span style={{ fontSize: 12, fontWeight: 800, color: sideColor(r.side), whiteSpace: "nowrap" }}>{sideLabel(r.side)}</span>}
+                  {r.qty != null && <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>×{fmtNum(r.qty)}</span>}
+                  {r.entry_price != null && <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>כניסה {fmtPrice(r.entry_price)}</span>}
+                  {r.exit_price != null && <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>יציאה {fmtPrice(r.exit_price)}</span>}
+                  {r.stop_price != null && <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>סטופ {fmtPrice(r.stop_price)}</span>}
+                  {r.fee != null && <span style={{ fontSize: 12, color: "#fca5a5", whiteSpace: "nowrap" }}>עמלה {fmtUsd(r.fee)}</span>}
+                  {r.event === "entry" && (
+                    <span style={{ fontSize: 12, color: r.stop_verified ? "#6ee7b7" : "#fca5a5", whiteSpace: "nowrap" }}>
+                      {r.stop_verified ? "סטופ אומת ✅" : "סטופ לא אומת ❌"}
+                    </span>
+                  )}
+                  <span style={{ flex: 1 }} />
+                  {r.realized_pnl != null && (
+                    <span style={{ fontSize: 13, fontWeight: 800, color: pnlColor(r.realized_pnl), whiteSpace: "nowrap" }}>
+                      נטו {fmtUsd(r.realized_pnl)}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── small layout helpers ─────────────────────────────────────────────────────
+function Stat({ label, value, valueColor, big }: {
+  label: string; value: string; valueColor?: string; big?: boolean;
+}) {
+  return (
+    <div>
+      <div style={labelStyle()}>{label}</div>
+      <div style={{ fontSize: big ? 20 : 15, fontWeight: 800, color: valueColor ?? "#e2e8f0", lineHeight: 1.2 }}>{value}</div>
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label style={{ display: "block" }}>
+      <div style={labelStyle()}>{label}</div>
+      {children}
+    </label>
+  );
+}
+
+function cardStyle(): React.CSSProperties {
+  return {
+    marginTop: 14, padding: 16, borderRadius: 12,
+    background: "var(--card,#0f172a)", border: "1px solid #1e293b",
+  };
+}
+function labelStyle(): React.CSSProperties {
+  return { fontSize: 12, color: "var(--muted,#94a3b8)", fontWeight: 700, marginBottom: 3 };
+}
+function inputStyle(): React.CSSProperties {
+  return {
+    width: "100%", boxSizing: "border-box", padding: "9px 10px", borderRadius: 9,
+    border: "1px solid #1e293b", background: "#0b1220", color: "#e2e8f0", fontSize: 14,
+  };
+}
+function btnStyle(bg?: string): React.CSSProperties {
+  return {
+    padding: "7px 12px", borderRadius: 9, border: "1px solid #1e293b",
+    background: bg ?? "var(--card,#0f172a)", color: "#e2e8f0", fontSize: 13, fontWeight: 600, cursor: "pointer",
+  };
+}

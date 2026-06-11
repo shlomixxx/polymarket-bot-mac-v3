@@ -31,6 +31,7 @@ import AnalyticsV3 from "./AnalyticsV3";
 import FaultsTab from "./FaultsTab";
 import AuditTab from "./AuditTab";
 import EdgeWatcherTab from "./EdgeWatcherTab";
+import BtcCockpitTab from "./BtcCockpitTab";
 
 type Market = {
   slug: string;
@@ -59,7 +60,7 @@ type OrderbookSummary = {
   down: SideSummary;
 };
 
-type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "analytics_v3" | "faults" | "edge" | "audits" | "help";
+type Tab = "dash" | "strategy" | "signals" | "trigger" | "stats" | "stats_live" | "tips_v2" | "analytics_v3" | "faults" | "edge" | "audits" | "binance" | "help";
 
 type Trade = {
   id?: string;
@@ -2721,6 +2722,7 @@ export default function App() {
             ["faults", "🐞 תקלות"],
             ["edge", "🔭 גלאי edge"],
             ["audits", "📋 ביקורת עסקאות"],
+            ["binance", "₿ קוקפיט Binance"],
             ["help", "עזרה ותיעוד"],
           ] as const
         ).map(([k, l]) => (
@@ -4868,6 +4870,7 @@ export default function App() {
       {tab === "faults" && <FaultsTab />}
       {tab === "edge" && <EdgeWatcherTab onGoToStrategy={() => setTab("strategy")} />}
       {tab === "audits" && <AuditTab />}
+      {tab === "binance" && <BtcCockpitTab />}
       {tab === "signals" && <SignalsPanel />}
       {tab === "trigger" && <TriggerTrader />}
       </main>

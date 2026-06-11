@@ -2075,6 +2075,15 @@ async def binance_state(request: Request):
     return etag_json_response(out, request.headers.get("if-none-match"))
 
 
+@app.get("/api/binance/trades")
+async def binance_trades(limit: int = 200):
+    """READ-ONLY recent rows from the sidecar binance_audit.db (entry/exit/fault),
+    newest first, with net P&L. No key material, no network — just the local
+    ledger. Never raises (list_trades swallows its own errors)."""
+    rows = binance_cockpit.list_trades(limit=max(1, min(int(limit or 200), 1000)))
+    return {"rows": rows, "count": len(rows)}
+
+
 class BinancePreviewBody(BaseModel):
     symbol: str = "BTCUSDT"
     side: str                       # 'long' | 'short'
