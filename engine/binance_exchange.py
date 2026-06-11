@@ -138,7 +138,17 @@ class BinanceFuturesClient:
         if not (api_key and api_secret):
             blob = None
             try:
-                blob = secret_store.load_key()  # may be repurposed per SERVICE
+                # MUST be scoped to the Binance service so we never read the
+                # Polymarket key store (the two stores must never collide).
+                blob = secret_store.load_key(service=SECRET_SERVICE)
+            except TypeError:
+                # Older secret_store without a `service` param — refuse rather
+                # than silently fall back to the polymarket-scoped key.
+                _log.error(
+                    "secret_store.load_key() has no `service` param; cannot scope "
+                    "to %s — set BINANCE_API_KEY/SECRET env instead", SECRET_SERVICE,
+                )
+                blob = None
             except Exception:
                 blob = None
             if blob and "\n" in blob:

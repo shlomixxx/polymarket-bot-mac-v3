@@ -493,6 +493,86 @@ def test_wrapper_never_calls_a_withdrawal_on_the_client():
     assert bad == [], f"wrapper called forbidden client methods: {bad}"
 
 
+# ---------------------------------------------------------------------------
+# SECRET-STORE SCOPING — the live key path must read the BINANCE store, never
+# the Polymarket one (the two stores must never collide).
+# ---------------------------------------------------------------------------
+
+def test_build_real_client_scopes_secret_store_to_binance(monkeypatch):
+    """When no client is injected and no env keys are set, _build_real_client must
+    load the key from secret_store SCOPED to the binance-futures service — NOT the
+    default polymarket store. Proven by a fake secret_store that records the
+    `service` it was asked for, and a fake UMFutures that records the key it got."""
+    # no env keys -> force the secret_store path
+    monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+    monkeypatch.delenv("BINANCE_API_SECRET", raising=False)
+
+    seen = {}
+
+    class FakeSecretStore:
+        # default arg mirrors the real signature: load_key(service=...)
+        def load_key(self, service="polymarket-bot"):
+            seen["service"] = service
+            return "BINANCE_KEY\nBINANCE_SECRET"
+
+    class FakeUMFutures:
+        def __init__(self, key=None, secret=None, base_url=None):
+            seen["key"] = key
+            seen["secret"] = secret
+            seen["base_url"] = base_url
+
+    fake_binance_mod = type("M", (), {"UMFutures": FakeUMFutures})
+    fake_um_pkg = type("M", (), {})()
+    fake_um_pkg.um_futures = type("M", (), {"UMFutures": FakeUMFutures})
+
+    import sys
+    monkeypatch.setitem(sys.modules, "secret_store", FakeSecretStore())
+    monkeypatch.setitem(sys.modules, "binance", fake_binance_mod)
+    monkeypatch.setitem(sys.modules, "binance.um_futures",
+                        type("M", (), {"UMFutures": FakeUMFutures}))
+
+    # client=None -> _build_real_client runs
+    BinanceFuturesClient(client=None, testnet=True)
+
+    assert seen["service"] == binance_exchange.SECRET_SERVICE == "binance-futures-bot", (
+        "live key path read the wrong secret_store service (polymarket collision!)"
+    )
+    # and the scoped key/secret reached the connector
+    assert seen["key"] == "BINANCE_KEY"
+    assert seen["secret"] == "BINANCE_SECRET"
+    # testnet base url, never the live fapi host, when testnet=True
+    assert seen["base_url"] == "https://testnet.binancefuture.com"
+
+
+def test_build_real_client_prefers_env_keys_over_secret_store(monkeypatch):
+    """Env keys take precedence and the secret_store is not consulted at all."""
+    monkeypatch.setenv("BINANCE_API_KEY", "ENVKEY")
+    monkeypatch.setenv("BINANCE_API_SECRET", "ENVSECRET")
+
+    seen = {}
+
+    class FakeSecretStore:
+        def load_key(self, service="polymarket-bot"):
+            seen["consulted"] = True
+            return "SHOULD_NOT_BE_USED\nNOPE"
+
+    class FakeUMFutures:
+        def __init__(self, key=None, secret=None, base_url=None):
+            seen["key"] = key
+            seen["secret"] = secret
+
+    import sys
+    monkeypatch.setitem(sys.modules, "secret_store", FakeSecretStore())
+    monkeypatch.setitem(sys.modules, "binance.um_futures",
+                        type("M", (), {"UMFutures": FakeUMFutures}))
+
+    BinanceFuturesClient(client=None, testnet=True)
+
+    assert seen["key"] == "ENVKEY"
+    assert seen["secret"] == "ENVSECRET"
+    assert "consulted" not in seen, "secret_store must not be read when env keys are present"
+
+
 def _strip_comments_and_strings(src: str) -> str:
     """Tokenize and drop comments + string literals (docstrings included), so we
     test only the EXECUTABLE code — prose that says 'there is no withdraw method'
