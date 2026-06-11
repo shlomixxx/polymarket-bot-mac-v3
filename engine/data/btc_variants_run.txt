@@ -1,0 +1,109 @@
+======================================================================================================================
+BTC strategy VARIANTS — REAL-history backtest vs BUY-AND-HOLD (HARMLESS half; no live code; NO MARTINGALE)
+======================================================================================================================
+History: 1d: source=binance n=2200; 4h: source=binance n=11000; 1h: source=binance n=28000
+Variants x timeframes: 6 runs; costs fee 0.05%/side + slippage 0.02%/fill + funding (per-tf).
+
+======================================================================================================================
+mean_reversion_v1 (1h, daily-trend)  [base_tf=1h]
+  window: 2023-04-01..2026-06-11 (28000 bars); OOS tail = last 8760 bars (2025-06-11..2026-06-11, FROZEN ~1yr)
+  auto-counted n_trials = 16; best in-sample params = {'mr_rsi_oversold': 25.0, 'mr_rsi_overbought': 70.0, 'mr_atr_stop_mult': 2.0, 'mr_min_rr': 2.0}
+  funding/bar = 0.001%  (fee 0.05%/side, slippage 0.02%/fill)
+----------------------------------------------------------------------------------------------------------------------
+                                            Return  Sharpe     DSR     MaxDD      PF     Win%  Trades
+IN-SAMPLE
+  mean_reversion_v1 (1h, daily-trend)       -46.4%   -3.84   0.000    -50.1%    0.65   +27.2%     401
+  buy-and-hold                             +284.1%    2.25     -      -32.3%    1.05   +51.0%       1
+OUT-OF-SAMPLE (frozen)
+  mean_reversion_v1 (1h, daily-trend)       -17.5%   -1.24   0.000    -18.5%    0.78   +28.9%     194
+  buy-and-hold                              -42.4%   -1.10     -      -52.9%    0.97   +49.9%       1
+
+======================================================================================================================
+mean_reversion_v1 (4h, daily-trend)  [base_tf=4h]
+  window: 2021-06-04..2026-06-11 (11000 bars); OOS tail = last 2190 bars (2025-06-11..2026-06-11, FROZEN ~1yr)
+  auto-counted n_trials = 16; best in-sample params = {'mr_rsi_oversold': 25.0, 'mr_rsi_overbought': 75.0, 'mr_atr_stop_mult': 2.0, 'mr_min_rr': 2.0}
+  funding/bar = 0.004%  (fee 0.05%/side, slippage 0.02%/fill)
+----------------------------------------------------------------------------------------------------------------------
+                                            Return  Sharpe     DSR     MaxDD      PF     Win%  Trades
+IN-SAMPLE
+  mean_reversion_v1 (4h, daily-trend)       -23.1%   -2.32   0.000    -26.7%    0.66   +24.9%     177
+  buy-and-hold                             +198.4%    1.54     -      -77.0%    1.05   +51.1%       1
+OUT-OF-SAMPLE (frozen)
+  mean_reversion_v1 (4h, daily-trend)        +1.2%    0.25   0.000     -7.2%    1.08   +37.2%      43
+  buy-and-hold                              -42.4%   -1.13     -      -51.9%    0.93   +50.1%       1
+
+======================================================================================================================
+ma_crossover_v1 (1d)  [base_tf=1d]
+  window: 2020-06-03..2026-06-11 (2200 bars); OOS tail = last 365 bars (2025-06-12..2026-06-11, FROZEN ~1yr)
+  auto-counted n_trials = 16; best in-sample params = {'ma_fast': 50, 'ma_slow': 100, 'ma_atr_stop_mult': 2.0, 'ma_rr': 2.0}
+  funding/bar = 0.024%  (fee 0.05%/side, slippage 0.02%/fill)
+----------------------------------------------------------------------------------------------------------------------
+                                            Return  Sharpe     DSR     MaxDD      PF     Win%  Trades
+IN-SAMPLE
+  ma_crossover_v1 (1d)                      +12.0%    1.89   0.000     -5.2%    1.61   +47.8%      67
+  buy-and-hold                            +1024.0%    2.47     -      -76.6%    1.18   +50.9%       1
+OUT-OF-SAMPLE (frozen)
+  ma_crossover_v1 (1d)                       +2.4%    0.98   0.000     -1.1%    1.90   +54.5%      11
+  buy-and-hold                              -40.2%   -0.99     -      -51.2%    0.86   +48.1%       1
+
+======================================================================================================================
+ma_crossover_v1 (4h)  [base_tf=4h]
+  window: 2021-06-04..2026-06-11 (11000 bars); OOS tail = last 2190 bars (2025-06-11..2026-06-11, FROZEN ~1yr)
+  auto-counted n_trials = 16; best in-sample params = {'ma_fast': 20, 'ma_slow': 100, 'ma_atr_stop_mult': 2.0, 'ma_rr': 2.0}
+  funding/bar = 0.004%  (fee 0.05%/side, slippage 0.02%/fill)
+----------------------------------------------------------------------------------------------------------------------
+                                            Return  Sharpe     DSR     MaxDD      PF     Win%  Trades
+IN-SAMPLE
+  ma_crossover_v1 (4h)                       +7.8%    0.62   0.000     -9.1%    1.06   +37.1%     345
+  buy-and-hold                             +198.4%    1.54     -      -77.0%    1.05   +51.1%       1
+OUT-OF-SAMPLE (frozen)
+  ma_crossover_v1 (4h)                       +0.1%    0.04   0.000     -7.3%    1.00   +36.2%      80
+  buy-and-hold                              -42.4%   -1.13     -      -51.9%    0.93   +50.1%       1
+
+======================================================================================================================
+donchian_breakout_v1 (1d)  [base_tf=1d]
+  window: 2020-06-03..2026-06-11 (2200 bars); OOS tail = last 365 bars (2025-06-12..2026-06-11, FROZEN ~1yr)
+  auto-counted n_trials = 12; best in-sample params = {'dc_period': 20, 'dc_atr_stop_mult': 3.0, 'dc_rr': 2.0}
+  funding/bar = 0.024%  (fee 0.05%/side, slippage 0.02%/fill)
+----------------------------------------------------------------------------------------------------------------------
+                                            Return  Sharpe     DSR     MaxDD      PF     Win%  Trades
+IN-SAMPLE
+  donchian_breakout_v1 (1d)                  +7.1%    1.69   0.000     -3.1%    1.89   +53.3%      30
+  buy-and-hold                            +1024.0%    2.47     -      -76.6%    1.18   +50.9%       1
+OUT-OF-SAMPLE (frozen)
+  donchian_breakout_v1 (1d)                  -1.8%   -1.21   0.000     -1.8%    0.34   +28.6%       7
+  buy-and-hold                              -40.2%   -0.99     -      -51.2%    0.86   +48.1%       1
+
+======================================================================================================================
+donchian_breakout_v1 (4h)  [base_tf=4h]
+  window: 2021-06-04..2026-06-11 (11000 bars); OOS tail = last 2190 bars (2025-06-11..2026-06-11, FROZEN ~1yr)
+  auto-counted n_trials = 12; best in-sample params = {'dc_period': 40, 'dc_atr_stop_mult': 3.0, 'dc_rr': 2.0}
+  funding/bar = 0.004%  (fee 0.05%/side, slippage 0.02%/fill)
+----------------------------------------------------------------------------------------------------------------------
+                                            Return  Sharpe     DSR     MaxDD      PF     Win%  Trades
+IN-SAMPLE
+  donchian_breakout_v1 (4h)                  +8.1%    1.10   0.000     -4.8%    1.24   +41.4%      99
+  buy-and-hold                             +198.4%    1.54     -      -77.0%    1.05   +51.1%       1
+OUT-OF-SAMPLE (frozen)
+  donchian_breakout_v1 (4h)                  +4.3%    1.02   0.000     -2.7%    1.46   +46.9%      32
+  buy-and-hold                              -42.4%   -1.13     -      -51.9%    0.93   +50.1%       1
+
+======================================================================================================================
+HONEST VERDICT (out-of-sample, after fees + slippage + funding; multiple-testing corrected)
+----------------------------------------------------------------------------------------------------------------------
+  mean_reversion_v1 (1h, daily-trend)      -> no edge  [ret -17.5% vs B&H -42.4%, Sharpe -1.24 vs -1.10, PF 0.78, DSR 0.000, 194 trades]
+      why not: Sharpe -1.24 <= B&H -1.10; PF 0.78 <= 1; DSR 0.000 == 0 (no edge after 16 trials)
+  mean_reversion_v1 (4h, daily-trend)      -> no edge  [ret +1.2% vs B&H -42.4%, Sharpe 0.25 vs -1.13, PF 1.08, DSR 0.000, 43 trades]
+      why not: DSR 0.000 == 0 (no edge after 16 trials)
+  ma_crossover_v1 (1d)                     -> no edge  [ret +2.4% vs B&H -40.2%, Sharpe 0.98 vs -0.99, PF 1.90, DSR 0.000, 11 trades]
+      why not: only 11 OOS trades (<30 -> a fluke could hide here)
+  ma_crossover_v1 (4h)                     -> no edge  [ret +0.1% vs B&H -42.4%, Sharpe 0.04 vs -1.13, PF 1.00, DSR 0.000, 80 trades]
+      why not: DSR 0.000 == 0 (no edge after 16 trials)
+  donchian_breakout_v1 (1d)                -> no edge  [ret -1.8% vs B&H -40.2%, Sharpe -1.21 vs -0.99, PF 0.34, DSR 0.000, 7 trades]
+      why not: only 7 OOS trades (<30 -> a fluke could hide here); Sharpe -1.21 <= B&H -0.99; PF 0.34 <= 1
+  donchian_breakout_v1 (4h)                -> no edge  [ret +4.3% vs B&H -42.4%, Sharpe 1.02 vs -1.13, PF 1.46, DSR 0.000, 32 trades]
+      why not: DSR 0.000 == 0 (no edge after 12 trials)
+----------------------------------------------------------------------------------------------------------------------
+NONE of the three variants beats risk-adjusted buy-and-hold OUT-OF-SAMPLE after fees with Deflated-Sharpe > 0.
+No variant clears PF>1 AND DSR>0 AND n_trades>=30 on the frozen OOS it was never tuned on.
+==> hold BTC remains the honest answer.

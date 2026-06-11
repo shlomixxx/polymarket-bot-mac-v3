@@ -1,0 +1,335 @@
+{
+  "history": "1d: source=binance n=2200; 4h: source=binance n=11000; 1h: source=binance n=28000",
+  "binance_reachable": true,
+  "costs": {
+    "fee_pct": 0.05,
+    "slippage_pct": 0.02,
+    "funding": true,
+    "funding_per_hour_pct": 0.001
+  },
+  "oos_days": 365,
+  "runs": [
+    {
+      "name": "mean_reversion_v1 (1h, daily-trend)",
+      "base_tf": "1h",
+      "n_trials": 16,
+      "best_params": {
+        "mr_rsi_oversold": 25.0,
+        "mr_rsi_overbought": 70.0,
+        "mr_atr_stop_mult": 2.0,
+        "mr_min_rr": 2.0
+      },
+      "oos_bars": 8760,
+      "in_sample": {
+        "strategy": {
+          "final_return": -0.46391016198392565,
+          "sharpe": -3.8359671444700063,
+          "max_drawdown": -0.5008618644546664,
+          "profit_factor": 0.6483101945111006,
+          "win_rate": 0.2718204488778055,
+          "n_trades": 401,
+          "avg_R": -0.30444488873177417
+        },
+        "buy_and_hold": {
+          "final_return": 2.8405784415670245,
+          "sharpe": 2.2537303483818807,
+          "max_drawdown": -0.3231069072207684,
+          "profit_factor": 1.052580070854759,
+          "win_rate": 0.5096938510317585,
+          "n_trades": 1,
+          "avg_R": 2.8405784415670245
+        },
+        "deflated_sharpe": 0.0
+      },
+      "oos": {
+        "strategy": {
+          "final_return": -0.17486349766747566,
+          "sharpe": -1.2386366263477895,
+          "max_drawdown": -0.1853446279185308,
+          "profit_factor": 0.7765716041337596,
+          "win_rate": 0.28865979381443296,
+          "n_trades": 194,
+          "avg_R": -0.18732942215306167
+        },
+        "buy_and_hold": {
+          "final_return": -0.42430766221570504,
+          "sharpe": -1.09592907341765,
+          "max_drawdown": -0.5286450773653575,
+          "profit_factor": 0.9650988649401718,
+          "win_rate": 0.4994862427217719,
+          "n_trades": 1,
+          "avg_R": -0.42430766221570504
+        },
+        "deflated_sharpe": 0.0
+      }
+    },
+    {
+      "name": "mean_reversion_v1 (4h, daily-trend)",
+      "base_tf": "4h",
+      "n_trials": 16,
+      "best_params": {
+        "mr_rsi_oversold": 25.0,
+        "mr_rsi_overbought": 75.0,
+        "mr_atr_stop_mult": 2.0,
+        "mr_min_rr": 2.0
+      },
+      "oos_bars": 2190,
+      "in_sample": {
+        "strategy": {
+          "final_return": -0.23106119199997932,
+          "sharpe": -2.3201961055694507,
+          "max_drawdown": -0.2672544773445803,
+          "profit_factor": 0.6592521309318028,
+          "win_rate": 0.24858757062146894,
+          "n_trades": 177,
+          "avg_R": -0.28987135696847793
+        },
+        "buy_and_hold": {
+          "final_return": 1.9841907835201522,
+          "sharpe": 1.5403961917441724,
+          "max_drawdown": -0.7704339319608702,
+          "profit_factor": 1.0520380019076696,
+          "win_rate": 0.5109547054149166,
+          "n_trades": 1,
+          "avg_R": 1.9841907835201522
+        },
+        "deflated_sharpe": 0.0
+      },
+      "oos": {
+        "strategy": {
+          "final_return": 0.012145707593574029,
+          "sharpe": 0.24782013760728255,
+          "max_drawdown": -0.07199621087164432,
+          "profit_factor": 1.077337444436095,
+          "win_rate": 0.37209302325581395,
+          "n_trades": 43,
+          "avg_R": 0.06289396604660204
+        },
+        "buy_and_hold": {
+          "final_return": -0.4244170311029136,
+          "sharpe": -1.1309662189814007,
+          "max_drawdown": -0.519178290930423,
+          "profit_factor": 0.9318387381373122,
+          "win_rate": 0.5006852444038373,
+          "n_trades": 1,
+          "avg_R": -0.4244170311029136
+        },
+        "deflated_sharpe": 0.0
+      }
+    },
+    {
+      "name": "ma_crossover_v1 (1d)",
+      "base_tf": "1d",
+      "n_trials": 16,
+      "best_params": {
+        "ma_fast": 50,
+        "ma_slow": 100,
+        "ma_atr_stop_mult": 2.0,
+        "ma_rr": 2.0
+      },
+      "oos_bars": 365,
+      "in_sample": {
+        "strategy": {
+          "final_return": 0.1198408376654232,
+          "sharpe": 1.886405796199717,
+          "max_drawdown": -0.052137271165093035,
+          "profit_factor": 1.6106065144145199,
+          "win_rate": 0.47761194029850745,
+          "n_trades": 67,
+          "avg_R": 0.3436182688468096
+        },
+        "buy_and_hold": {
+          "final_return": 10.239646439566988,
+          "sharpe": 2.4700650318503143,
+          "max_drawdown": -0.7662925431645935,
+          "profit_factor": 1.1825712958734822,
+          "win_rate": 0.5092693565976009,
+          "n_trades": 1,
+          "avg_R": 10.239646439566988
+        },
+        "deflated_sharpe": 0.0
+      },
+      "oos": {
+        "strategy": {
+          "final_return": 0.02449509998809951,
+          "sharpe": 0.9823089628948755,
+          "max_drawdown": -0.010746223109766806,
+          "profit_factor": 1.896755741874498,
+          "win_rate": 0.5454545454545454,
+          "n_trades": 11,
+          "avg_R": 0.4456177218611842
+        },
+        "buy_and_hold": {
+          "final_return": -0.40228100741797257,
+          "sharpe": -0.9909494739601098,
+          "max_drawdown": -0.5115888570490237,
+          "profit_factor": 0.8625428518315646,
+          "win_rate": 0.4807692307692308,
+          "n_trades": 1,
+          "avg_R": -0.40228100741797257
+        },
+        "deflated_sharpe": 1.265606198841418e-06
+      }
+    },
+    {
+      "name": "ma_crossover_v1 (4h)",
+      "base_tf": "4h",
+      "n_trials": 16,
+      "best_params": {
+        "ma_fast": 20,
+        "ma_slow": 100,
+        "ma_atr_stop_mult": 2.0,
+        "ma_rr": 2.0
+      },
+      "oos_bars": 2190,
+      "in_sample": {
+        "strategy": {
+          "final_return": 0.07780416675065638,
+          "sharpe": 0.6243999268368394,
+          "max_drawdown": -0.09133766383142217,
+          "profit_factor": 1.064128186297939,
+          "win_rate": 0.3710144927536232,
+          "n_trades": 345,
+          "avg_R": 0.04864519547423723
+        },
+        "buy_and_hold": {
+          "final_return": 1.9841907835201522,
+          "sharpe": 1.5403961917441724,
+          "max_drawdown": -0.7704339319608702,
+          "profit_factor": 1.0520380019076696,
+          "win_rate": 0.5109547054149166,
+          "n_trades": 1,
+          "avg_R": 1.9841907835201522
+        },
+        "deflated_sharpe": 0.0
+      },
+      "oos": {
+        "strategy": {
+          "final_return": 0.0008264040702086195,
+          "sharpe": 0.04463397510493176,
+          "max_drawdown": -0.07306440900176236,
+          "profit_factor": 1.003064628108421,
+          "win_rate": 0.3625,
+          "n_trades": 80,
+          "avg_R": 0.0072222559515737845
+        },
+        "buy_and_hold": {
+          "final_return": -0.4244170311029136,
+          "sharpe": -1.1309662189814007,
+          "max_drawdown": -0.519178290930423,
+          "profit_factor": 0.9318387381373122,
+          "win_rate": 0.5006852444038373,
+          "n_trades": 1,
+          "avg_R": -0.4244170311029136
+        },
+        "deflated_sharpe": 0.0
+      }
+    },
+    {
+      "name": "donchian_breakout_v1 (1d)",
+      "base_tf": "1d",
+      "n_trials": 12,
+      "best_params": {
+        "dc_period": 20,
+        "dc_atr_stop_mult": 3.0,
+        "dc_rr": 2.0
+      },
+      "oos_bars": 365,
+      "in_sample": {
+        "strategy": {
+          "final_return": 0.07121247367800243,
+          "sharpe": 1.6923290528263328,
+          "max_drawdown": -0.03092712140301379,
+          "profit_factor": 1.8850407881185878,
+          "win_rate": 0.5333333333333333,
+          "n_trades": 30,
+          "avg_R": 0.46458692459334955
+        },
+        "buy_and_hold": {
+          "final_return": 10.239646439566988,
+          "sharpe": 2.4700650318503143,
+          "max_drawdown": -0.7662925431645935,
+          "profit_factor": 1.1825712958734822,
+          "win_rate": 0.5092693565976009,
+          "n_trades": 1,
+          "avg_R": 10.239646439566988
+        },
+        "deflated_sharpe": 2.452482661396971e-13
+      },
+      "oos": {
+        "strategy": {
+          "final_return": -0.017736221539073727,
+          "sharpe": -1.2070541753062125,
+          "max_drawdown": -0.01812287112277311,
+          "profit_factor": 0.3441238616652088,
+          "win_rate": 0.2857142857142857,
+          "n_trades": 7,
+          "avg_R": -0.5079942836370684
+        },
+        "buy_and_hold": {
+          "final_return": -0.40228100741797257,
+          "sharpe": -0.9909494739601098,
+          "max_drawdown": -0.5115888570490237,
+          "profit_factor": 0.8625428518315646,
+          "win_rate": 0.4807692307692308,
+          "n_trades": 1,
+          "avg_R": -0.40228100741797257
+        },
+        "deflated_sharpe": 6.400220232638532e-05
+      }
+    },
+    {
+      "name": "donchian_breakout_v1 (4h)",
+      "base_tf": "4h",
+      "n_trials": 12,
+      "best_params": {
+        "dc_period": 40,
+        "dc_atr_stop_mult": 3.0,
+        "dc_rr": 2.0
+      },
+      "oos_bars": 2190,
+      "in_sample": {
+        "strategy": {
+          "final_return": 0.08075495964605905,
+          "sharpe": 1.0969265520616045,
+          "max_drawdown": -0.04759590105290834,
+          "profit_factor": 1.2433205546658697,
+          "win_rate": 0.41414141414141414,
+          "n_trades": 99,
+          "avg_R": 0.16229969618450724
+        },
+        "buy_and_hold": {
+          "final_return": 1.9841907835201522,
+          "sharpe": 1.5403961917441724,
+          "max_drawdown": -0.7704339319608702,
+          "profit_factor": 1.0520380019076696,
+          "win_rate": 0.5109547054149166,
+          "n_trades": 1,
+          "avg_R": 1.9841907835201522
+        },
+        "deflated_sharpe": 0.0
+      },
+      "oos": {
+        "strategy": {
+          "final_return": 0.04312159655546921,
+          "sharpe": 1.0195296645893366,
+          "max_drawdown": -0.026975982245846963,
+          "profit_factor": 1.458173606264694,
+          "win_rate": 0.46875,
+          "n_trades": 32,
+          "avg_R": 0.2694352715163394
+        },
+        "buy_and_hold": {
+          "final_return": -0.4244170311029136,
+          "sharpe": -1.1309662189814007,
+          "max_drawdown": -0.519178290930423,
+          "profit_factor": 0.9318387381373122,
+          "win_rate": 0.5006852444038373,
+          "n_trades": 1,
+          "avg_R": -0.4244170311029136
+        },
+        "deflated_sharpe": 0.0
+      }
+    }
+  ]
+}
