@@ -217,6 +217,37 @@ class BinanceFuturesClient:
             _log.warning("get_position failed for %s: %s", symbol, exc)
             return {}
 
+    def get_open_positions(self) -> list[dict[str, Any]]:
+        """Every CURRENTLY-OPEN position across the whole futures account.
+
+        Used by reconcile_on_start (and enforce_caps) to discover naked positions
+        WITHOUT being told which symbols to look at — so a position opened outside
+        the cockpit still gets a stop or gets flattened on boot. Normalizes each
+        row to the same shape get_position returns; only non-flat rows are kept.
+        NEVER raises — empty list on failure (read path)."""
+        try:
+            rows = self._client.get_position_risk() or []
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                amt = _D(row.get("positionAmt"))
+                amt_f = float(amt) if amt is not None else 0.0
+                if amt_f == 0.0:
+                    continue  # flat — skip
+                side = "long" if amt_f > 0 else "short"
+                out.append({
+                    "symbol": row.get("symbol") or "",
+                    "qty": amt_f,
+                    "entry_price": float(_D(row.get("entryPrice")) or 0),
+                    "side": side,
+                    "leverage": float(_D(row.get("leverage")) or 0),
+                    "unrealized_pnl": float(_D(row.get("unRealizedProfit")) or 0),
+                    "raw": row,
+                })
+            return out
+        except Exception as exc:
+            _log.warning("get_open_positions failed: %s", exc)
+            return []
+
     def get_liquidation_price(self, symbol: str) -> Optional[float]:
         """Liquidation price from positionRisk. None if flat / unavailable."""
         try:

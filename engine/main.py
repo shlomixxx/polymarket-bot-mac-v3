@@ -890,6 +890,14 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
     asyncio.create_task(_audit_backfill_once())
+    # Binance cockpit: boot-time naked-position guard. Runs ONCE, OFF the event
+    # loop (sync REST inside), and never crashes boot. No-op unless live enabled.
+    async def _binance_reconcile_once():
+        try:
+            await asyncio.to_thread(_binance_reconcile_on_start)
+        except Exception as e:
+            print(f"[binance] reconcile task failed (non-fatal): {e!r}", flush=True)
+    asyncio.create_task(_binance_reconcile_once())
     # Start real-time WebSocket price stream from Polymarket CLOB
     price_stream.start()
     _ws_subscription_task = asyncio.create_task(
@@ -1964,6 +1972,253 @@ async def live_mode_set(body: LiveModeBody):
     except Exception:
         pass
     return {"ok": True, **_live_mode_state()}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BINANCE USDⓈ-M FUTURES — responsible MANUAL-TRADING COCKPIT (Task 3 wiring)
+#
+# The human makes EVERY trade decision. These endpoints only enforce SAFETY:
+#   * every order routes through risk_engine.gate_order (the single approve path),
+#   * the exchange stop is placed ATOMICALLY and VERIFIED (naked-position guard),
+#   * a REAL order is NEVER placed unless binance_secrets.is_live_enabled() — the
+#     BINANCE_LIVE deploy gate (mirrors POLYMARKET_LIVE) + keys present + not
+#     testnet. Otherwise we run against TESTNET or refuse, never silently live.
+# The API keys are NEVER returned/logged here — only booleans about their state.
+# ════════════════════════════════════════════════════════════════════════════
+
+import risk_engine
+import binance_cockpit
+import binance_secrets
+from binance_exchange import BinanceFuturesClient
+
+# Symbols the boot-time reconcile guard scans when the account can't enumerate
+# positions itself (e.g. an injected client without get_open_positions). Live
+# clients enumerate ALL open positions; this is only a belt-and-braces fallback.
+_BINANCE_RECONCILE_SYMBOLS = [
+    s.strip().upper()
+    for s in (os.environ.get("BINANCE_RECONCILE_SYMBOLS", "BTCUSDT").split(","))
+    if s.strip()
+]
+
+# Lazily-built, cached cockpit exchange clients — one per (live|testnet) mode so a
+# preview on testnet never touches the live client and vice-versa. Tests
+# monkeypatch _get_binance_client / binance_cockpit to inject a mock (NO network).
+_binance_clients: dict[bool, Any] = {}
+
+
+def _get_binance_client(*, force_testnet: bool = False) -> Any:
+    """Build (once) and return a BinanceFuturesClient.
+
+    `force_testnet=True` (or live not enabled) ALWAYS yields a testnet client, so
+    the /trade path can guarantee it never sends a real order while live is off.
+    The real connector reads keys from binance_secrets via env/secret_store inside
+    binance_exchange; keys are NEVER passed through here."""
+    live = binance_secrets.is_live_enabled() and not force_testnet
+    testnet = not live
+    cached = _binance_clients.get(testnet)
+    if cached is not None:
+        return cached
+    client = BinanceFuturesClient(testnet=testnet)
+    _binance_clients[testnet] = client
+    return client
+
+
+def _binance_equity(client: Any) -> Optional[float]:
+    """Account equity (USDT available balance) used for risk sizing. None if the
+    balance can't be read — callers must treat None as 'cannot size'."""
+    try:
+        return client.get_balance("USDT")
+    except Exception:
+        return None
+
+
+def _binance_risk_state() -> dict[str, Any]:
+    """Risk-cap inputs for the gate. The manual cockpit has no running P&L feed
+    yet, so day/drawdown default to 0.0 (caps not breached). Wired to a real feed
+    later; gate_order still enforces per-trade risk/leverage/R:R regardless."""
+    return {"day_pnl_pct": 0.0, "peak_drawdown_pct": 0.0}
+
+
+@app.get("/api/binance/state")
+async def binance_state(request: Request):
+    """READ-ONLY cockpit state: balance + open position + liquidation + net P&L +
+    caps status + whether LIVE is enabled. NEVER returns the API keys."""
+    status = binance_secrets.live_status()  # booleans only — no key material
+    symbol = (request.query_params.get("symbol") or "BTCUSDT").strip().upper()
+    out: dict[str, Any] = {
+        "live": status,
+        "symbol": symbol,
+        "testnet": status["testnet"],
+        "balance_usdt": None,
+        "position": None,
+        "liquidation_price": None,
+        "unrealized_pnl": None,
+        "caps": None,
+        "error": None,
+    }
+    try:
+        client = _get_binance_client()
+        out["balance_usdt"] = client.get_balance("USDT")
+        pos = client.get_position(symbol) or {}
+        out["position"] = pos or None
+        out["unrealized_pnl"] = (pos or {}).get("unrealized_pnl")
+        out["liquidation_price"] = client.get_liquidation_price(symbol)
+        rs = _binance_risk_state()
+        caps = risk_engine.check_caps(rs.get("day_pnl_pct"), rs.get("peak_drawdown_pct"))
+        out["caps"] = {
+            "allow_new": caps["allow_new"], "flatten": caps["flatten"],
+            "halt": caps["halt"], "reason": caps["reason"],
+        }
+    except Exception as exc:
+        # Read path must never 500 — surface a message, keep live-status intact.
+        out["error"] = f"binance read failed: {exc!r}"
+    return etag_json_response(out, request.headers.get("if-none-match"))
+
+
+class BinancePreviewBody(BaseModel):
+    symbol: str = "BTCUSDT"
+    side: str                       # 'long' | 'short'
+    entry: float
+    stop: float
+    target: Optional[float] = None
+    leverage: int = 3
+    risk_pct: Optional[float] = None
+    equity: Optional[float] = None  # override; else read from the account balance
+
+
+@app.post("/api/binance/preview")
+async def binance_preview(body: BinancePreviewBody):
+    """TRANSPARENCY: show EXACTLY what the order costs and whether it passes every
+    safety check — BEFORE any money moves. Places NOTHING. Read-only."""
+    client = _get_binance_client()
+    equity = body.equity if body.equity is not None else _binance_equity(client)
+    if equity is None:
+        return {"approved": False, "reason": "could not read account equity (no balance)"}
+    risk_pct = body.risk_pct if body.risk_pct is not None else risk_engine.DEFAULT_RISK_PCT
+    return binance_cockpit.preview_trade(
+        client,
+        symbol=body.symbol.strip().upper(), side=body.side, entry=body.entry,
+        stop=body.stop, target=body.target, equity=equity,
+        risk_pct=risk_pct, leverage=int(body.leverage or 3),
+        risk_state=_binance_risk_state(),
+    )
+
+
+class BinanceTradeBody(BaseModel):
+    symbol: str = "BTCUSDT"
+    side: str
+    entry: float
+    stop: float
+    target: Optional[float] = None
+    leverage: int = 3
+    risk_pct: Optional[float] = None
+    equity: Optional[float] = None
+
+
+@app.post("/api/binance/trade")
+async def binance_trade(body: BinanceTradeBody):
+    """EXECUTE a human-decided trade. Protected by the global X-Bot-Token POST
+    middleware AND the BINANCE_LIVE live gate.
+
+    If live is NOT enabled, the order runs against TESTNET and the response is
+    clearly labelled `live_enabled=false` — a REAL order is NEVER placed silently.
+    Routes through binance_cockpit.place_manual_trade, which re-runs gate_order
+    (the only approve path) and atomically attaches + verifies the exchange stop;
+    a stop that can't be verified auto-flattens the position (naked-risk guard).
+    """
+    live_enabled = binance_secrets.is_live_enabled()
+    # When live is off we FORCE a testnet client — the /trade path can never send
+    # a real order while the BINANCE_LIVE gate (or keys/testnet) says no.
+    client = _get_binance_client(force_testnet=not live_enabled)
+
+    equity = body.equity if body.equity is not None else _binance_equity(client)
+    if equity is None:
+        return {"ok": False, "approved": False, "live_enabled": live_enabled,
+                "reason": "could not read account equity (no balance) — refusing to place"}
+
+    params = {
+        "symbol": body.symbol.strip().upper(), "side": body.side, "entry": body.entry,
+        "stop": body.stop, "target": body.target, "equity": equity,
+        "leverage": int(body.leverage or 3),
+    }
+    if body.risk_pct is not None:
+        params["risk_pct"] = body.risk_pct
+
+    try:
+        result = binance_cockpit.place_manual_trade(
+            client, params, risk_state=_binance_risk_state(),
+        )
+    except binance_cockpit.NakedPositionError as exc:
+        # The cockpit already flattened (or loudly reported it couldn't). Surface
+        # it as a clear 5xx-style payload without leaking internals.
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "naked_position_guard": True,
+                     "live_enabled": live_enabled, "testnet": not live_enabled,
+                     "reason": str(exc)},
+        )
+    result = dict(result)
+    result["live_enabled"] = live_enabled
+    result["testnet"] = not live_enabled
+    if not live_enabled:
+        result["note"] = ("LIVE disabled (BINANCE_LIVE != '1' / no keys / testnet) — "
+                          "this order ran against TESTNET, not real money.")
+    return result
+
+
+class BinanceCloseBody(BaseModel):
+    symbol: str = "BTCUSDT"
+
+
+@app.post("/api/binance/close")
+async def binance_close(body: BinanceCloseBody):
+    """Flatten the position + cancel ALL resting orders (stop/TP) + log the exit
+    with real fees. Protected by the global X-Bot-Token POST middleware. Runs on
+    the same (live|testnet) client the trade path uses. Idempotent when flat."""
+    live_enabled = binance_secrets.is_live_enabled()
+    client = _get_binance_client(force_testnet=not live_enabled)
+    symbol = body.symbol.strip().upper()
+    try:
+        res = binance_cockpit.close_position(client, symbol)
+    except Exception as exc:
+        return {"ok": False, "symbol": symbol, "live_enabled": live_enabled,
+                "reason": f"close failed: {exc!r}"}
+    res = dict(res)
+    res["live_enabled"] = live_enabled
+    res["testnet"] = not live_enabled
+    return res
+
+
+def _binance_reconcile_on_start() -> None:
+    """Boot-time naked-position guard: scan open positions; any without a live
+    stop is protected or flattened. Runs ONCE at startup. Never crashes boot.
+
+    Only acts when live is enabled with real keys — on testnet/no-keys there is
+    nothing real to protect, so we skip rather than poke an empty/garbage account.
+    """
+    try:
+        if not binance_secrets.is_live_enabled():
+            print("[binance] reconcile_on_start skipped — live not enabled (testnet/no keys)",
+                  flush=True)
+            return
+        client = _get_binance_client()
+        # symbols=None -> the cockpit asks the account for ALL open positions
+        # (client.get_open_positions); the watchlist is a belt-and-braces fallback.
+        try:
+            report = binance_cockpit.reconcile_on_start(client)
+        except Exception:
+            report = binance_cockpit.reconcile_on_start(
+                client, symbols=_BINANCE_RECONCILE_SYMBOLS)
+        print(f"[binance] reconcile_on_start: {report}", flush=True)
+    except Exception as exc:
+        print(f"[binance] reconcile_on_start failed (non-fatal): {exc!r}", flush=True)
+        try:
+            from fault_tracker import record_fault
+            record_fault(category="binance", severity="high",
+                         title="binance reconcile_on_start failed",
+                         detail=repr(exc), source="main._binance_reconcile_on_start")
+        except Exception:
+            pass
 
 
 @app.get("/api/live/polymarket-clob-account")
