@@ -83,6 +83,9 @@ def test_every_three_losses_only():
 
 
 def test_max_multiplier_cap():
+    """ה-config מתיר 10×, אבל תקרת-הברזל (3.0) חוסמת את הצבירה — incident 2026-06-15."""
+    from strategy_runner import HARD_MAX_LOSS_RECOVERY_MULT
+
     st = _state()
     st.loss_recovery_multiplier = 9.0
     st.loss_recovery_streak = 0
@@ -94,7 +97,8 @@ def test_max_multiplier_cap():
         max_multiplier=10.0,
         settlement_trades=[{"realized_pnl": -1.0}],
     )
-    assert st.loss_recovery_multiplier == 10.0
+    # נחסם בתקרת-הברזל, לא ב-cap של ה-config (10) ולא בכפל 9×1.5
+    assert st.loss_recovery_multiplier == HARD_MAX_LOSS_RECOVERY_MULT == 3.0
 
 
 def test_disabled_no_op():

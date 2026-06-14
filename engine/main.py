@@ -427,7 +427,7 @@ def _save_persisted_config() -> None:
             "loss_recovery_enabled": getattr(c, "loss_recovery_enabled", False),
             "loss_recovery_step_pct": getattr(c, "loss_recovery_step_pct", 20.0),
             "loss_recovery_every_n_losses": getattr(c, "loss_recovery_every_n_losses", 1),
-            "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 10.0),
+            "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 3.0),
             "order_mode": getattr(c, "order_mode", "limit"),
             "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
             "market_max_entry_price_cents": float(getattr(c, "market_max_entry_price_cents", 80.0)),
@@ -1479,7 +1479,7 @@ class ConfigBody(BaseModel):
     auto_reenter_after_tp: bool = True
     reenter_cooldown_sec: float = 8.0
     max_entries_per_window: int = 3
-    max_notional_per_window_usd: float = 1_000_000.0
+    max_notional_per_window_usd: float = 1_000.0  # safe default (incident 2026-06-15) — not 50_000_000
     max_trades_per_hour: int = 1_000
     near_entry_pct: float = 3.0
     near_tp_pct: float = 2.0
@@ -1488,7 +1488,7 @@ class ConfigBody(BaseModel):
     loss_recovery_enabled: bool = False
     loss_recovery_step_pct: float = 20.0
     loss_recovery_every_n_losses: int = 1
-    loss_recovery_max_multiplier: float = 10.0
+    loss_recovery_max_multiplier: float = 3.0  # = HARD_MAX_LOSS_RECOVERY_MULT (incident 2026-06-15) — not 100000
     # ביצוע מובטח: "limit" (ברירת מחדל, תאימות לאחור) או "market" (FOK/FAK)
     order_mode: str = "limit"
     entry_slippage_pct: float = 2.0

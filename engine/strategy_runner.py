@@ -26,6 +26,17 @@ _STRATEGY_TICK_SLEEP = max(0.05, min(float(os.environ.get("STRATEGY_TICK_SLEEP_S
 DISCOVERY_NONE_PERSIST_SEC = 60.0
 DISCOVERY_NONE_RECORD_INTERVAL_SEC = 120.0
 _CB_COOLDOWN_SEC = 900.0  # 15 min — how long the circuit-breaker pauses new entries after a trip before auto-resuming
+# ── תקרת-ברזל מוחלטת למכפיל שחזור-הפסד ────────────────────────────────────────────────
+# 2026-06-15 INCIDENT: config ה-config סטה למצב מסוכן (loss_recovery_max_multiplier=100000)
+# והמכפיל בסטייט טיפס ל-1525×, אז הבוט ניסה להיכנס ל-~$30k שוב ושוב ("insufficient balance")
+# ורשם 274,840 תקלות שחנקו את ה-event loop. התקרה הזו היא בלם-ברזל בקוד: גם אם ה-config מתיר
+# 100000 וה-state כבר 1525, גודל הפוזיציה לעולם לא יעבור base × HARD_MAX_LOSS_RECOVERY_MULT.
+# חל גם על הצבירה (loss_recovery.py) — כך שהמכפיל המאוחסן עצמו לא יכול להצטבר מעבר לתקרה.
+# בלם בטיחות בלבד: כשהמכפיל ≤ 3 או ששחזור-הפסד כבוי — אין שום שינוי התנהגות.
+HARD_MAX_LOSS_RECOVERY_MULT = 3.0
+# בלם יחסי-ליתרה: לעולם לא ננסה כניסה שה-notional שלה עולה על X מהיתרה הנוכחית של הדמו.
+# מונע את הלולאה "לנסות להיכנס ל-$30k על יתרה של $7k בכל טיק" גם אם משהו אחר השתבש.
+MAX_ENTRY_FRACTION_OF_BALANCE = 0.25
 
 
 def _fmt_px(x: Optional[float]) -> str:
@@ -68,8 +79,10 @@ class StrategyConfig:
     auto_reenter_after_tp: bool = True
     reenter_cooldown_sec: float = 8.0
     max_entries_per_window: int = 3
-    # Risk limits (רך) — בלי SL, רק תקרות כדי למנוע ריצה לא מבוקרת
-    max_notional_per_window_usd: float = 1_000_000.0
+    # Risk limits (רך) — בלי SL, רק תקרות כדי למנוע ריצה לא מבוקרת.
+    # ברירות מחדל שמרניות (incident 2026-06-15): שדות אלו לא נשמרו פעם, ובפרוד חזרו לערכי
+    # ענק (50_000_000 / 100_000_000) שאיפשרו את לולאת ה-$30k. כעת הם בטוחים + נשמרים לדיסק.
+    max_notional_per_window_usd: float = 1_000.0
     max_trades_per_hour: int = 1_000
     # Proximity status thresholds (for UI feedback)
     near_entry_pct: float = 3.0  # נחשב "קרוב" אם ה-Ask עד X% מעל יעד הכניסה
@@ -82,7 +95,8 @@ class StrategyConfig:
     loss_recovery_enabled: bool = False
     loss_recovery_step_pct: float = 20.0
     loss_recovery_every_n_losses: int = 1
-    loss_recovery_max_multiplier: float = 10.0
+    # ברירת מחדל = תקרת-הברזל (3.0). גם אם מישהו מעלה את ה-cap, ה-sizing נחסם ב-HARD_MAX_LOSS_RECOVERY_MULT.
+    loss_recovery_max_multiplier: float = 3.0
     # ביצוע: "limit" (GTC קלאסי) או "market" (FOK לכניסה, FAK ליציאה + retry ladder).
     # מטרה: להבטיח ביצוע מידי ולמנוע פוזיציה תקועה כשהשוק מדלג על יעד ה-TP.
     order_mode: Literal["limit", "market"] = "limit"
@@ -573,6 +587,10 @@ class StrategyRunner:
         m = float(self.demo.state.loss_recovery_multiplier)
         if not math.isfinite(m) or m < 1.0:
             m = 1.0
+        # תקרת-ברזל מוחלטת: גם אם ה-state טיפס ל-1525× (incident 2026-06-15) או ה-config
+        # מתיר 100000 — הגודל בפועל לעולם לא יעבור base × HARD_MAX_LOSS_RECOVERY_MULT.
+        # כשהמכפיל ≤ התקרה אין שינוי התנהגות.
+        m = min(m, HARD_MAX_LOSS_RECOVERY_MULT)
         return base * m
 
     def _live_trading_ok(self) -> bool:
@@ -1009,6 +1027,42 @@ class StrategyRunner:
                 f"סטטוס: תקרת חשיפה בחלון (${cfg.max_notional_per_window_usd:.0f}) — נחסם (נדרש ~${planned_cost_usd:.2f})",
                 key="limit_notional_per_window",
             )
+            return False
+        # ── בלם יחסי-ליתרה (incident 2026-06-15) ──
+        # גם אם משהו אחר השתבש (config מסוכן, מכפיל מנופח), לעולם לא ננסה כניסה שה-notional
+        # שלה עולה על MAX_ENTRY_FRACTION_OF_BALANCE מהיתרה — מונע את הלולאה "לנסות $30k על $7k
+        # בכל טיק" ("insufficient balance" שוב ושוב). תקלה אחת מדודדפת בלבד, לא אחת לכל טיק.
+        try:
+            _bal = float(self.demo.state.balance_usd)
+        except Exception:
+            _bal = 0.0
+        if (
+            _bal > 0
+            and planned_cost_usd > 0
+            and planned_cost_usd > _bal * MAX_ENTRY_FRACTION_OF_BALANCE
+        ):
+            self.rt.status(
+                f"סטטוס: כניסה (~${planned_cost_usd:.2f}) חורגת מ-{MAX_ENTRY_FRACTION_OF_BALANCE * 100:.0f}% מהיתרה "
+                f"(${_bal:.2f}) — נחסם להגנה",
+                key="limit_entry_fraction_of_balance",
+            )
+            try:
+                from fault_tracker import record_fault
+                record_fault(
+                    category="risk", severity="high",
+                    title="כניסה נחסמה: notional גדול מדי ביחס ליתרה",
+                    detail=(
+                        f"notional ~${planned_cost_usd:.2f} > {MAX_ENTRY_FRACTION_OF_BALANCE * 100:.0f}% "
+                        f"מיתרה ${_bal:.2f} — נחסם (הגנה מפני לולאת insufficient-balance)"
+                    ),
+                    source="strategy_runner._entry_limits_ok",
+                    context={"planned_cost_usd": round(planned_cost_usd, 2),
+                             "balance_usd": round(_bal, 2),
+                             "max_fraction": MAX_ENTRY_FRACTION_OF_BALANCE},
+                    dedup_key="entry_notional_exceeds_balance_fraction",
+                )
+            except Exception:
+                pass
             return False
         return True
 
