@@ -47,8 +47,12 @@ type Market = {
   seconds_left: number;
   price_to_beat: number | null;
   price_to_beat_note: string;
-  /** chainlink_polygon_window | binance_1m_fallback — מקור ייחוס לעומת Polymarket */
-  price_to_beat_source?: string;
+  /** chainlink_stream (מדויק) | chainlink_polygon_window | binance_1m_fallback | pending — מקור ייחוס לעומת Polymarket */
+  price_to_beat_source?:
+    | "chainlink_stream"
+    | "chainlink_polygon_window"
+    | "binance_1m_fallback"
+    | "pending";
   /** מ-Gamma API — קישור למקור הרזולוציה (אין ב-API מחיר ייחוס מספרי) */
   polymarket_resolution_source?: string | null;
 };
@@ -144,7 +148,8 @@ const TIP_SETTLEMENT_BTC =
   "המספרים כאן מהמנוע (פרוקסי Binance 1m), לא Chainlink הרשמי לפירוק.";
 
 const TIP_OPEN_BTC_LIVE =
-  "ייחוס פתיחת החלון (Price to Beat) מול מחיר BTC חי מהמסך. " +
+  "ייחוס פתיחת החלון (Price to Beat) מול מחיר BTC חי. כשהמקור הוא פיד Chainlink BTC/USD Data Stream של " +
+  "Polymarket — המספרים זהים למקור שלפיו השוק נסגר (דיוק לסנט); כשמופיע fallback (Binance/Polygon) ייתכן הפרש — ראה את ההערה למטה. " +
   "בסוף החלון: אם סוף ≥ ייחוס — מנצח Up; אחרת Down. במהלך החלון זה רק מצב נוכחי, לא פירוק סופי.";
 
 /** עלות הרגל לפי יציאת TP: proceeds − realized (כמו ב־demo_engine) */
@@ -1661,7 +1666,7 @@ export default function App() {
   const [pkPersistChecked, setPkPersistChecked] = useState(true);
   const [tab, setTab] = useState<Tab>("dash");
   const [market, setMarket] = useState<Market | null>(null);
-  const [btc, setBtc] = useState<{ price: number; history: { t: number; p: number }[] }>({
+  const [btc, setBtc] = useState<{ price: number; source?: string; history: { t: number; p: number }[] }>({
     price: 0,
     history: [],
   });
@@ -1911,7 +1916,7 @@ export default function App() {
       // לא בלולאה המהירה הזו — חוסך הורדת ~19MB כל ~1s. ה-snapshot (500ms) שומר P&L חי טרי.
       const [m, b, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw, lwo] = await Promise.all([
         api<Market>("/api/market/current", { timeoutMs: TIMEOUT_MS_MARKET_CURRENT }),
-        api<{ price: number; history: { t: number; p: number }[] }>("/api/btc/live"),
+        api<{ price: number; source?: string; history: { t: number; p: number }[] }>("/api/btc/live"),
         api<{ lines: string[] }>("/api/strategy/logs"),
         api<{ pending: unknown }>("/api/strategy/pending"),
         api<Record<string, unknown>>("/api/strategy/config"),
@@ -2452,6 +2457,10 @@ export default function App() {
     market?.price_to_beat != null && btc.price
       ? btc.price - market.price_to_beat
       : null;
+  // הסימן (↑/↓) אמין רק כששני הצדדים מאותו מקור Chainlink Data Stream. אם אחד מהם fallback
+  // (Binance/Polygon) — ההפרש חוצה מקורות ועלול להסטות בכמה דולרים ליד גבול החלון, אז לא נצבע כיוון.
+  const diffSourcesMatch =
+    btc.source === "chainlink_stream" && market?.price_to_beat_source === "chainlink_stream";
 
   return (
     <div className="app-shell">
@@ -2783,16 +2792,39 @@ export default function App() {
                   >
                     {market.polymarket_resolution_source}
                   </a>{" "}
-                  — ב-API אין שדה למחיר הדולר; המספר מחושב אצלנו מ-Chainlink/Binance.
+                  — ב-API אין שדה למחיר הדולר; אנו לוכדים אותו ישירות מפיד Chainlink Data Stream של Polymarket
+                  (אותו מקור שלפיו השוק נסגר). Binance/Polygon משמשים כ-fallback בלבד.
                 </p>
               ) : null}
               <p>
                 <strong>מחיר BTC נוכחי:</strong> $
                 {btc.price.toLocaleString(undefined, { maximumFractionDigits: 2 })}{" "}
+                <span
+                  style={{ color: "var(--muted)", fontSize: 11 }}
+                  title={
+                    btc.source === "chainlink_stream"
+                      ? "מפיד Chainlink BTC/USD Data Stream של Polymarket — המקור שלפיו השוק נסגר"
+                      : btc.source === "binance_fallback"
+                      ? "פיד Chainlink לא זמין כרגע — מוצג מחיר Binance spot כ-fallback"
+                      : "טוען מקור מחיר…"
+                  }
+                >
+                  {btc.source === "chainlink_stream"
+                    ? "· ⛓️ Chainlink Data Stream"
+                    : btc.source === "binance_fallback"
+                    ? "· ⚠ Binance (fallback)"
+                    : ""}
+                </span>{" "}
                 {diff != null && (
-                  <span style={{ color: diff >= 0 ? "var(--up)" : "var(--down)" }}>
-                    ({diff >= 0 ? "↑" : "↓"} {Math.abs(diff).toFixed(2)}$ ממחיר הפתיחה)
-                  </span>
+                  diffSourcesMatch ? (
+                    <span style={{ color: diff >= 0 ? "var(--up)" : "var(--down)" }}>
+                      ({diff >= 0 ? "↑" : "↓"} {Math.abs(diff).toFixed(2)}$ ממחיר הפתיחה)
+                    </span>
+                  ) : (
+                    <span style={{ color: "var(--muted)" }} title="מחיר חי וייחוס ממקורות שונים (fallback) — הכיוון משוער">
+                      (~{Math.abs(diff).toFixed(2)}$ ממחיר הפתיחה · מקורות שונים)
+                    </span>
+                  )
                 )}
               </p>
               <p style={{ fontSize: 13, color: "var(--muted)" }}>

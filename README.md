@@ -91,9 +91,31 @@ npm run build:web
 5. **RTL** — כותרות טבלה וטקסט קריאים.  
 6. **חלון צר** — מעל המינימום — כפתורים וטבלאות לא נחתכים קריטית.
 
+## מקור מחירי BTC — דיוק מלא מול Polymarket
+
+שוקי "BTC Up or Down 5m" ב-Polymarket **נסגרים לפי Chainlink BTC/USD Data Stream**
+(`resolutionSource: data.chain.link/streams/btc-usd`). כדי שהמספרים במכון יהיו זהים
+*בדיוק* לאתר, גם ה**מחיר הנוכחי** וגם ה**Price to Beat** נלכדים מאותו פיד:
+
+- `engine/chainlink_price_stream.py` — חיבור WebSocket מתמשך ל-`wss://ws-live-data.polymarket.com`,
+  topic `crypto_prices_chainlink`. הפיד עונה ל-`subscribe` ב-snapshot חד-פעמי של ~60ש׳ טיקים
+  (1Hz), **ללא push** — לכן אנחנו **re-subscribe** כל שנייה כדי לרענן, עם PING כל 5ש׳,
+  reconnect עם backoff ו-watchdog ל-stale (חיקוי הדפוס של `ws_price_stream.py`, אך חיבור נפרד).
+  - **מחיר נוכחי** = הטיק הטרי ביותר (`get_current_price`).
+  - **Price to Beat** = הטיק הראשון שחותמתו ≥ `window_start` (`get_price_to_beat`), נשמר
+    immutable פר-חלון. אם המכון עולה **באמצע חלון** ואין כיסוי לפני הגבול — מוחזר `None`
+    (לא ממציאים מספר), והחלון הבא נלכד במדויק.
+- **שרשרת fallback** (רק כשפיד Chainlink לא זמין/טרי): מחיר נוכחי → Binance spot; Price to Beat
+  → אורקל Chainlink על Polygon → נר Binance 1m. המקור מסומן תמיד: `chainlink_stream`
+  (מדויק) לעומת `binance_fallback` / `chainlink_polygon_window` / `binance_1m_fallback`.
+- ההחלטות האסטרטגיות רצות על מחיר Chainlink (ראה `trigger_engine._fetch_btc_price`,
+  `btc_price.fetch_btc_current_usd`). ה-endpoints `/api/btc/live` ו-`/api/market/current`
+  מחזירים את המקור (`source` / `price_to_beat_source`) וה-`price_to_beat_note` משקף אותו.
+- **הערה:** פירוק ה-settlement בדמו עדיין משתמש בפרוקסי Binance 1m (מחוץ להיקף השינוי הזה).
+
 ## מבנה תיקייה (עיקרי)
 
-- `engine/` — FastAPI, דמו, אסטרטגיה  
+- `engine/` — FastAPI, דמו, אסטרטגיה; `chainlink_price_stream.py` (פיד המחירים המדויק)  
 - `src/` — React; `ui/` רכיבים; `chartConstants.ts`  
 - `electron/` — חלון, פורט dev  
 

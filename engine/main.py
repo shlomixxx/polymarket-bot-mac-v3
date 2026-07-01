@@ -59,12 +59,14 @@ from _http_cache import etag_json_response
 from atomic_io import atomic_write_text
 from btc_price import (
     PriceHistoryBuffer,
+    fetch_btc_current_usd,
     fetch_btc_spot_usdt,
     fetch_chainlink_btc_usd_polygon_at_window_start,
     fetch_close_price_at_window_end,
     fetch_open_price_at_window_start,
     fetch_window_start_end_btc_usd,
 )
+from chainlink_price_stream import chainlink_stream
 from demo_engine import DemoEngine
 from market_discovery import (
     discover_active_btc_window,
@@ -900,6 +902,9 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_binance_reconcile_once())
     # Start real-time WebSocket price stream from Polymarket CLOB
     price_stream.start()
+    # Start the Chainlink Data Stream feed — המקור המדויק למחיר BTC ול-Price to Beat
+    # (זהה למה ש-Polymarket סוגר לפיו). חיבור נפרד מ-price_stream (זה CLOB, זה מחירים).
+    chainlink_stream.start()
     _ws_subscription_task = asyncio.create_task(
         _supervise("ws_subscription_loop", lambda: _ws_subscription_loop(5.0))
     )
@@ -962,6 +967,7 @@ async def lifespan(app: FastAPI):
             pass
         _watchdog_task = None
     price_stream.stop()
+    chainlink_stream.stop()
     trigger.stop_loop()
     runner.stop_loop()
     if _shared_httpx is not None:
@@ -1081,6 +1087,36 @@ async def api_version():
     }
 
 
+def _price_to_beat_note(source: Optional[str], epoch: int) -> str:
+    """טקסט ההסבר שמופיע ליד ה-Price to Beat, לפי המקור שנבחר בפועל."""
+    if source == "chainlink_stream":
+        return (
+            "ייחוס מדויק: הטיק הראשון בפיד Chainlink BTC/USD Data Stream של Polymarket בגבול החלון — "
+            "זהה למקור שלפיו השוק נסגר. מחיר ה-BTC החי במסך מגיע מאותו פיד."
+        )
+    if source == "chainlink_polygon_window":
+        note = (
+            "ייחוס משוער (fallback): סיבוב Chainlink BTC/USD על Polygon עד פתיחת החלון — "
+            "פיד ה-Data Stream המדויק לא זמין כרגע; עלול להסטות סנטים/דולרים בודדים מהאתר."
+        )
+    elif source == "binance_1m_fallback":
+        note = (
+            "ייחוס משוער (fallback): נר Binance 1m בפתיחת החלון — פיד Chainlink לא זמין כרגע; "
+            "עלול להסטות מהאתר."
+        )
+    else:  # pending / unknown
+        return "ממתין לפיד Chainlink של Polymarket ללכידת מחיר הייחוס המדויק…"
+    # מקרה קצה: הפיד חי אך נכנסנו *באמצע* חלון → לא ניתן ללכוד את הגבול עד החלון הבא.
+    # is_midwindow_gap מבדיל cold-start אמיתי ממצב המעבר התקין (הטיק בגבול פשוט עוד לא הגיע,
+    # ~1-2ש׳ בתחילת כל חלון) — כדי לא להבהיל בכל פתיחת חלון.
+    try:
+        if chainlink_stream.is_fresh() and chainlink_stream.is_midwindow_gap(epoch):
+            note += " · נכנסנו באמצע חלון — הערך המדויק מהפיד יינעל בחלון הבא."
+    except Exception:
+        pass
+    return note
+
+
 @app.get("/api/market/current")
 async def market_current():
     # ‎discover_active_btc_window כבר מבצע wait_for פנימי של 8s + stale-on-error fallback.
@@ -1096,44 +1132,56 @@ async def market_current():
     global last_epoch_for_open, cached_open, cached_ptb_source
     if m.epoch != last_epoch_for_open:
         last_epoch_for_open = m.epoch
-        # B-7: גם פתיחת Binance (3s) וגם שדרוג Chainlink רצים ברקע — לא חוסמים את הבקשה.
-        # price_to_beat יחזור null עד שיוכן (ה-UI סובל null) ויתמלא בפול הבא (~1s, או מיד אם
-        # A-7 כבר ב-cache). מסיר את החסימה של עד 3s פעם בכל חלון מנתיב ה-UI.
+        # המקור המדויק (Chainlink Data Stream) נלכד חי בגבול החלון ומשודרג בכל פול למטה.
+        # עד שהוא זמין (~1-2s אחרי פתיחת החלון) — נר פתיחת Binance ואז אורקל Polygon כ-fallback,
+        # ברקע, בלי לחסום את הבקשה. price_to_beat יחזור null עד שיוכן (ה-UI סובל null).
         cached_open = None
-        cached_ptb_source = "binance_1m_fallback"
+        cached_ptb_source = "pending"
 
-        async def _populate_price_to_beat(epoch: int) -> None:
+        async def _populate_price_to_beat_fallback(epoch: int) -> None:
+            """Fallback בלבד — Binance 1m ואז אורקל Chainlink על Polygon. לעולם לא דורס chainlink_stream."""
             global cached_open, cached_ptb_source, last_epoch_for_open
             try:
                 ob = await asyncio.wait_for(
                     fetch_open_price_at_window_start(epoch), timeout=3.0
                 )
-                if ob is not None and last_epoch_for_open == epoch:
+                if (
+                    ob is not None
+                    and last_epoch_for_open == epoch
+                    and cached_ptb_source not in ("chainlink_stream", "chainlink_polygon_window")
+                ):
                     cached_open = ob
                     cached_ptb_source = "binance_1m_fallback"
             except Exception:
                 pass
-            # שדרוג Chainlink (cache פר-epoch ב-_CHAINLINK_AT_WINDOW_CACHE → זול בחזרה).
+            # שדרוג לאורקל Polygon (cache פר-epoch ב-_CHAINLINK_AT_WINDOW_CACHE → זול בחזרה).
             try:
                 ptb = await asyncio.wait_for(
                     fetch_chainlink_btc_usd_polygon_at_window_start(epoch), timeout=10.0
                 )
             except Exception:
                 return
-            if ptb is not None and last_epoch_for_open == epoch:
+            if (
+                ptb is not None
+                and last_epoch_for_open == epoch
+                and cached_ptb_source != "chainlink_stream"
+            ):
                 cached_open = ptb
                 cached_ptb_source = "chainlink_polygon_window"
 
-        asyncio.create_task(_populate_price_to_beat(m.epoch))
-    note_chainlink = (
-        "ייחוס: סיבוב Chainlink BTC/USD על Polygon שעודכן עד לפתיחת החלון (קרוב לפיד האונ־צ׳יין). "
-        "באתר Polymarket מוצג לעיתים Chainlink Data Streams — עשוי להסטות סנטים/דולרים בודדים. "
-        "BTC חי במסך מהמנוע הוא Binance spot."
-    )
-    note_binance = (
-        "ייחוס מ-Binance (נר 1m בפתיחת החלון) — כשהפיד של Chainlink על Polygon לא זמין; "
-        "Polymarket רשמית מסתמך על Chainlink Streams — עלול להסטות מהאתר."
-    )
+        asyncio.create_task(_populate_price_to_beat_fallback(m.epoch))
+
+    # המקור המדויק: הטיק הראשון בפיד Chainlink Data Stream של Polymarket בגבול החלון.
+    # קריאה סינכרונית זולה (סריקת חוצץ + cache immutable); מרגע שנלכד הערך ננעל ולא נדרס.
+    if cached_ptb_source != "chainlink_stream":
+        try:
+            ptb_cl = chainlink_stream.get_price_to_beat(m.epoch)
+            if ptb_cl is not None:
+                cached_open = ptb_cl
+                cached_ptb_source = "chainlink_stream"
+        except Exception:
+            pass
+
     return {
         "slug": m.slug,
         "epoch": m.epoch,
@@ -1148,7 +1196,7 @@ async def market_current():
         "seconds_left": seconds_until_window_end(m.epoch, m.window_sec),
         "price_to_beat": cached_open,
         "price_to_beat_source": cached_ptb_source,
-        "price_to_beat_note": note_chainlink if cached_ptb_source == "chainlink_polygon_window" else note_binance,
+        "price_to_beat_note": _price_to_beat_note(cached_ptb_source, m.epoch),
         # מ-Gamma API — אין שם מחיר BTC מספרי; רק קישור למקור הרזולוציה
         "polymarket_resolution_source": m.resolution_source,
     }
@@ -1156,12 +1204,17 @@ async def market_current():
 
 @app.get("/api/btc/live")
 async def btc_live():
+    # מעדיף את פיד Chainlink Data Stream (המקור שלפיו השוק נסגר); Binance רק כ-fallback.
     try:
-        p = await fetch_btc_spot_usdt()
+        p, source = await fetch_btc_current_usd()
     except Exception as e:
         raise HTTPException(502, str(e))
     price_buf.add(p)
-    return {"price": p, "history": [{"t": a, "p": b} for a, b in price_buf.points]}
+    return {
+        "price": p,
+        "source": source,
+        "history": [{"t": a, "p": b} for a, b in price_buf.points],
+    }
 
 
 @app.get("/api/btc/window-prices")

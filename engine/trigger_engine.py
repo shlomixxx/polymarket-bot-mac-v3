@@ -999,9 +999,11 @@ class TriggerEngine:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     async def _fetch_btc_price(self) -> Optional[float]:
+        # ההחלטות רצות על מחיר Chainlink (המקור שלפיו Polymarket סוגר); Binance רק כ-fallback.
         try:
-            from btc_price import fetch_btc_spot_usdt
-            return await fetch_btc_spot_usdt()
+            from btc_price import fetch_btc_current_usd
+            price, _source = await fetch_btc_current_usd()
+            return price
         except Exception:
             return None
 
