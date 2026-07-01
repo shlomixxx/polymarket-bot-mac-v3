@@ -96,6 +96,13 @@ h3 {
   color: var(--text);
 }
 
+/* Header-row variant: drop the bottom margin so the title aligns with
+   inline helper text and action buttons in a flex header. */
+.section-title--reset {
+  margin: 0;
+  font-size: 1rem;
+}
+
 @keyframes pnl-dot-pulse {
   0%,
   100% {
@@ -221,6 +228,21 @@ h3 {
   border-radius: var(--radius-md);
   border: 1px solid var(--border);
   box-shadow: var(--shadow-card);
+}
+
+/* Collapsible (native <details>) — hide default marker, rotate chevron when open */
+.ui-collapsible > summary {
+  list-style: none;
+}
+.ui-collapsible > summary::-webkit-details-marker {
+  display: none;
+}
+.ui-collapsible > summary:hover {
+  background: var(--card-hover);
+  border-radius: var(--radius-md);
+}
+.ui-collapsible[open] > summary .ui-collapsible__chevron {
+  transform: rotate(90deg);
 }
 
 .ui-btn {

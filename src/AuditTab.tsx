@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, isPageHidden } from "./api";
+import { Card } from "./ui/Card";
+import { SectionTitle } from "./ui/SectionTitle";
+import { Button } from "./ui/Button";
+import { Collapsible } from "./ui/Collapsible";
 
 /** לשונית "ביקורת עסקאות" — שורה לכל סשן עסקה שנסגר, עם drill-down מלא ללמידה. */
 
@@ -50,14 +54,14 @@ function sevMeta(s: string) {
 
 // ── status meta ──────────────────────────────────────────────────────────────
 function statusColor(s: string): string {
-  if (s === "WIN") return "#065f46";
-  if (s === "LOSS") return "#7f1d1d";
-  return "#334155";
+  if (s === "WIN") return "var(--up)";
+  if (s === "LOSS") return "var(--down)";
+  return "var(--border-strong)";
 }
 function statusChipColor(s: string): { color: string; bg: string } {
-  if (s === "WIN") return { color: "#6ee7b7", bg: "#065f46" };
-  if (s === "LOSS") return { color: "#fecaca", bg: "#7f1d1d" };
-  return { color: "#cbd5e1", bg: "#334155" };
+  if (s === "WIN") return { color: "var(--up)", bg: "var(--up-muted)" };
+  if (s === "LOSS") return { color: "var(--down)", bg: "var(--down-muted)" };
+  return { color: "var(--text-secondary)", bg: "var(--bg-elevated)" };
 }
 
 // ── formatters ─────────────────────────────────────────────────────────────
@@ -90,14 +94,14 @@ function fmtNum(v: number | null, digits = 2): string {
 }
 
 function pnlColor(v: number | null): string {
-  if (v == null || !Number.isFinite(v)) return "var(--muted,#94a3b8)";
-  return v >= 0 ? "#6ee7b7" : "#fca5a5";
+  if (v == null || !Number.isFinite(v)) return "var(--muted)";
+  return v >= 0 ? "var(--up)" : "var(--down)";
 }
 
 function sideColor(side: string): string {
-  if (side === "Up") return "#6ee7b7";
-  if (side === "Down") return "#fca5a5";
-  return "#e2e8f0";
+  if (side === "Up") return "var(--up)";
+  if (side === "Down") return "var(--down)";
+  return "var(--text)";
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -125,11 +129,11 @@ function Sparkline({ path }: { path: Array<{ upnl_pct?: number }> }) {
   const last = ys[ys.length - 1];
   return (
     <svg width={W} height={H} style={{ display: "block" }}>
-      <line x1={PAD} y1={zeroY} x2={W - PAD} y2={zeroY} stroke="#334155" strokeWidth={1} strokeDasharray="2 2" />
+      <line x1={PAD} y1={zeroY} x2={W - PAD} y2={zeroY} stroke="var(--border-strong)" strokeWidth={1} strokeDasharray="2 2" />
       <polyline
         points={points}
         fill="none"
-        stroke={last >= 0 ? "#6ee7b7" : "#fca5a5"}
+        stroke={last >= 0 ? "var(--up)" : "var(--down)"}
         strokeWidth={1.5}
         strokeLinejoin="round"
         strokeLinecap="round"
@@ -150,33 +154,36 @@ function LessonsSection({ lessons }: { lessons: LessonsResponse | null }) {
   };
 
   return (
-    <div style={{
-      borderRadius: 12, background: "var(--card,#0f172a)", border: "1px solid #1e293b",
-      borderInlineStart: "4px solid #7c3aed", overflow: "hidden", marginBottom: 18,
-    }}>
+    <Card style={{ borderInlineStart: "4px solid var(--accent)" }}>
       {/* Header row */}
       <div
-        style={{ display: "flex", alignItems: "baseline", gap: 10, padding: "12px 14px", cursor: "pointer", flexWrap: "wrap" }}
+        style={{ display: "flex", alignItems: "baseline", gap: "var(--s-3)", cursor: "pointer", flexWrap: "wrap" }}
         onClick={() => setOpen((o) => !o)}
       >
         <div style={{ flex: 1, minWidth: 240 }}>
-          <div style={{ fontSize: 17, fontWeight: 800, letterSpacing: "-0.01em" }}>🎓 לקחים — מאמן העסקאות</div>
-          <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", marginTop: 2 }}>
-            לקחים מדורגים מתוך כל העסקאות — מה לשפר. סכומי $ מוטים ע"י martingale, לכן מתבססים על win-rate ו-median.
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)" }}>
+            <span aria-hidden>🎓</span>
+            <SectionTitle as="h3">לקחים — מאמן העסקאות</SectionTitle>
+          </div>
+          <div
+            style={{ fontSize: "0.8125rem", color: "var(--muted)", marginTop: 2 }}
+            title='סכומי $ מוטים ע"י martingale — הדירוג מתבסס על win-rate ו-median, לא על הרווח בדולרים.'
+          >
+            לקחים מדורגים מתוך כל העסקאות — מה לשפר.
           </div>
           {Object.keys(e).length > 0 && (
-            <div style={{ fontSize: 12, color: "#93c5fd", marginTop: 4 }}>
+            <div style={{ fontSize: "0.8125rem", color: "var(--accent-bright)", marginTop: "var(--s-1)" }}>
               סה"כ {num("total")} עסקאות · {num("schema_v1")} עם סיגנלים · win {num("overall_winrate")}%
             </div>
           )}
         </div>
-        <span style={{ color: "var(--muted,#94a3b8)", transform: open ? "rotate(90deg)" : "none", transition: "transform .15s" }}>‹</span>
+        <span style={{ color: "var(--muted)", transform: open ? "rotate(90deg)" : "none", transition: "transform .15s" }}>‹</span>
       </div>
 
       {open && (
-        <div style={{ padding: "0 14px 14px", borderTop: "1px solid #1e293b", display: "grid", gap: 8 }}>
+        <div style={{ marginTop: "var(--s-3)", paddingTop: "var(--s-3)", borderTop: "1px solid var(--border)", display: "grid", gap: "var(--s-2)" }}>
           {lessons.lessons.length === 0 && (
-            <div style={{ marginTop: 12, padding: 24, textAlign: "center", color: "var(--muted,#94a3b8)", border: "1px dashed #1e293b", borderRadius: 12 }}>
+            <div style={{ padding: "var(--s-5)", textAlign: "center", color: "var(--muted)", border: "1px dashed var(--border)", borderRadius: "var(--radius-md)" }}>
               עוד אין מספיק נתונים ללקחים
             </div>
           )}
@@ -185,40 +192,40 @@ function LessonsSection({ lessons }: { lessons: LessonsResponse | null }) {
             const m = sevMeta(l.severity);
             return (
               <div key={l.key} style={{
-                marginTop: 10, borderRadius: 10, background: "#0b1220",
-                border: "1px solid #1e293b", borderInlineStart: `4px solid ${m.bg}`, padding: "10px 14px",
+                borderRadius: "var(--radius-md)", background: "var(--bg-elevated)",
+                border: "1px solid var(--border)", borderInlineStart: `4px solid ${m.bg}`, padding: "var(--s-3) var(--s-4)",
               }}>
                 {/* title + severity badge */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", flexWrap: "wrap" }}>
                   <span style={{
                     fontSize: 11, fontWeight: 800, padding: "3px 8px", borderRadius: 999,
                     color: m.color, background: m.bg, whiteSpace: "nowrap",
                   }}>{m.label}</span>
-                  <span style={{ fontSize: 14, fontWeight: 800, color: "#e2e8f0" }}>{l.title}</span>
+                  <span style={{ fontSize: 14, fontWeight: 800, color: "var(--text)" }}>{l.title}</span>
                 </div>
 
                 {/* recommendation */}
-                <div style={{ fontSize: 13, color: "#cbd5e1", marginTop: 6, lineHeight: 1.5 }}>{l.recommendation}</div>
+                <div style={{ fontSize: 13, color: "var(--text-secondary)", marginTop: "var(--s-2)", lineHeight: 1.5 }}>{l.recommendation}</div>
 
                 {/* confidence chip */}
                 {l.confidence && (
-                  <div style={{ marginTop: 6 }}>
+                  <div style={{ marginTop: "var(--s-2)" }}>
                     <span style={{
                       fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 999,
-                      color: "#93c5fd", background: "#1e3a5f55", border: "1px solid #1e3a5f", whiteSpace: "nowrap",
+                      color: "var(--accent-bright)", background: "var(--accent-muted)", border: "1px solid var(--border-strong)", whiteSpace: "nowrap",
                     }}>ביטחון: {l.confidence}</span>
                   </div>
                 )}
 
                 {/* stat pills */}
                 {l.stat && Object.keys(l.stat).length > 0 && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-2)", marginTop: "var(--s-2)" }}>
                     {Object.entries(l.stat).map(([k, v]) => (
                       <span key={k} style={{
-                        fontSize: 11, fontWeight: 600, padding: "3px 8px", borderRadius: 8,
-                        color: "#cbd5e1", background: "#0f172a", border: "1px solid #1e293b", whiteSpace: "nowrap",
+                        fontSize: 11, fontWeight: 600, padding: "3px 8px", borderRadius: "var(--radius-sm)",
+                        color: "var(--text-secondary)", background: "var(--card)", border: "1px solid var(--border)", whiteSpace: "nowrap",
                       }}>
-                        {k}: <b style={{ color: "#e2e8f0" }}>{v == null ? "—" : String(v)}</b>
+                        {k}: <b style={{ color: "var(--text)" }}>{v == null ? "—" : String(v)}</b>
                       </span>
                     ))}
                   </div>
@@ -229,11 +236,11 @@ function LessonsSection({ lessons }: { lessons: LessonsResponse | null }) {
 
           {/* note */}
           {lessons.note && (
-            <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", fontStyle: "italic", marginTop: 8 }}>{lessons.note}</div>
+            <div style={{ fontSize: "0.8125rem", color: "var(--muted)", fontStyle: "italic", marginTop: "var(--s-2)" }}>{lessons.note}</div>
           )}
         </div>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -241,12 +248,12 @@ function LessonsSection({ lessons }: { lessons: LessonsResponse | null }) {
 function Section({ title, obj }: { title: string; obj: unknown }) {
   if (!isPlainObject(obj) || Object.keys(obj).length === 0) return null;
   return (
-    <div style={{ marginTop: 8 }}>
-      <div style={{ fontSize: 12, fontWeight: 700, color: "#93c5fd", marginBottom: 4 }}>{title}</div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 16px", fontSize: 12, color: "#cbd5e1" }}>
+    <div style={{ marginTop: "var(--s-2)" }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent-bright)", marginBottom: "var(--s-1)" }}>{title}</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-1) var(--s-4)", fontSize: 12, color: "var(--text-secondary)" }}>
         {Object.entries(obj).map(([k, v]) => (
           <span key={k}>
-            {k}: <b style={{ color: "#e2e8f0" }}>{isPlainObject(v) || Array.isArray(v) ? JSON.stringify(v) : String(v)}</b>
+            {k}: <b style={{ color: "var(--text)" }}>{isPlainObject(v) || Array.isArray(v) ? JSON.stringify(v) : String(v)}</b>
           </span>
         ))}
       </div>
@@ -343,115 +350,116 @@ export default function AuditTab() {
   ];
 
   return (
-    <div dir="rtl" style={{ padding: "4px 2px 40px", maxWidth: 1100, margin: "0 auto" }}>
+    <div dir="rtl" style={{ padding: "4px 2px 40px", maxWidth: 1100, margin: "0 auto", display: "grid", gap: "var(--s-4)" }}>
       {/* 🎓 לקחים — מאמן העסקאות (ranked, mined from the ledger) */}
       <LessonsSection lessons={lessons} />
 
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 24, fontWeight: 800, letterSpacing: "-0.02em" }}>📋 ביקורת עסקאות</h2>
-          <p style={{ margin: "4px 0 0", color: "var(--muted, #94a3b8)", fontSize: 13 }}>
-            כל עסקה מתועדת כאן — למה נכנסנו, מה קרה, ומה היה אפשר טוב יותר. הבסיס שה-AI ילמד ממנו.
-          </p>
-          <p style={{ margin: "4px 0 0", color: "var(--muted, #94a3b8)", fontSize: 12 }}>
-            הנתונים נשמרים ב-audit.db (נפח /data בשרת). ניתן להוריד הכל כאן או דרך /api/audit/export.
-          </p>
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button type="button" onClick={() => void downloadExport()} disabled={downloading} style={btnStyle()}>
-            {downloading ? "מוריד…" : "⬇ הורד JSON"}
-          </button>
-          <button type="button" onClick={() => void refresh()} style={btnStyle()}>
-            {loading ? "מרענן…" : "↻ רענן"}
-          </button>
-        </div>
-      </div>
-
-      {/* Summary strip */}
-      <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
-        <div style={{
-          flex: "1 1 120px", minWidth: 110, padding: "12px 14px", borderRadius: 12,
-          background: "var(--card, #0f172a)", border: "1px solid #065f46", borderInlineStart: "4px solid #065f46",
-        }}>
-          <div style={{ fontSize: 12, color: "#6ee7b7", fontWeight: 700 }}>אחוז ניצחון</div>
-          <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.1, marginTop: 2 }}>
-            {counts ? `${counts.win_rate_pct.toFixed(1)}%` : "—"}
-          </div>
-        </div>
-        <div style={{
-          flex: "1 1 120px", minWidth: 110, padding: "12px 14px", borderRadius: 12,
-          background: "var(--card, #0f172a)", border: "1px solid #1e3a5f", borderInlineStart: "4px solid #1d4ed8",
-        }}>
-          <div style={{ fontSize: 12, color: "#93c5fd", fontWeight: 700 }}>יעילות יציאה ממוצעת</div>
-          <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.1, marginTop: 2 }}>
-            {counts && counts.avg_exit_efficiency != null ? `${(counts.avg_exit_efficiency * 100).toFixed(0)}%` : "—"}
-          </div>
-        </div>
-        <div style={{
-          flex: "1 1 120px", minWidth: 110, padding: "12px 14px", borderRadius: 12,
-          background: "var(--card, #0f172a)", border: "1px solid #1e293b",
-        }}>
-          <div style={{ fontSize: 12, color: "var(--muted, #94a3b8)", fontWeight: 700 }}>סה"כ עסקאות</div>
-          <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.1, marginTop: 2 }}>{counts?.total ?? 0}</div>
-        </div>
-        {statusKeys.map((s) => {
-          const m = statusChipColor(s);
-          return (
-            <div key={s} style={{
-              flex: "1 1 100px", minWidth: 90, padding: "12px 14px", borderRadius: 12,
-              background: "var(--card, #0f172a)", border: `1px solid ${m.bg}`, borderInlineStart: `4px solid ${m.bg}`,
-            }}>
-              <div style={{ fontSize: 12, color: m.color, fontWeight: 700 }}>{s}</div>
-              <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.1, marginTop: 2 }}>{byStatus[s] ?? 0}</div>
+      {/* Header + summary + filters card */}
+      <Card>
+        {/* Header row */}
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: "var(--s-2)" }}>
+          <div style={{ flex: 1, minWidth: 240 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)" }}>
+              <span aria-hidden>📋</span>
+              <SectionTitle as="h3">ביקורת עסקאות</SectionTitle>
             </div>
-          );
-        })}
-      </div>
-
-      {/* Top lessons chips */}
-      {counts && counts.top_lessons.length > 0 && (
-        <div style={{ display: "flex", gap: 6, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
-          <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", fontWeight: 700 }}>לקחים נפוצים:</span>
-          {counts.top_lessons.map((l) => (
-            <span key={l.lesson_tag} style={{
-              fontSize: 12, fontWeight: 700, padding: "3px 10px", borderRadius: 999,
-              color: "#fde68a", background: "#713f1255", border: "1px solid #713f12",
-            }}>
-              {l.lesson_tag} ×{l.n}
-            </span>
-          ))}
+            <div style={{ fontSize: "0.8125rem", color: "var(--muted)", marginTop: 2 }}>
+              כל עסקה מתועדת כאן — למה נכנסנו, מה קרה, ומה היה אפשר טוב יותר. הבסיס שה-AI ילמד ממנו.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: "var(--s-2)" }}>
+            <Button variant="ghost" onClick={() => void downloadExport()} disabled={downloading}>
+              {downloading ? "מוריד…" : "⬇ הורד JSON"}
+            </Button>
+            <Button variant="ghost" onClick={() => void refresh()}>
+              {loading ? "מרענן…" : "↻ רענן"}
+            </Button>
+          </div>
         </div>
-      )}
 
-      {/* Filters toolbar */}
-      <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap", alignItems: "center" }}>
-        <select value={fMode} onChange={(e) => setFMode(e.target.value as "all" | "demo" | "live")} style={selectStyle()}>
-          <option value="all">כל המצבים</option>
-          <option value="demo">דמו</option>
-          <option value="live">לייב</option>
-        </select>
-        <select value={fWindow} onChange={(e) => setFWindow(e.target.value as "all" | "300" | "900")} style={selectStyle()}>
-          <option value="all">כל החלונות</option>
-          <option value="300">5 דקות</option>
-          <option value="900">15 דקות</option>
-        </select>
-        <select value={fStatus} onChange={(e) => setFStatus(e.target.value as typeof fStatus)} style={selectStyle()}>
-          <option value="all">כל הסטטוסים</option>
-          <option value="WIN">WIN</option>
-          <option value="LOSS">LOSS</option>
-          <option value="VOID">VOID</option>
-          <option value="UNKNOWN">UNKNOWN</option>
-          <option value="PENDING">PENDING</option>
-        </select>
-      </div>
+        {/* Summary strip — stat tiles */}
+        <div style={{ display: "flex", gap: "var(--s-3)", marginTop: "var(--s-4)", flexWrap: "wrap" }}>
+          <div style={{ ...tileStyle(), flex: "1 1 120px", minWidth: 110, borderInlineStart: "4px solid var(--up)" }}>
+            <div style={{ fontSize: "0.75rem", color: "var(--muted)", fontWeight: 600 }}>אחוז ניצחון</div>
+            <div style={{ fontSize: "1.5rem", fontWeight: 700, lineHeight: 1.1, marginTop: 2, fontVariantNumeric: "tabular-nums", color: "var(--up)" }}>
+              {counts ? `${counts.win_rate_pct.toFixed(1)}%` : "—"}
+            </div>
+          </div>
+          <div style={{ ...tileStyle(), flex: "1 1 120px", minWidth: 110, borderInlineStart: "4px solid var(--accent)" }}>
+            <div style={{ fontSize: "0.75rem", color: "var(--muted)", fontWeight: 600 }}>יעילות יציאה ממוצעת</div>
+            <div style={{ fontSize: "1.5rem", fontWeight: 700, lineHeight: 1.1, marginTop: 2, fontVariantNumeric: "tabular-nums" }}>
+              {counts && counts.avg_exit_efficiency != null ? `${(counts.avg_exit_efficiency * 100).toFixed(0)}%` : "—"}
+            </div>
+          </div>
+          <div style={{ ...tileStyle(), flex: "1 1 120px", minWidth: 110 }}>
+            <div style={{ fontSize: "0.75rem", color: "var(--muted)", fontWeight: 600 }}>סה"כ עסקאות</div>
+            <div style={{ fontSize: "1.5rem", fontWeight: 700, lineHeight: 1.1, marginTop: 2, fontVariantNumeric: "tabular-nums" }}>{counts?.total ?? 0}</div>
+          </div>
+          {statusKeys.map((s) => {
+            const m = statusChipColor(s);
+            const tone = s === "WIN" ? "var(--up)" : s === "LOSS" ? "var(--down)" : "var(--border-strong)";
+            return (
+              <div key={s} style={{ ...tileStyle(), flex: "1 1 100px", minWidth: 90, borderInlineStart: `4px solid ${tone}` }}>
+                <div style={{ fontSize: "0.75rem", color: m.color, fontWeight: 600 }}>{s}</div>
+                <div style={{ fontSize: "1.5rem", fontWeight: 700, lineHeight: 1.1, marginTop: 2, fontVariantNumeric: "tabular-nums" }}>{byStatus[s] ?? 0}</div>
+              </div>
+            );
+          })}
+        </div>
 
-      {err && <div style={{ marginTop: 14, color: "#fecaca", background: "#7f1d1d33", padding: 12, borderRadius: 10 }}>שגיאה בטעינה: {err}</div>}
+        {/* Top lessons chips */}
+        {counts && counts.top_lessons.length > 0 && (
+          <div style={{ display: "flex", gap: "var(--s-2)", marginTop: "var(--s-3)", flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: "var(--muted)", fontWeight: 700 }}>לקחים נפוצים:</span>
+            {counts.top_lessons.map((l) => (
+              <span key={l.lesson_tag} style={{
+                fontSize: 12, fontWeight: 700, padding: "3px 10px", borderRadius: 999,
+                color: SEV_META.medium.color, background: SEV_META.medium.bg, border: `1px solid ${SEV_META.medium.bg}`,
+              }}>
+                {l.lesson_tag} ×{l.n}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Filters toolbar */}
+        <div style={{ display: "flex", gap: "var(--s-2)", marginTop: "var(--s-4)", flexWrap: "wrap", alignItems: "center" }}>
+          <select value={fMode} onChange={(e) => setFMode(e.target.value as "all" | "demo" | "live")} style={selectStyle()}>
+            <option value="all">כל המצבים</option>
+            <option value="demo">דמו</option>
+            <option value="live">לייב</option>
+          </select>
+          <select value={fWindow} onChange={(e) => setFWindow(e.target.value as "all" | "300" | "900")} style={selectStyle()}>
+            <option value="all">כל החלונות</option>
+            <option value="300">5 דקות</option>
+            <option value="900">15 דקות</option>
+          </select>
+          <select value={fStatus} onChange={(e) => setFStatus(e.target.value as typeof fStatus)} style={selectStyle()}>
+            <option value="all">כל הסטטוסים</option>
+            <option value="WIN">WIN</option>
+            <option value="LOSS">LOSS</option>
+            <option value="VOID">VOID</option>
+            <option value="UNKNOWN">UNKNOWN</option>
+            <option value="PENDING">PENDING</option>
+          </select>
+        </div>
+
+        {/* about the data — tucked away by default */}
+        <div style={{ marginTop: "var(--s-3)" }}>
+          <Collapsible title="על הנתונים" subtitle="היכן נשמר וכיצד להוריד">
+            <div style={{ fontSize: "0.8125rem", color: "var(--text-secondary)", lineHeight: 1.6 }}>
+              הנתונים נשמרים ב-audit.db (נפח /data בשרת). ניתן להוריד את הכל בעזרת "⬇ הורד JSON" כאן, או ישירות דרך /api/audit/export.
+            </div>
+          </Collapsible>
+        </div>
+      </Card>
+
+      {err && <div style={{ color: "var(--down)", background: "var(--down-muted)", padding: "var(--s-3)", borderRadius: "var(--radius-sm)" }}>שגיאה בטעינה: {err}</div>}
 
       {/* Row list */}
-      <div style={{ marginTop: 16, display: "grid", gap: 8 }}>
+      <div style={{ display: "grid", gap: "var(--s-2)" }}>
         {!loading && rows.length === 0 && (
-          <div style={{ padding: 40, textAlign: "center", color: "var(--muted,#94a3b8)", border: "1px dashed #1e293b", borderRadius: 12 }}>
+          <div style={{ padding: "var(--s-6)", textAlign: "center", color: "var(--muted)", border: "1px dashed var(--border)", borderRadius: "var(--radius-md)" }}>
             אין עסקאות להצגה
           </div>
         )}
@@ -459,7 +467,7 @@ export default function AuditTab() {
           const isOpen = expanded.has(r.session_id);
           const sc = statusChipColor(r.settlement_status);
           const sigMark = r.signal_was_correct === true ? "✓" : r.signal_was_correct === false ? "✗" : "—";
-          const sigColor = r.signal_was_correct === true ? "#6ee7b7" : r.signal_was_correct === false ? "#fca5a5" : "var(--muted,#94a3b8)";
+          const sigColor = r.signal_was_correct === true ? "var(--up)" : r.signal_was_correct === false ? "var(--down)" : "var(--muted)";
           const ctx = r.context ?? {};
           const provenance = isPlainObject(ctx.provenance) ? ctx.provenance : {};
           const signalsMissing = provenance.signals_missing === true;
@@ -469,74 +477,75 @@ export default function AuditTab() {
           const btcEnd = r.settlement_btc_end ?? null;
           return (
             <div key={r.session_id} style={{
-              borderRadius: 12, background: "var(--card,#0f172a)", border: "1px solid #1e293b",
+              borderRadius: "var(--radius-md)", background: "var(--card)", border: "1px solid var(--border)",
               borderInlineStart: `4px solid ${statusColor(r.settlement_status)}`, overflow: "hidden",
+              boxShadow: "var(--shadow-card)",
             }}>
               {/* Collapsed row */}
-              <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", cursor: "pointer", overflowX: "auto" }}
+              <div style={{ display: "flex", alignItems: "center", gap: "var(--s-3)", padding: "var(--s-3) var(--s-4)", cursor: "pointer", overflowX: "auto" }}
                    onClick={() => toggleExpand(r.session_id)}>
                 <span style={{
                   fontSize: 11, fontWeight: 800, padding: "3px 8px", borderRadius: 999,
                   color: sc.color, background: sc.bg, whiteSpace: "nowrap",
                 }}>{r.settlement_status}</span>
-                <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>{fmtTime(r.decision_ts)}</span>
-                <span style={{ fontSize: 12, color: "#e2e8f0", whiteSpace: "nowrap" }}>{r.window_sec === 900 ? "15m" : "5m"}</span>
+                <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>{fmtTime(r.decision_ts)}</span>
+                <span style={{ fontSize: 12, color: "var(--text)", whiteSpace: "nowrap" }}>{r.window_sec === 900 ? "15m" : "5m"}</span>
                 <span style={{ fontSize: 12, fontWeight: 800, color: sideColor(r.side), whiteSpace: "nowrap" }}>{r.side}</span>
-                <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>@{fmtNum(r.avg_fill_price)}</span>
-                <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>×{r.contracts ?? "—"}</span>
-                {r.exit_type && <span style={{ fontSize: 12, color: "#cbd5e1", whiteSpace: "nowrap" }}>{r.exit_type}</span>}
-                <span style={{ fontSize: 13, fontWeight: 800, color: pnlColor(r.realized_pnl), whiteSpace: "nowrap" }}>{fmtUsd(r.realized_pnl)}</span>
-                <span style={{ fontSize: 12, fontWeight: 700, color: pnlColor(r.realized_pct), whiteSpace: "nowrap" }}>ROI {fmtPct(r.realized_pct)}</span>
-                <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>שיא {fmtPct(r.peak_unrealized_pct)}</span>
-                <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>
+                <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>@{fmtNum(r.avg_fill_price)}</span>
+                <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>×{r.contracts ?? "—"}</span>
+                {r.exit_type && <span style={{ fontSize: 12, color: "var(--text-secondary)", whiteSpace: "nowrap" }}>{r.exit_type}</span>}
+                <span style={{ fontSize: 13, fontWeight: 800, color: pnlColor(r.realized_pnl), whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>{fmtUsd(r.realized_pnl)}</span>
+                <span style={{ fontSize: 12, fontWeight: 700, color: pnlColor(r.realized_pct), whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" }}>ROI {fmtPct(r.realized_pct)}</span>
+                <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>שיא {fmtPct(r.peak_unrealized_pct)}</span>
+                <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>
                   יעילות {r.exit_efficiency != null ? `${r.exit_efficiency.toFixed(2)}×` : "—"}
                 </span>
                 <span style={{ fontSize: 13, fontWeight: 800, color: sigColor, whiteSpace: "nowrap" }} title="סיגנל צדק?">{sigMark}</span>
                 {r.lesson_tag && (
                   <span style={{
                     fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 999,
-                    color: "#fde68a", background: "#713f1255", whiteSpace: "nowrap",
+                    color: SEV_META.medium.color, background: SEV_META.medium.bg, whiteSpace: "nowrap",
                   }}>{r.lesson_tag}</span>
                 )}
                 <span style={{ flex: 1 }} />
-                <span style={{ color: "var(--muted,#94a3b8)", transform: isOpen ? "rotate(90deg)" : "none", transition: "transform .15s" }}>‹</span>
+                <span style={{ color: "var(--muted)", transform: isOpen ? "rotate(90deg)" : "none", transition: "transform .15s" }}>‹</span>
               </div>
 
               {/* Drill-down */}
               {isOpen && (
-                <div style={{ padding: "0 14px 14px", borderTop: "1px solid #1e293b", display: "grid", gap: 6, fontSize: 13 }}>
+                <div style={{ padding: "0 var(--s-4) var(--s-4)", borderTop: "1px solid var(--border)", display: "grid", gap: "var(--s-2)", fontSize: 13 }}>
                   {/* Top meta line */}
-                  <div style={{ display: "flex", gap: 16, flexWrap: "wrap", color: "var(--muted,#94a3b8)", marginTop: 10 }}>
-                    <span>מצב: <b style={{ color: "#e2e8f0" }}>{r.mode}</b></span>
-                    <span>שוק: <b style={{ color: "#e2e8f0" }}>{r.slug}</b></span>
+                  <div style={{ display: "flex", gap: "var(--s-4)", flexWrap: "wrap", color: "var(--muted)", marginTop: "var(--s-3)" }}>
+                    <span>מצב: <b style={{ color: "var(--text)" }}>{r.mode}</b></span>
+                    <span>שוק: <b style={{ color: "var(--text)" }}>{r.slug}</b></span>
                     <span>החלטה: {fmtTime(r.decision_ts)}</span>
                     <span>סגירה: {fmtTime(r.settled_ts)}</span>
-                    <span>המלצה: <b style={{ color: "#e2e8f0" }}>{r.recommendation ?? "—"}</b></span>
-                    <span>ציון משוקלל: <b style={{ color: "#e2e8f0" }}>{fmtNum(r.weighted_score)}</b></span>
-                    <span>ביטחון: <b style={{ color: "#e2e8f0" }}>{r.confidence_pct != null ? `${r.confidence_pct.toFixed(0)}%` : "—"}</b></span>
-                    <span>תנודתיות: <b style={{ color: "#e2e8f0" }}>{r.vol_bucket ?? "—"}</b></span>
-                    <span>מכפיל התאוששות: <b style={{ color: "#e2e8f0" }}>{fmtNum(r.loss_recovery_multiplier)}</b></span>
+                    <span>המלצה: <b style={{ color: "var(--text)" }}>{r.recommendation ?? "—"}</b></span>
+                    <span>ציון משוקלל: <b style={{ color: "var(--text)" }}>{fmtNum(r.weighted_score)}</b></span>
+                    <span>ביטחון: <b style={{ color: "var(--text)" }}>{r.confidence_pct != null ? `${r.confidence_pct.toFixed(0)}%` : "—"}</b></span>
+                    <span>תנודתיות: <b style={{ color: "var(--text)" }}>{r.vol_bucket ?? "—"}</b></span>
+                    <span>מכפיל התאוששות: <b style={{ color: "var(--text)" }}>{fmtNum(r.loss_recovery_multiplier)}</b></span>
                   </div>
 
                   {signalsMissing && (
-                    <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", fontStyle: "italic" }}>
+                    <div style={{ fontSize: 12, color: "var(--muted)", fontStyle: "italic" }}>
                       אין נתוני סיגנל (עסקה היסטורית/לפני חיווט הסיגנלים)
                     </div>
                   )}
 
                   {/* PnL / efficiency line */}
-                  <div style={{ display: "flex", gap: 16, flexWrap: "wrap", color: "var(--muted,#94a3b8)" }}>
+                  <div style={{ display: "flex", gap: "var(--s-4)", flexWrap: "wrap", color: "var(--muted)" }}>
                     <span>שיא לא ממומש: <b style={{ color: pnlColor(r.peak_unrealized_pct) }}>{fmtPct(r.peak_unrealized_pct)}</b></span>
                     <span>שפל לא ממומש: <b style={{ color: pnlColor(r.trough_unrealized_pct) }}>{fmtPct(r.trough_unrealized_pct)}</b></span>
-                    <span>רווח שהוחמץ: <b style={{ color: "#e2e8f0" }}>{fmtPct(r.missed_profit_pct)}</b></span>
-                    <span>הסכמת סיגנלים: <b style={{ color: "#e2e8f0" }}>{r.signals_agreement != null ? `${(r.signals_agreement * 100).toFixed(0)}%` : "—"}</b></span>
-                    <span>ניגוד סיגנלים: <b style={{ color: "#e2e8f0" }}>{r.signal_conflict === true ? "כן" : r.signal_conflict === false ? "לא" : "—"}</b></span>
+                    <span>רווח שהוחמץ: <b style={{ color: "var(--text)" }}>{fmtPct(r.missed_profit_pct)}</b></span>
+                    <span>הסכמת סיגנלים: <b style={{ color: "var(--text)" }}>{r.signals_agreement != null ? `${(r.signals_agreement * 100).toFixed(0)}%` : "—"}</b></span>
+                    <span>ניגוד סיגנלים: <b style={{ color: "var(--text)" }}>{r.signal_conflict === true ? "כן" : r.signal_conflict === false ? "לא" : "—"}</b></span>
                   </div>
 
                   {/* Sparkline */}
                   {r.pnl_path && r.pnl_path.length > 1 && (
-                    <div style={{ marginTop: 4 }}>
-                      <div style={{ fontSize: 12, fontWeight: 700, color: "#93c5fd", marginBottom: 2 }}>מסלול רווח/הפסד (% לא ממומש)</div>
+                    <div style={{ marginTop: "var(--s-1)" }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent-bright)", marginBottom: 2 }}>מסלול רווח/הפסד (% לא ממומש)</div>
                       <Sparkline path={r.pnl_path} />
                     </div>
                   )}
@@ -553,20 +562,20 @@ export default function AuditTab() {
 
                   {/* Settlement */}
                   {(btcStart != null || btcEnd != null || resolvedOutcome != null) && (
-                    <div style={{ marginTop: 8 }}>
-                      <div style={{ fontSize: 12, fontWeight: 700, color: "#93c5fd", marginBottom: 4 }}>סיום עסקה</div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 16px", fontSize: 12, color: "#cbd5e1" }}>
-                        <span>BTC פתיחה: <b style={{ color: "#e2e8f0" }}>{btcStart != null ? String(btcStart) : "—"}</b></span>
-                        <span>BTC סגירה: <b style={{ color: "#e2e8f0" }}>{btcEnd != null ? String(btcEnd) : "—"}</b></span>
-                        <span>תוצאה: <b style={{ color: "#e2e8f0" }}>{resolvedOutcome != null ? String(resolvedOutcome) : "—"}</b></span>
+                    <div style={{ marginTop: "var(--s-2)" }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent-bright)", marginBottom: "var(--s-1)" }}>סיום עסקה</div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-1) var(--s-4)", fontSize: 12, color: "var(--text-secondary)" }}>
+                        <span>BTC פתיחה: <b style={{ color: "var(--text)" }}>{btcStart != null ? String(btcStart) : "—"}</b></span>
+                        <span>BTC סגירה: <b style={{ color: "var(--text)" }}>{btcEnd != null ? String(btcEnd) : "—"}</b></span>
+                        <span>תוצאה: <b style={{ color: "var(--text)" }}>{resolvedOutcome != null ? String(resolvedOutcome) : "—"}</b></span>
                       </div>
                     </div>
                   )}
 
                   {/* Counterfactuals */}
-                  <div style={{ marginTop: 8 }}>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: "#93c5fd", marginBottom: 4 }}>תרחישים נגדיים</div>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 16px", fontSize: 12, color: "#cbd5e1" }}>
+                  <div style={{ marginTop: "var(--s-2)" }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "var(--accent-bright)", marginBottom: "var(--s-1)" }}>תרחישים נגדיים</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-1) var(--s-4)", fontSize: 12, color: "var(--text-secondary)" }}>
                       <span>רווח לו בחרנו בצד השני: <b style={{ color: pnlColor(r.cf_other_side_pnl) }}>{fmtUsd(r.cf_other_side_pnl)}</b></span>
                     </div>
                     {r.cf_exit_variants && Object.keys(r.cf_exit_variants).length > 0 && (
@@ -581,9 +590,13 @@ export default function AuditTab() {
 
                   {/* Full context JSON dump */}
                   {ctx && Object.keys(ctx).length > 0 && (
-                    <pre style={{ margin: "8px 0 0", padding: 10, background: "#020617", borderRadius: 8, fontSize: 12, overflow: "auto", color: "#94a3b8" }}>
-                      {JSON.stringify(ctx, null, 2)}
-                    </pre>
+                    <div style={{ marginTop: "var(--s-2)" }}>
+                      <Collapsible title="נתונים גולמיים (JSON)" subtitle="ההקשר המלא של ההחלטה">
+                        <pre style={{ margin: 0, padding: "var(--s-3)", background: "var(--bg-elevated)", borderRadius: "var(--radius-sm)", fontSize: 12, overflow: "auto", color: "var(--muted)" }}>
+                          {JSON.stringify(ctx, null, 2)}
+                        </pre>
+                      </Collapsible>
+                    </div>
                   )}
                 </div>
               )}
@@ -595,14 +608,14 @@ export default function AuditTab() {
   );
 }
 
-// ── inline style helpers (match app dark theme) ──────────────────────────────
-function btnStyle(bg?: string): React.CSSProperties {
+// ── inline style helpers (match app design tokens) ───────────────────────────
+// stat tile recipe — label + big value; caller adds flex/borderInlineStart accent
+function tileStyle(): React.CSSProperties {
   return {
-    padding: "7px 12px", borderRadius: 9, border: "1px solid #1e293b",
-    background: bg ?? "var(--card,#0f172a)", color: "#e2e8f0", fontSize: 13, fontWeight: 600,
-    cursor: "pointer",
+    padding: "var(--s-3)", borderRadius: "var(--radius-md)",
+    background: "var(--bg-elevated)", border: "1px solid var(--border)",
   };
 }
 function selectStyle(): React.CSSProperties {
-  return { padding: "7px 10px", borderRadius: 9, border: "1px solid #1e293b", background: "var(--card,#0f172a)", color: "#e2e8f0", fontSize: 13 };
+  return { padding: "7px 10px", borderRadius: "var(--radius-sm)", border: "1px solid var(--border-strong)", background: "var(--card)", color: "var(--text)", fontSize: 13 };
 }

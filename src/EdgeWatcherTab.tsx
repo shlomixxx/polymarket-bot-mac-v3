@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, isPageHidden } from "./api";
+import { Card } from "./ui/Card";
+import { SectionTitle } from "./ui/SectionTitle";
+import { Button } from "./ui/Button";
 
 /**
  * לשונית "🔭 גלאי edge" — מציגה verdict סטטיסטי אחד וכן (collecting/watching/forming/
@@ -59,11 +62,12 @@ function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
 }
 
-// confidence chip — same visual language as the Faults / Audit tabs
+// confidence chip — same visual language as the Faults / Audit tabs.
+// high/medium/low encode meaning (like SEV_META) — keep the semantic amber for medium.
 const CONF_META: Record<string, { label: string; color: string; bg: string }> = {
   high: { label: "גבוה", color: "#6ee7b7", bg: "#065f46" },
   medium: { label: "בינוני", color: "#fde68a", bg: "#713f12" },
-  low: { label: "נמוך", color: "#cbd5e1", bg: "#334155" },
+  low: { label: "נמוך", color: "var(--text-secondary)", bg: "var(--bg-elevated)" },
 };
 function confMeta(c: string) {
   return CONF_META[c] ?? CONF_META.low;
@@ -77,9 +81,9 @@ function stateMeta(s: string): { label: string; accent: string; tone: string } {
     case "forming":
       return { label: "מתגבש", accent: "#f59e0b", tone: "#713f12" };
     case "watching":
-      return { label: "במעקב", accent: "#3b82f6", tone: "#1e3a5f" };
+      return { label: "במעקב", accent: "var(--accent)", tone: "var(--accent-muted)" };
     default:
-      return { label: "אוסף נתונים", accent: "#475569", tone: "#334155" };
+      return { label: "אוסף נתונים", accent: "var(--muted)", tone: "var(--bg-elevated)" };
   }
 }
 
@@ -103,31 +107,31 @@ function ProgressMeter({ data }: { data: EdgeResponse }) {
 
   const bars: Array<{ label: string; value: number; need: number; color: string }> = [];
   if (totalNeeded > 0) {
-    bars.push({ label: "סה\"כ עסקאות מתויגות", value: collected, need: totalNeeded, color: "#3b82f6" });
+    bars.push({ label: "סה\"כ עסקאות מתויגות", value: collected, need: totalNeeded, color: "var(--accent)" });
   }
   if (sliceTotalNeeded > 0) {
     bars.push({
       label: "נחוץ לניתוח מובהק לפי-פלח (החסם האמיתי)",
       value: collected,
       need: sliceTotalNeeded,
-      color: "#8b5cf6",
+      color: "var(--accent-bright)",
     });
   }
   if (bars.length === 0) return null;
 
   return (
-    <div style={{ display: "grid", gap: 10, marginTop: 14 }}>
+    <div style={{ display: "grid", gap: "var(--s-3)" }}>
       {bars.map((b) => {
         const frac = b.need > 0 ? clamp01(b.value / b.need) : 0;
         return (
           <div key={b.label}>
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "var(--muted,#94a3b8)", marginBottom: 4 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.75rem", color: "var(--muted)", marginBottom: "var(--s-1)" }}>
               <span>{b.label}</span>
-              <span style={{ color: "#e2e8f0", fontWeight: 700 }}>
+              <span style={{ color: "var(--text)", fontWeight: 700 }} className="tabular-nums">
                 {b.value.toLocaleString("he-IL")} / {b.need.toLocaleString("he-IL")}
               </span>
             </div>
-            <div style={{ height: 10, borderRadius: 999, background: "#0b1220", border: "1px solid #1e293b", overflow: "hidden" }}>
+            <div style={{ height: 10, borderRadius: 999, background: "var(--bg-elevated)", border: "1px solid var(--border)", overflow: "hidden" }}>
               <div style={{ height: "100%", width: `${(frac * 100).toFixed(1)}%`, background: b.color, transition: "width .3s" }} />
             </div>
           </div>
@@ -151,31 +155,22 @@ function VerdictHero({ data }: { data: EdgeResponse }) {
       "אין עדיין edge מובהק — ממשיכים לאסוף נתונים. הכול תקין… אל תפעיל אוטונומיה עכשיו — אין מה להפעיל.";
   }
   return (
-    <div
-      style={{
-        borderRadius: 14,
-        background: "var(--card,#0f172a)",
-        border: "1px solid #1e293b",
-        borderInlineStart: `5px solid ${sm.accent}`,
-        padding: "16px 18px",
-        marginTop: 4,
-      }}
-    >
-      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+    <Card style={{ borderInlineStart: `5px solid ${sm.accent}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", flexWrap: "wrap" }}>
         <span
           style={{
-            fontSize: 12, fontWeight: 800, padding: "3px 10px", borderRadius: 999,
-            color: "#e2e8f0", background: sm.tone, whiteSpace: "nowrap",
+            fontSize: "0.75rem", fontWeight: 800, padding: "3px 10px", borderRadius: 999,
+            color: "var(--text)", background: sm.tone, whiteSpace: "nowrap",
           }}
         >
           מצב: {sm.label}
         </span>
       </div>
-      <div style={{ fontSize: 18, fontWeight: 800, color: "#e2e8f0", marginTop: 10, lineHeight: 1.5 }}>{headline}</div>
+      <div style={{ fontSize: "1.125rem", fontWeight: 800, color: "var(--text)", marginTop: "var(--s-3)", lineHeight: 1.5 }}>{headline}</div>
       {data.note && (
-        <div style={{ fontSize: 13, color: "var(--muted,#94a3b8)", marginTop: 8, lineHeight: 1.55 }}>{data.note}</div>
+        <div style={{ fontSize: "0.8125rem", color: "var(--muted)", marginTop: "var(--s-2)", lineHeight: 1.55 }}>{data.note}</div>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -183,27 +178,27 @@ function VerdictHero({ data }: { data: EdgeResponse }) {
 function EdgeCardView({ card }: { card: EdgeCard }) {
   const cm = confMeta(card.confidence);
   const oosMark = card.oos_confirmed ? "✓ אומת קדימה" : "🧪 טרם אומת ✗";
-  const oosColor = card.oos_confirmed ? "#6ee7b7" : "#fca5a5";
+  const oosColor = card.oos_confirmed ? "var(--up)" : "var(--down)";
   return (
     <div
       style={{
-        borderRadius: 12, background: "#0b1220", border: "1px solid #1e293b",
-        borderInlineStart: `4px solid ${cm.bg}`, padding: "12px 14px",
+        borderRadius: "var(--radius-md)", background: "var(--bg-elevated)", border: "1px solid var(--border)",
+        borderInlineStart: `4px solid ${cm.bg}`, padding: "var(--s-3) var(--s-4)",
       }}
     >
-      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", flexWrap: "wrap" }}>
         <span style={{ fontSize: 11, fontWeight: 800, padding: "3px 8px", borderRadius: 999, color: cm.color, background: cm.bg, whiteSpace: "nowrap" }}>
           {cm.label}
         </span>
-        <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 999, color: "#93c5fd", background: "#1e3a5f55", border: "1px solid #1e3a5f", whiteSpace: "nowrap" }}>
+        <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 8px", borderRadius: 999, color: "var(--accent-bright)", background: "var(--accent-muted)", border: "1px solid var(--border-strong)", whiteSpace: "nowrap" }}>
           {edgeTypeLabel(card.edge_type)}
         </span>
-        <span style={{ fontSize: 12, fontWeight: 800, color: oosColor, whiteSpace: "nowrap" }}>{oosMark}</span>
+        <span style={{ fontSize: "0.75rem", fontWeight: 800, color: oosColor, whiteSpace: "nowrap" }}>{oosMark}</span>
       </div>
 
-      <div style={{ fontSize: 14, fontWeight: 800, color: "#e2e8f0", marginTop: 8, lineHeight: 1.5 }}>{card.setup_he}</div>
+      <div style={{ fontSize: "0.875rem", fontWeight: 800, color: "var(--text)", marginTop: "var(--s-2)", lineHeight: 1.5 }}>{card.setup_he}</div>
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-1)", marginTop: "var(--s-3)" }}>
         <Pill k="אחוז הצלחה" v={fmtPct(card.hit_rate_pct)} />
         <Pill k="בסיס (השלמה)" v={fmtPct(card.baseline_pct)} />
         <Pill k="עודף (lift)" v={`+${fmtPct(card.lift_pct)}`} />
@@ -213,7 +208,7 @@ function EdgeCardView({ card }: { card: EdgeCard }) {
       </div>
 
       {!card.oos_confirmed && card.more_trades_to_confirm > 0 && (
-        <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", marginTop: 8 }}>
+        <div style={{ fontSize: "0.75rem", color: "var(--muted)", marginTop: "var(--s-2)" }}>
           צריך עוד ~{card.more_trades_to_confirm} עסקאות + מבחן קדימה שטרם עבר.
         </div>
       )}
@@ -223,8 +218,8 @@ function EdgeCardView({ card }: { card: EdgeCard }) {
 
 function Pill({ k, v }: { k: string; v: string }) {
   return (
-    <span style={{ fontSize: 11, fontWeight: 600, padding: "3px 8px", borderRadius: 8, color: "#cbd5e1", background: "#0f172a", border: "1px solid #1e293b", whiteSpace: "nowrap" }}>
-      {k}: <b style={{ color: "#e2e8f0" }}>{v}</b>
+    <span className="tabular-nums" style={{ fontSize: 11, fontWeight: 600, padding: "3px 8px", borderRadius: "var(--radius-sm)", color: "var(--text-secondary)", background: "var(--card)", border: "1px solid var(--border)", whiteSpace: "nowrap" }}>
+      {k}: <b style={{ color: "var(--text)" }}>{v}</b>
     </span>
   );
 }
@@ -233,14 +228,18 @@ function Pill({ k, v }: { k: string; v: string }) {
 function CandidateGrid({ cards }: { cards: EdgeCard[] }) {
   if (!cards || cards.length === 0) return null;
   return (
-    <div style={{ marginTop: 16 }}>
-      <div style={{ fontSize: 13, fontWeight: 700, color: "#93c5fd", marginBottom: 8 }}>מועמדים שנבחנים</div>
-      <div style={{ display: "grid", gap: 8 }}>
+    <Card>
+      <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)", flexWrap: "wrap", marginBottom: "var(--s-3)" }}>
+        <span aria-hidden>🔬</span>
+        <SectionTitle as="h3" className="section-title--reset">מועמדים שנבחנים</SectionTitle>
+        <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>כל setup נבדק מול בסיס + מבחן קדימה</span>
+      </div>
+      <div style={{ display: "grid", gap: "var(--s-2)" }}>
         {cards.map((c, i) => (
           <EdgeCardView key={c.slice_key ?? `${c.setup_he}-${i}`} card={c} />
         ))}
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -249,9 +248,9 @@ function HonestyFooter() {
   return (
     <div
       style={{
-        marginTop: 20, padding: "12px 14px", borderRadius: 10,
-        background: "#0b1220", border: "1px solid #1e293b",
-        fontSize: 12, color: "var(--muted,#94a3b8)", lineHeight: 1.6, fontStyle: "italic",
+        padding: "var(--s-3) var(--s-4)", borderRadius: "var(--radius-md)",
+        background: "var(--bg-elevated)", border: "1px solid var(--border)",
+        fontSize: "0.75rem", color: "var(--muted)", lineHeight: 1.6, fontStyle: "italic",
       }}
     >
       'edge' נחשב אמיתי רק אחרי מבחן קדימה (out-of-sample בזמן אמת), תיקון לריבוי-בדיקות, וסף
@@ -326,29 +325,31 @@ export default function EdgeWatcherTab({ onGoToStrategy }: { onGoToStrategy: () 
     `אחרי עמלות אמיתיות, מבחן קדימה ✓, ${c.confirmations} אישורים.`;
 
   return (
-    <div dir="rtl" style={{ padding: "4px 2px 40px", maxWidth: 1100, margin: "0 auto" }}>
+    <div dir="rtl" style={{ display: "grid", gap: "var(--s-4)", padding: "var(--s-1) 2px var(--s-6)", maxWidth: 1100, margin: "0 auto" }}>
       {/* Header */}
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: "var(--s-2)" }}>
         <div>
-          <h2 style={{ margin: 0, fontSize: 24, fontWeight: 800, letterSpacing: "-0.02em" }}>🔭 גלאי edge</h2>
-          <p style={{ margin: "4px 0 0", color: "var(--muted, #94a3b8)", fontSize: 13, lineHeight: 1.55 }}>
-            verdict סטטיסטי אחד וכן מתוך כל העסקאות — האם צמח edge אמיתי שכדאי לשקול. רק כלי תיעוד
-            וייעוץ: לעולם לא משנה לבד את מצב ההחלטה.
+          <h2 style={{ margin: 0, fontSize: "1.5rem", fontWeight: 800, letterSpacing: "-0.02em" }}>🔭 גלאי edge</h2>
+          <p
+            style={{ margin: "var(--s-1) 0 0", color: "var(--muted)", fontSize: "0.8125rem", lineHeight: 1.55, maxWidth: 640 }}
+            title="verdict סטטיסטי אחד וכן מתוך כל העסקאות — האם צמח edge אמיתי שכדאי לשקול. רק כלי תיעוד וייעוץ: לעולם לא משנה לבד את מצב ההחלטה."
+          >
+            verdict אחד וכן מכל העסקאות — כלי תיעוד וייעוץ בלבד, לעולם לא משנה לבד את מצב ההחלטה.
           </p>
         </div>
-        <button type="button" onClick={() => void refresh()} style={btnStyle()}>
+        <Button variant="ghost" onClick={() => void refresh()}>
           {loading ? "מרענן…" : "↻ רענן"}
-        </button>
+        </Button>
       </div>
 
       {err && (
-        <div style={{ marginTop: 14, color: "#fecaca", background: "#7f1d1d33", padding: 12, borderRadius: 10 }}>
+        <div className="alert-error">
           שגיאה בטעינה: {err}
         </div>
       )}
 
       {!data && !err && (
-        <div style={{ marginTop: 16, padding: 40, textAlign: "center", color: "var(--muted,#94a3b8)", border: "1px dashed #1e293b", borderRadius: 12 }}>
+        <div style={{ padding: "var(--s-6)", textAlign: "center", color: "var(--muted)", border: "1px dashed var(--border)", borderRadius: "var(--radius-md)" }}>
           טוען…
         </div>
       )}
@@ -358,11 +359,20 @@ export default function EdgeWatcherTab({ onGoToStrategy }: { onGoToStrategy: () 
           <VerdictHero data={data} />
 
           {/* progress meter — only meaningful while still collecting / watching */}
-          {(data.state === "collecting" || data.state === "watching") && <ProgressMeter data={data} />}
+          {(data.state === "collecting" || data.state === "watching") && (
+            <Card>
+              <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)", flexWrap: "wrap", marginBottom: "var(--s-3)" }}>
+                <span aria-hidden>📊</span>
+                <SectionTitle as="h3" className="section-title--reset">התקדמות עד לסף</SectionTitle>
+                <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>כמה נתונים עוד צריך כדי להכריע</span>
+              </div>
+              <ProgressMeter data={data} />
+            </Card>
+          )}
 
           {/* directional diagnostic note — information only, never a tradeable signal */}
           {data.directional_note_he && (
-            <div style={{ marginTop: 14, padding: "10px 14px", borderRadius: 10, background: "#0b1220", border: "1px solid #1e293b", borderInlineStart: "4px solid #475569", fontSize: 13, color: "#cbd5e1", lineHeight: 1.55 }}>
+            <div style={{ padding: "var(--s-3) var(--s-4)", borderRadius: "var(--radius-md)", background: "var(--bg-elevated)", border: "1px solid var(--border)", borderInlineStart: "4px solid var(--muted)", fontSize: "0.8125rem", color: "var(--text-secondary)", lineHeight: 1.55 }}>
               {data.directional_note_he}
             </div>
           )}
@@ -372,24 +382,18 @@ export default function EdgeWatcherTab({ onGoToStrategy }: { onGoToStrategy: () 
 
           {/* ── THE autonomy nudge — the ONLY button, navigates, never flips mode ── */}
           {mayNudgeAutonomy && best && (
-            <div
-              style={{
-                marginTop: 18, padding: "16px 18px", borderRadius: 14,
-                background: "var(--card,#0f172a)", border: "1px solid #065f46",
-                borderInlineStart: "5px solid #10b981",
-              }}
-            >
-              <div style={{ fontSize: 15, fontWeight: 800, color: "#6ee7b7" }}>שקול להפעיל אוטונומיה</div>
-              <div style={{ fontSize: 13, color: "#cbd5e1", marginTop: 8, lineHeight: 1.6 }}>{evidenceSentence(best)}</div>
-              <div style={{ marginTop: 12 }}>
-                <button type="button" onClick={goToDecisionMode} style={btnStyle("#065f46")}>
+            <Card style={{ border: "1px solid #065f46", borderInlineStart: "5px solid var(--up)" }}>
+              <div style={{ fontSize: "0.9375rem", fontWeight: 800, color: "#6ee7b7" }}>שקול להפעיל אוטונומיה</div>
+              <div style={{ fontSize: "0.8125rem", color: "var(--text-secondary)", marginTop: "var(--s-2)", lineHeight: 1.6 }}>{evidenceSentence(best)}</div>
+              <div style={{ marginTop: "var(--s-3)" }}>
+                <Button variant="primary" onClick={goToDecisionMode}>
                   ← למסך מצב ההחלטה
-                </button>
+                </Button>
               </div>
-              <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", marginTop: 8 }}>
+              <div style={{ fontSize: "0.75rem", color: "var(--muted)", marginTop: "var(--s-2)" }}>
                 הכפתור רק מנווט — ההחלטה להפעיל אוטונומיה היא שלך, ידנית, במסך האסטרטגיה.
               </div>
-            </div>
+            </Card>
           )}
 
           <HonestyFooter />
@@ -397,13 +401,4 @@ export default function EdgeWatcherTab({ onGoToStrategy }: { onGoToStrategy: () 
       )}
     </div>
   );
-}
-
-// ── inline style helpers (match app dark theme, mirrors AuditTab) ────────────────
-function btnStyle(bg?: string): React.CSSProperties {
-  return {
-    padding: "7px 12px", borderRadius: 9, border: "1px solid #1e293b",
-    background: bg ?? "var(--card,#0f172a)", color: "#e2e8f0", fontSize: 13, fontWeight: 600,
-    cursor: "pointer",
-  };
 }

@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, isPageHidden } from "./api";
+import { Card } from "./ui/Card";
+import { SectionTitle } from "./ui/SectionTitle";
+import { Button } from "./ui/Button";
 
 /** לשונית "תקלות ובאגים" — מעקב אחרי כשלים במערכת: חומרה, ספירה, טופל/לא, שיתוף. */
 
@@ -36,6 +39,7 @@ type Counts = {
 
 type FaultsResponse = { faults: Fault[]; counts: Counts };
 
+// SEV_META — צבעי חומרה מכוונים (קריטי/גבוה/בינוני/נמוך): נשמרים כי הם מקודדים משמעות.
 const SEV_META: Record<Severity, { label: string; color: string; bg: string }> = {
   critical: { label: "קריטי", color: "#fecaca", bg: "#7f1d1d" },
   high: { label: "גבוה", color: "#fed7aa", bg: "#7c2d12" },
@@ -207,67 +211,72 @@ export default function FaultsTab() {
   const sevOrder: Severity[] = ["critical", "high", "medium", "low"];
 
   return (
-    <div dir="rtl" style={{ padding: "4px 2px 40px", maxWidth: 1100, margin: "0 auto" }}>
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-        <div>
-          <h2 style={{ margin: 0, fontSize: 24, fontWeight: 800, letterSpacing: "-0.02em" }}>🐞 תקלות ובאגים</h2>
-          <p style={{ margin: "4px 0 0", color: "var(--muted, #94a3b8)", fontSize: 13 }}>
-            כל כשל במערכת נתפס כאן אוטומטית — מה קרה, כמה פעמים, חומרה, והאם טופל. אפשר גם לדווח ידנית ולשתף דוח.
-          </p>
-        </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <button type="button" onClick={() => void refresh()} style={btnStyle()}>
-            {loading ? "מרענן…" : "↻ רענן"}
-          </button>
-          <button type="button" onClick={() => void copyReport()} style={btnStyle(copied ? "#065f46" : undefined)}>
-            {copied ? "✓ הועתק" : "📋 העתק דוח"}
-          </button>
-        </div>
-      </div>
-
-      {/* Severe banner */}
-      {counts && counts.open_severe > 0 && (
-        <div style={{
-          marginTop: 14, padding: "12px 16px", borderRadius: 12,
-          background: "linear-gradient(90deg, #7f1d1d33, #7c2d1222)", border: "1px solid #ef444455",
-          color: "#fecaca", fontWeight: 600, display: "flex", alignItems: "center", gap: 10,
-        }}>
-          <span style={{ fontSize: 18 }}>⚠️</span>
-          יש {counts.open_severe} תקלות חמורות פתוחות (קריטי/גבוה) שדורשות טיפול.
-        </div>
-      )}
-
-      {/* Counts strip */}
-      <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
-        {sevOrder.map((s) => {
-          const m = SEV_META[s];
-          const n = counts?.by_severity?.[s] ?? 0;
-          return (
-            <div key={s} style={{
-              flex: "1 1 120px", minWidth: 110, padding: "12px 14px", borderRadius: 12,
-              background: "var(--card, #0f172a)", border: `1px solid ${m.bg}`,
-              borderInlineStart: `4px solid ${m.bg}`,
-            }}>
-              <div style={{ fontSize: 12, color: m.color, fontWeight: 700 }}>{m.label}</div>
-              <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.1, marginTop: 2 }}>{n}</div>
+    <div dir="rtl" style={{ display: "grid", gap: "var(--s-4)", maxWidth: 1100, margin: "0 auto", paddingBottom: "var(--s-6)" }}>
+      {/* ── Header card ── */}
+      <Card>
+        <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: "var(--s-3)" }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)" }}>
+              <span style={{ fontSize: "1.25rem" }}>🐞</span>
+              <SectionTitle as="h3" className="section-title--reset">תקלות ובאגים</SectionTitle>
             </div>
-          );
-        })}
-        <div style={{
-          flex: "1 1 120px", minWidth: 110, padding: "12px 14px", borderRadius: 12,
-          background: "var(--card, #0f172a)", border: "1px solid #1e293b",
-        }}>
-          <div style={{ fontSize: 12, color: "var(--muted, #94a3b8)", fontWeight: 700 }}>פתוחות / סה"כ</div>
-          <div style={{ fontSize: 26, fontWeight: 800, lineHeight: 1.1, marginTop: 2 }}>
-            {counts?.open ?? 0}<span style={{ fontSize: 15, color: "var(--muted, #94a3b8)" }}> / {counts?.total ?? 0}</span>
+            <p style={{ margin: "var(--s-1) 0 0", color: "var(--muted)", fontSize: "0.8125rem" }}>
+              כל כשל במערכת נתפס כאן אוטומטית — מה קרה, כמה פעמים, ובאיזו חומרה.
+            </p>
+          </div>
+          <div style={{ display: "flex", gap: "var(--s-2)" }}>
+            <Button variant="ghost" onClick={() => void refresh()}>
+              {loading ? "מרענן…" : "↻ רענן"}
+            </Button>
+            <Button variant={copied ? "primary" : "ghost"} onClick={() => void copyReport()}>
+              {copied ? "✓ הועתק" : "📋 העתק דוח"}
+            </Button>
           </div>
         </div>
-      </div>
 
-      {/* Toolbar */}
-      <div style={{ display: "flex", gap: 8, marginTop: 16, flexWrap: "wrap", alignItems: "center" }}>
-        <div style={{ display: "flex", gap: 4, background: "var(--card,#0f172a)", padding: 4, borderRadius: 10, border: "1px solid #1e293b" }}>
+        {/* Severe banner */}
+        {counts && counts.open_severe > 0 && (
+          <div style={{
+            marginTop: "var(--s-4)", padding: "var(--s-3) var(--s-4)", borderRadius: "var(--radius-md)",
+            background: "var(--down-muted)", border: "1px solid rgba(184, 92, 92, 0.35)",
+            color: "var(--down)", fontWeight: 600, display: "flex", alignItems: "center", gap: "var(--s-2)",
+          }}>
+            <span style={{ fontSize: "1.125rem" }}>⚠️</span>
+            יש {counts.open_severe} תקלות חמורות פתוחות (קריטי/גבוה) שדורשות טיפול.
+          </div>
+        )}
+
+        {/* Counts strip — stat tiles */}
+        <div style={{ display: "flex", gap: "var(--s-3)", marginTop: "var(--s-4)", flexWrap: "wrap" }}>
+          {sevOrder.map((s) => {
+            const m = SEV_META[s];
+            const n = counts?.by_severity?.[s] ?? 0;
+            return (
+              <div key={s} style={{
+                flex: "1 1 120px", minWidth: 110, padding: "var(--s-3)", borderRadius: "var(--radius-md)",
+                background: "var(--bg-elevated)", border: "1px solid var(--border)",
+                borderInlineStart: `4px solid ${m.bg}`,
+              }}>
+                <div style={{ fontSize: "0.75rem", color: m.color, fontWeight: 600 }}>{m.label}</div>
+                <div className="tabular-nums" style={{ fontSize: "1.5rem", fontWeight: 700, lineHeight: 1.1, marginTop: 2 }}>{n}</div>
+              </div>
+            );
+          })}
+          <div style={{
+            flex: "1 1 120px", minWidth: 110, padding: "var(--s-3)", borderRadius: "var(--radius-md)",
+            background: "var(--bg-elevated)", border: "1px solid var(--border)",
+          }}>
+            <div style={{ fontSize: "0.75rem", color: "var(--muted)", fontWeight: 600 }}>פתוחות / סה"כ</div>
+            <div className="tabular-nums" style={{ fontSize: "1.5rem", fontWeight: 700, lineHeight: 1.1, marginTop: 2 }}>
+              {counts?.open ?? 0}<span style={{ fontSize: "0.9375rem", color: "var(--muted)" }}> / {counts?.total ?? 0}</span>
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      {/* ── Toolbar ── */}
+      <div style={{ display: "flex", gap: "var(--s-2)", flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ display: "flex", gap: "var(--s-1)", background: "var(--card)", padding: "var(--s-1)", borderRadius: "var(--radius-md)", border: "1px solid var(--border)" }}>
           {(["open", "all", "handled"] as const).map((k) => (
             <button key={k} type="button" onClick={() => setFilterHandled(k)} style={chipStyle(filterHandled === k)}>
               {k === "open" ? "פתוחות" : k === "handled" ? "טופלו" : "הכל"}
@@ -279,32 +288,40 @@ export default function FaultsTab() {
           {sevOrder.map((s) => <option key={s} value={s}>{SEV_META[s].label}</option>)}
         </select>
         <div style={{ flex: 1 }} />
-        <button type="button" onClick={() => setShowAdd((v) => !v)} style={btnStyle()}>＋ דווח תקלה</button>
-        <button type="button" onClick={() => void clearHandled()} style={btnStyle()}>🗑 נקה שטופלו</button>
+        <Button variant="ghost" onClick={() => setShowAdd((v) => !v)}>＋ דווח תקלה</Button>
+        <Button variant="ghost" onClick={() => void clearHandled()}>🗑 נקה שטופלו</Button>
       </div>
 
-      {/* Manual add */}
+      {/* ── Manual add ── */}
       {showAdd && (
-        <div style={{ marginTop: 12, padding: 14, borderRadius: 12, background: "var(--card,#0f172a)", border: "1px solid #1e293b", display: "grid", gap: 8 }}>
-          <input value={mTitle} onChange={(e) => setMTitle(e.target.value)} placeholder="כותרת התקלה (חובה)" style={inputStyle()} />
-          <textarea value={mDetail} onChange={(e) => setMDetail(e.target.value)} placeholder="פירוט / מה קרה / איך לשחזר" rows={3} style={{ ...inputStyle(), resize: "vertical" }} />
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <select value={mSev} onChange={(e) => setMSev(e.target.value as Severity)} style={selectStyle()}>
-              {sevOrder.map((s) => <option key={s} value={s}>{SEV_META[s].label}</option>)}
-            </select>
-            <div style={{ flex: 1 }} />
-            <button type="button" onClick={() => void addManual()} style={btnStyle("#1d4ed8")} disabled={!mTitle.trim()}>שמור</button>
-            <button type="button" onClick={() => setShowAdd(false)} style={btnStyle()}>ביטול</button>
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", marginBottom: "var(--s-3)" }}>
+            <span style={{ fontSize: "1.05rem" }}>＋</span>
+            <SectionTitle as="h3" className="section-title--reset">דיווח תקלה ידני</SectionTitle>
           </div>
-        </div>
+          <div style={{ display: "grid", gap: "var(--s-2)" }}>
+            <input value={mTitle} onChange={(e) => setMTitle(e.target.value)} placeholder="כותרת התקלה (חובה)" style={inputStyle()} />
+            <textarea value={mDetail} onChange={(e) => setMDetail(e.target.value)} placeholder="פירוט / מה קרה / איך לשחזר" rows={3} style={{ ...inputStyle(), resize: "vertical" }} />
+            <div style={{ display: "flex", gap: "var(--s-2)", alignItems: "center" }}>
+              <select value={mSev} onChange={(e) => setMSev(e.target.value as Severity)} style={selectStyle()}>
+                {sevOrder.map((s) => <option key={s} value={s}>{SEV_META[s].label}</option>)}
+              </select>
+              <div style={{ flex: 1 }} />
+              <Button variant="primary" onClick={() => void addManual()} disabled={!mTitle.trim()}>שמור</Button>
+              <Button variant="ghost" onClick={() => setShowAdd(false)}>ביטול</Button>
+            </div>
+          </div>
+        </Card>
       )}
 
-      {err && <div style={{ marginTop: 14, color: "#fecaca", background: "#7f1d1d33", padding: 12, borderRadius: 10 }}>שגיאה בטעינה: {err}</div>}
+      {err && (
+        <div className="alert-error" style={{ margin: 0 }}>שגיאה בטעינה: {err}</div>
+      )}
 
-      {/* List */}
-      <div style={{ marginTop: 16, display: "grid", gap: 8 }}>
+      {/* ── List ── */}
+      <div style={{ display: "grid", gap: "var(--s-2)" }}>
         {!loading && faults.length === 0 && (
-          <div style={{ padding: 40, textAlign: "center", color: "var(--muted,#94a3b8)", border: "1px dashed #1e293b", borderRadius: 12 }}>
+          <div style={{ padding: "var(--s-6)", textAlign: "center", color: "var(--muted)", border: "1px dashed var(--border)", borderRadius: "var(--radius-md)" }}>
             {filterHandled === "open" ? "🎉 אין תקלות פתוחות" : "אין תקלות להצגה"}
           </div>
         )}
@@ -313,53 +330,53 @@ export default function FaultsTab() {
           const isOpen = expanded.has(f.id);
           return (
             <div key={f.id} style={{
-              borderRadius: 12, background: "var(--card,#0f172a)", border: "1px solid #1e293b",
+              borderRadius: "var(--radius-md)", background: "var(--card)", border: "1px solid var(--border)",
               borderInlineStart: `4px solid ${m.bg}`, opacity: f.handled ? 0.62 : 1, overflow: "hidden",
             }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", cursor: "pointer" }}
+              <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", padding: "var(--s-3) var(--s-4)", cursor: "pointer" }}
                    onClick={() => toggleExpand(f.id)}>
                 <span style={{
-                  fontSize: 11, fontWeight: 800, padding: "3px 8px", borderRadius: 999,
+                  fontSize: "0.6875rem", fontWeight: 800, padding: "3px 8px", borderRadius: 999,
                   color: m.color, background: m.bg, whiteSpace: "nowrap",
                 }}>{m.label}</span>
                 <span style={{ fontWeight: 700, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {f.title}
                 </span>
                 {f.count > 1 && (
-                  <span style={{ fontSize: 12, fontWeight: 700, color: "#fbbf24", background: "#78350f55", padding: "2px 8px", borderRadius: 999 }}>
+                  <span style={{ fontSize: "0.75rem", fontWeight: 700, color: "#fbbf24", background: "#78350f55", padding: "2px 8px", borderRadius: 999 }}>
                     ×{f.count}
                   </span>
                 )}
-                <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>{fmtAgo(f.last_ts)}</span>
-                {f.handled && <span style={{ fontSize: 11, color: "#6ee7b7" }}>✓ טופל</span>}
-                <span style={{ color: "var(--muted,#94a3b8)", transform: isOpen ? "rotate(90deg)" : "none", transition: "transform .15s" }}>‹</span>
+                <span style={{ fontSize: "0.75rem", color: "var(--muted)", whiteSpace: "nowrap" }}>{fmtAgo(f.last_ts)}</span>
+                {f.handled && <span style={{ fontSize: "0.6875rem", color: "var(--up)" }}>✓ טופל</span>}
+                <span style={{ color: "var(--muted)", transform: isOpen ? "rotate(90deg)" : "none", transition: "transform .15s" }}>‹</span>
               </div>
               {isOpen && (
-                <div style={{ padding: "0 14px 14px", borderTop: "1px solid #1e293b", display: "grid", gap: 6, fontSize: 13 }}>
-                  <div style={{ display: "flex", gap: 16, flexWrap: "wrap", color: "var(--muted,#94a3b8)", marginTop: 10 }}>
-                    <span>קטגוריה: <b style={{ color: "#e2e8f0" }}>{f.category}</b></span>
-                    <span>מקור: <b style={{ color: "#e2e8f0" }}>{f.source || "—"}</b></span>
+                <div style={{ padding: "0 var(--s-4) var(--s-4)", borderTop: "1px solid var(--border)", display: "grid", gap: "var(--s-2)", fontSize: "0.8125rem" }}>
+                  <div style={{ display: "flex", gap: "var(--s-4)", flexWrap: "wrap", color: "var(--muted)", marginTop: "var(--s-3)" }}>
+                    <span>קטגוריה: <b style={{ color: "var(--text)" }}>{f.category}</b></span>
+                    <span>מקור: <b style={{ color: "var(--text)" }}>{f.source || "—"}</b></span>
                     <span>נראה לראשונה: {fmtTime(f.first_ts)}</span>
                     <span>לאחרונה: {fmtTime(f.last_ts)}</span>
                   </div>
-                  {f.detail && <div style={{ color: "#e2e8f0", whiteSpace: "pre-wrap" }}>{f.detail}</div>}
+                  {f.detail && <div style={{ color: "var(--text)", whiteSpace: "pre-wrap" }}>{f.detail}</div>}
                   {f.context && Object.keys(f.context).length > 0 && (
-                    <pre style={{ margin: 0, padding: 10, background: "#020617", borderRadius: 8, fontSize: 12, overflow: "auto", color: "#94a3b8" }}>
+                    <pre style={{ margin: 0, padding: "var(--s-3)", background: "var(--bg-elevated)", borderRadius: "var(--radius-sm)", fontSize: "0.75rem", overflow: "auto", color: "var(--muted)" }}>
                       {JSON.stringify(f.context, null, 2)}
                     </pre>
                   )}
                   {f.handled && f.resolution_note && (
-                    <div style={{ color: "#6ee7b7" }}>הערת טיפול: {f.resolution_note}</div>
+                    <div style={{ color: "var(--up)" }}>הערת טיפול: {f.resolution_note}</div>
                   )}
-                  <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                  <div style={{ display: "flex", gap: "var(--s-2)", marginTop: "var(--s-1)" }}>
                     {!f.handled ? (
-                      <button type="button" disabled={busyId === f.id} onClick={() => void setHandled(f, true)} style={btnStyle("#065f46")}>
+                      <Button variant="primary" disabled={busyId === f.id} onClick={() => void setHandled(f, true)}>
                         ✓ סמן כטופל
-                      </button>
+                      </Button>
                     ) : (
-                      <button type="button" disabled={busyId === f.id} onClick={() => void setHandled(f, false)} style={btnStyle()}>
+                      <Button variant="ghost" disabled={busyId === f.id} onClick={() => void setHandled(f, false)}>
                         ↩ פתח מחדש
-                      </button>
+                      </Button>
                     )}
                   </div>
                 </div>
@@ -372,24 +389,17 @@ export default function FaultsTab() {
   );
 }
 
-// ── inline style helpers (match app dark theme) ──────────────────────────────
-function btnStyle(bg?: string): React.CSSProperties {
-  return {
-    padding: "7px 12px", borderRadius: 9, border: "1px solid #1e293b",
-    background: bg ?? "var(--card,#0f172a)", color: "#e2e8f0", fontSize: 13, fontWeight: 600,
-    cursor: "pointer",
-  };
-}
+// ── inline style helpers (match app dark theme, tokenized) ───────────────────
 function chipStyle(active: boolean): React.CSSProperties {
   return {
-    padding: "6px 14px", borderRadius: 8, border: "none",
-    background: active ? "#1d4ed8" : "transparent", color: active ? "#fff" : "#94a3b8",
-    fontSize: 13, fontWeight: 700, cursor: "pointer",
+    padding: "6px 14px", borderRadius: "var(--radius-sm)", border: "none",
+    background: active ? "var(--accent)" : "transparent", color: active ? "var(--text-on-accent)" : "var(--muted)",
+    fontSize: "0.8125rem", fontWeight: 700, cursor: "pointer",
   };
 }
 function selectStyle(): React.CSSProperties {
-  return { padding: "7px 10px", borderRadius: 9, border: "1px solid #1e293b", background: "var(--card,#0f172a)", color: "#e2e8f0", fontSize: 13 };
+  return { padding: "7px 10px", borderRadius: "var(--radius-md)", border: "1px solid var(--border-strong)", background: "var(--bg-elevated)", color: "var(--text)", fontSize: "0.8125rem" };
 }
 function inputStyle(): React.CSSProperties {
-  return { padding: "9px 11px", borderRadius: 9, border: "1px solid #1e293b", background: "#020617", color: "#e2e8f0", fontSize: 13, width: "100%", boxSizing: "border-box" };
+  return { padding: "9px 11px", borderRadius: "var(--radius-md)", border: "1px solid var(--border-strong)", background: "var(--bg-elevated)", color: "var(--text)", fontSize: "0.8125rem", width: "100%", boxSizing: "border-box" };
 }

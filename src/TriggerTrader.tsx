@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, isPageHidden } from "./api";
 import { Card } from "./ui/Card";
+import { SectionTitle } from "./ui/SectionTitle";
+import { Button } from "./ui/Button";
+import { Collapsible } from "./ui/Collapsible";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -125,8 +128,8 @@ function SliderField({
   };
 
   return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+    <div style={{ marginBottom: "var(--s-4)" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "var(--s-1)" }}>
         <span style={{ fontSize: 13, color: "var(--text-secondary)" }}>{label}</span>
         <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
           <input
@@ -143,7 +146,7 @@ function SliderField({
               fontVariantNumeric: "tabular-nums",
               background: "var(--bg-elevated)",
               border: "1px solid var(--border-strong)",
-              borderRadius: 6, padding: "2px 6px",
+              borderRadius: "var(--radius-sm)", padding: "2px 6px",
               color: "var(--accent-bright)",
               outline: "none",
             }}
@@ -177,14 +180,14 @@ function DirectionPicker({
     ? [["auto", "🔁 אוטו"], ["Up", "⬆ Up"], ["Down", "⬇ Down"]]
     : [["Up", "⬆ Up"], ["Down", "⬇ Down"]];
   return (
-    <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+    <div style={{ display: "flex", gap: 6, marginBottom: "var(--s-3)" }}>
       {opts.map(([v, label]) => (
         <button
           key={v}
           type="button"
           onClick={() => onChange(v)}
           style={{
-            flex: 1, padding: "8px 4px", borderRadius: 8,
+            flex: 1, padding: "8px 4px", borderRadius: "var(--radius-sm)",
             border: `1px solid ${value === v ? "transparent" : "var(--border)"}`,
             fontWeight: 700, fontSize: 12, cursor: "pointer",
             background: value === v
@@ -220,7 +223,7 @@ function ModeCard({
       type="button"
       onClick={onClick}
       style={{
-        flex: 1, padding: "14px 10px", borderRadius: 12,
+        flex: 1, padding: "14px 10px", borderRadius: "var(--radius-lg)",
         border: `2px solid ${selected ? "var(--accent-bright)" : "var(--border)"}`,
         background: selected ? "var(--accent-muted)" : "var(--card)",
         cursor: "pointer", textAlign: "center",
@@ -465,7 +468,7 @@ export default function TriggerTrader() {
     <div style={{ display: "flex", flexDirection: "column", gap: "var(--s-4)" }}>
 
       {/* ── Title ──────────────────────────────────────────────── */}
-      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "var(--s-3)", flexWrap: "wrap" }}>
         <h2 style={{ margin: 0, fontSize: "1.15rem", fontFamily: "var(--font-display)", fontWeight: 700 }}>
           ⚡ מסחר אוטומטי מהיר
         </h2>
@@ -498,16 +501,17 @@ export default function TriggerTrader() {
       {err && (
         <div style={{
           background: "var(--down-muted)", border: "1px solid var(--down)",
-          borderRadius: 8, padding: "8px 14px", color: "var(--down)", fontSize: 13,
+          borderRadius: "var(--radius-sm)", padding: "8px 14px", color: "var(--down)", fontSize: 13,
         }}>{err}</div>
       )}
 
       {/* ── Window selector ────────────────────────────────────── */}
       <Card padding="md">
-        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 10, fontWeight: 600 }}>
-          0 · חלון מסחר Polymarket
+        <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)", marginBottom: "var(--s-3)", flexWrap: "wrap" }}>
+          <SectionTitle as="h3">0 · ⏱ חלון מסחר Polymarket</SectionTitle>
+          <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>בחר את משך הסבב שבו הבוט נכנס וסוגר</span>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: "var(--s-2)" }}>
           {([["5m", "⏱ 5 דקות", "חלון קצר — תנועות מהירות, רווח מהיר יותר"],
              ["15m", "⏳ 15 דקות", "חלון ארוך — יותר זמן להמתין לTP"]] as const).map(([val, label, desc]) => (
             <button
@@ -515,7 +519,7 @@ export default function TriggerTrader() {
               type="button"
               onClick={() => setCfg(p => ({ ...p, btc_window: val }))}
               style={{
-                flex: 1, padding: "12px 8px", borderRadius: 10, cursor: "pointer",
+                flex: 1, padding: "var(--s-3) var(--s-2)", borderRadius: "var(--radius-sm)", cursor: "pointer",
                 border: `2px solid ${cfg.btc_window === val ? "var(--accent-bright)" : "var(--border)"}`,
                 background: cfg.btc_window === val ? "var(--accent-muted)" : "var(--card)",
                 textAlign: "center",
@@ -524,7 +528,7 @@ export default function TriggerTrader() {
               <div style={{ fontWeight: 800, fontSize: 18, color: cfg.btc_window === val ? "var(--accent-bright)" : "var(--text)" }}>
                 {label}
               </div>
-              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4, lineHeight: 1.4 }}>{desc}</div>
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: "var(--s-1)", lineHeight: 1.4 }}>{desc}</div>
             </button>
           ))}
         </div>
@@ -532,10 +536,11 @@ export default function TriggerTrader() {
 
       {/* ── Mode selector ──────────────────────────────────────── */}
       <Card padding="md">
-        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 10, fontWeight: 600 }}>
-          1 · בחר מצב טריגר
+        <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)", marginBottom: "var(--s-3)", flexWrap: "wrap" }}>
+          <SectionTitle as="h3">1 · בחר מצב טריגר</SectionTitle>
+          <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>מה יגרום לבוט להיכנס לעסקה</span>
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: "var(--s-2)" }}>
           {MODES.map(m => (
             <ModeCard
               key={m.id}
@@ -549,11 +554,14 @@ export default function TriggerTrader() {
 
       {/* ── Mode-specific settings ────────────────────────────── */}
       <Card padding="md">
-        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 14, fontWeight: 600 }}>
-          2 · הגדרות{" "}
-          {selectedMode === "momentum" ? "🚀 מומנטום"
-            : selectedMode === "signal" ? "📡 סיגנל"
-            : "🔄 DCA פולס"}
+        <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)", marginBottom: "var(--s-4)", flexWrap: "wrap" }}>
+          <SectionTitle as="h3">
+            2 · הגדרות{" "}
+            {selectedMode === "momentum" ? "🚀 מומנטום"
+              : selectedMode === "signal" ? "📡 סיגנל"
+              : "🔄 DCA פולס"}
+          </SectionTitle>
+          <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>כוונון הטריגר שבחרת</span>
         </div>
 
         {selectedMode === "momentum" && (
@@ -574,7 +582,7 @@ export default function TriggerTrader() {
               onChange={v => setCfg(p => ({ ...p, momentum_direction: v as "auto" | "Up" | "Down" }))}
             />
             <div style={{
-              background: "var(--bg-elevated)", borderRadius: 8, padding: "10px 12px",
+              background: "var(--bg-elevated)", borderRadius: "var(--radius-sm)", padding: "var(--s-3)",
               fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.6,
             }}>
               <strong>איך עובד:</strong> הבוט בודק כל 2 שניות אם BTC זז{" "}
@@ -597,7 +605,7 @@ export default function TriggerTrader() {
               onChange={v => setCfg(p => ({ ...p, signal_direction: v as "auto" | "Up" | "Down" }))}
             />
             <div style={{
-              background: "var(--bg-elevated)", borderRadius: 8, padding: "10px 12px",
+              background: "var(--bg-elevated)", borderRadius: "var(--radius-sm)", padding: "var(--s-3)",
               fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.6,
             }}>
               <strong>איך עובד:</strong> כל ~2 שניות הבוט בודק את הסיגנלים.
@@ -638,7 +646,7 @@ export default function TriggerTrader() {
                     onClick={() => setCfg(p => ({ ...p, dca_sizing: val }))}
                     style={{
                       display: "flex", alignItems: "center", gap: 10,
-                      padding: "8px 12px", borderRadius: 8, cursor: "pointer",
+                      padding: "var(--s-2) var(--s-3)", borderRadius: "var(--radius-sm)", cursor: "pointer",
                       border: `1px solid ${cfg.dca_sizing === val ? "var(--accent-bright)" : "var(--border)"}`,
                       background: cfg.dca_sizing === val ? "var(--accent-muted)" : "var(--bg-elevated)",
                     }}
@@ -710,7 +718,7 @@ export default function TriggerTrader() {
               const totalSec = Math.round((cfg.dca_pulse_slices - 1) * cfg.dca_pulse_interval_sec);
               return (
                 <div style={{
-                  background: "var(--bg-elevated)", borderRadius: 8, padding: "10px 12px",
+                  background: "var(--bg-elevated)", borderRadius: "var(--radius-sm)", padding: "var(--s-3)",
                   fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.8,
                 }}>
                   <div>
@@ -750,8 +758,9 @@ export default function TriggerTrader() {
 
       {/* ── Common settings ────────────────────────────────────── */}
       <Card padding="md">
-        <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 14, fontWeight: 600 }}>
-          3 · הגדרות כניסה ויציאה
+        <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)", marginBottom: "var(--s-4)", flexWrap: "wrap" }}>
+          <SectionTitle as="h3">3 · הגדרות כניסה ויציאה</SectionTitle>
+          <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>כמה להשקיע, באיזה מחיר, ומתי לקחת רווח</span>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px" }}>
           <SliderField
@@ -775,26 +784,10 @@ export default function TriggerTrader() {
             onChange={v => setCfg(p => ({ ...p, cooldown_sec: v }))}
           />
         </div>
-        <SliderField
-          label="מקסימום טריגרים לחלון"
-          value={cfg.max_triggers_per_window} min={1} max={5} step={1}
-          onChange={v => setCfg(p => ({ ...p, max_triggers_per_window: v }))}
-        />
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px" }}>
-          <SliderField
-            label="לא להיכנס אם נשאר פחות מ (שניות)"
-            value={cfg.min_seconds_remaining} min={30} max={240} step={15} unit="ש׳"
-            onChange={v => setCfg(p => ({ ...p, min_seconds_remaining: v }))}
-          />
-          <SliderField
-            label={`דלג אם החוזה כבר עלה ב-% ${cfg.contract_max_drift_pct === 0 ? "(כבוי)" : ""}`}
-            value={cfg.contract_max_drift_pct} min={0} max={80} step={5} unit="%"
-            onChange={v => setCfg(p => ({ ...p, contract_max_drift_pct: v }))}
-          />
-        </div>
+
         {/* Summary pill */}
         <div style={{
-          display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4,
+          display: "flex", gap: "var(--s-2)", flexWrap: "wrap", marginTop: "var(--s-1)", marginBottom: "var(--s-4)",
         }}>
           {[
             ["השקעה", `$${cfg.investment_usd}`],
@@ -804,17 +797,43 @@ export default function TriggerTrader() {
           ].map(([k, v]) => (
             <div key={k} style={{
               background: "var(--bg-elevated)", border: "1px solid var(--border)",
-              borderRadius: 6, padding: "3px 10px", fontSize: 12,
+              borderRadius: "var(--radius-sm)", padding: "3px 10px", fontSize: 12,
             }}>
               <span style={{ color: "var(--muted)" }}>{k}: </span>
               <strong style={{ color: "var(--accent-bright)" }}>{v}</strong>
             </div>
           ))}
         </div>
+
+        {/* ── Advanced (power-user) entry/exit guards ────────────── */}
+        <Collapsible
+          title="הגדרות מתקדמות"
+          subtitle="הגבלות בטיחות — כמה טריגרים לחלון, זמן מינימלי שנותר, וסחיפת מחיר"
+          icon="⚙"
+          style={{ background: "var(--bg-elevated)", boxShadow: "none" }}
+        >
+          <SliderField
+            label="מקסימום טריגרים לחלון"
+            value={cfg.max_triggers_per_window} min={1} max={5} step={1}
+            onChange={v => setCfg(p => ({ ...p, max_triggers_per_window: v }))}
+          />
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px" }}>
+            <SliderField
+              label="לא להיכנס אם נשאר פחות מ (שניות)"
+              value={cfg.min_seconds_remaining} min={30} max={240} step={15} unit="ש׳"
+              onChange={v => setCfg(p => ({ ...p, min_seconds_remaining: v }))}
+            />
+            <SliderField
+              label={`דלג אם החוזה כבר עלה ב-% ${cfg.contract_max_drift_pct === 0 ? "(כבוי)" : ""}`}
+              value={cfg.contract_max_drift_pct} min={0} max={80} step={5} unit="%"
+              onChange={v => setCfg(p => ({ ...p, contract_max_drift_pct: v }))}
+            />
+          </div>
+        </Collapsible>
       </Card>
 
       {/* ── Activate / Deactivate ─────────────────────────────── */}
-      <div style={{ display: "flex", gap: 10 }}>
+      <div style={{ display: "flex", gap: "var(--s-2)" }}>
         {!isActive ? (
           <>
             <button
@@ -822,7 +841,7 @@ export default function TriggerTrader() {
               onClick={saveAndActivate}
               disabled={activating || cfg.mode === "off"}
               style={{
-                flex: 1, padding: "14px", borderRadius: 12, border: "none",
+                flex: 1, padding: "14px", borderRadius: "var(--radius-lg)", border: "none",
                 background: cfg.mode === "off" ? "var(--bg-elevated)" : "var(--up)",
                 color: "#fff", fontWeight: 800, fontSize: 15, cursor: "pointer",
                 opacity: activating || cfg.mode === "off" ? 0.6 : 1,
@@ -836,7 +855,7 @@ export default function TriggerTrader() {
               onClick={saveConfig}
               disabled={saving}
               style={{
-                padding: "14px 20px", borderRadius: 12,
+                padding: "14px 20px", borderRadius: "var(--radius-lg)",
                 border: "1px solid var(--border-strong)",
                 background: "var(--bg-elevated)", color: "var(--text-secondary)",
                 fontWeight: 600, fontSize: 13, cursor: "pointer",
@@ -852,7 +871,7 @@ export default function TriggerTrader() {
             onClick={deactivate}
             disabled={saving}
             style={{
-              flex: 1, padding: "14px", borderRadius: 12, border: "none",
+              flex: 1, padding: "14px", borderRadius: "var(--radius-lg)", border: "none",
               background: "var(--down)", color: "#fff",
               fontWeight: 800, fontSize: 15, cursor: "pointer",
               opacity: saving ? 0.6 : 1,
@@ -865,8 +884,8 @@ export default function TriggerTrader() {
 
       {/* ── Auto-start toggle ────────────────────────────────── */}
       <div style={{
-        display: "flex", alignItems: "center", gap: 12,
-        padding: "10px 14px", borderRadius: 10,
+        display: "flex", alignItems: "center", gap: "var(--s-3)",
+        padding: "10px 14px", borderRadius: "var(--radius-sm)",
         background: cfg.auto_start ? "var(--accent-muted)" : "var(--bg-elevated)",
         border: `1px solid ${cfg.auto_start ? "var(--accent-bright)" : "var(--border)"}`,
         cursor: "pointer",
@@ -906,36 +925,29 @@ export default function TriggerTrader() {
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
-            gap: 10,
-            marginBottom: 10,
+            gap: "var(--s-3)",
+            marginBottom: "var(--s-3)",
+            flexWrap: "wrap",
           }}>
-            <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600 }}>
-              מצב בזמן אמת
+            <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)", flexWrap: "wrap" }}>
+              <SectionTitle as="h3">📊 מצב בזמן אמת</SectionTitle>
+              <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>מה הבוט רואה ועושה עכשיו</span>
             </div>
             {state.mode === "dca_pulse" && (
-              <button
-                type="button"
+              <Button
+                variant="ghost"
                 onClick={rearmDcaPulse}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 10,
-                  border: "1px solid var(--border)",
-                  background: "var(--bg-elevated)",
-                  color: "var(--accent-bright)",
-                  fontSize: 11,
-                  fontWeight: 800,
-                  cursor: "pointer",
-                }}
                 title="משחרר נעילת חלון ומאפשר להתחיל DCA Pulse מחדש מיד"
+                style={{ fontSize: 11, fontWeight: 800, padding: "6px 10px" }}
               >
                 הרץ שוב עכשיו
-              </button>
+              </Button>
             )}
           </div>
           <div style={{
             fontSize: 13, fontFamily: "monospace",
             color: isActive ? "var(--text)" : "var(--muted)",
-            marginBottom: 10, minHeight: 20,
+            marginBottom: "var(--s-3)", minHeight: 20,
           }}>
             {state.status}
           </div>
@@ -976,14 +988,14 @@ export default function TriggerTrader() {
 
           {/* Live feed */}
           {state.status_log && state.status_log.length > 0 && (
-            <div style={{ marginTop: 12 }}>
+            <div style={{ marginTop: "var(--s-3)" }}>
               <div style={{ fontSize: 11, color: "var(--muted)", fontWeight: 600, marginBottom: 6 }}>
                 📡 פיד חי
               </div>
               <div style={{
                 maxHeight: 160, overflowY: "auto",
-                background: "var(--bg-base, #0b1020)",
-                borderRadius: 8, padding: "6px 10px",
+                background: "var(--bg-elevated)",
+                borderRadius: "var(--radius-sm)", padding: "6px 10px",
                 display: "flex", flexDirection: "column-reverse",
                 gap: 2,
               }}>
@@ -1020,40 +1032,35 @@ export default function TriggerTrader() {
       {/* ── Event log ────────────────────────────────────────── */}
       {state && state.events.length > 0 && (
         <Card padding="md">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-            <div style={{ fontSize: 12, color: "var(--muted)", fontWeight: 600 }}>לוג אירועים</div>
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <button
-                type="button"
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "var(--s-3)", marginBottom: "var(--s-3)", flexWrap: "wrap" }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: "var(--s-2)", flexWrap: "wrap" }}>
+              <SectionTitle as="h3">🧾 לוג אירועים</SectionTitle>
+              <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>כל כניסה, דילוג או שגיאה של הטריגר</span>
+            </div>
+            <div style={{ display: "flex", gap: "var(--s-2)", alignItems: "center" }}>
+              <Button
+                variant="ghost"
                 onClick={copyShareBundle}
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: shareCopied ? "var(--up)" : "var(--muted)",
-                  fontSize: 11,
-                  cursor: "pointer",
-                  padding: "2px 6px",
-                  fontWeight: 700,
-                }}
+                style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", color: shareCopied ? "var(--up)" : undefined }}
               >
                 {shareCopied ? "הועתק" : "העתק שיתוף"}
-              </button>
-              <button
-                type="button"
+              </Button>
+              <Button
+                variant="ghost"
                 onClick={clearEvents}
-                style={{
-                  background: "none",
-                  border: "none",
-                  color: "var(--muted)",
-                  fontSize: 11,
-                  cursor: "pointer",
-                  padding: "2px 6px",
-                }}
+                style={{ fontSize: 11, padding: "4px 10px" }}
               >
                 נקה
-              </button>
+              </Button>
             </div>
           </div>
+          <Collapsible
+            title="יומן אירועים"
+            subtitle={`${state.events.length} רשומות · לחיצה על שורה פותחת פירוט מלא`}
+            icon="📜"
+            defaultOpen={state.events.length <= 12}
+            style={{ background: "var(--bg-elevated)", boxShadow: "none" }}
+          >
           <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
             {[...state.events].reverse().map((ev, i) => {
               const isExpanded = expandedLog === i;
@@ -1070,8 +1077,8 @@ export default function TriggerTrader() {
                       fontSize: 12,
                       alignItems: "start",
                       cursor: "pointer",
-                      borderRadius: isExpanded ? "6px 6px 0 0" : 6,
-                      background: isExpanded ? "var(--bg-elevated)" : "transparent",
+                      borderRadius: isExpanded ? "var(--radius-sm) var(--radius-sm) 0 0" : "var(--radius-sm)",
+                      background: isExpanded ? "var(--card)" : "transparent",
                     }}
                   >
                     <span>{eventIcon(ev.event_type)}</span>
@@ -1096,12 +1103,12 @@ export default function TriggerTrader() {
                   {/* פירוט מלא בלחיצה */}
                   {isExpanded && (
                     <div style={{
-                      background: "var(--bg-elevated)",
+                      background: "var(--card)",
                       border: "1px solid var(--border)",
                       borderTop: "none",
-                      borderRadius: "0 0 6px 6px",
-                      padding: "10px 12px",
-                      marginBottom: 4,
+                      borderRadius: "0 0 var(--radius-sm) var(--radius-sm)",
+                      padding: "var(--s-3)",
+                      marginBottom: "var(--s-1)",
                       fontSize: 12,
                     }}>
                       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 20px" }}>
@@ -1129,6 +1136,7 @@ export default function TriggerTrader() {
               );
             })}
           </div>
+          </Collapsible>
         </Card>
       )}
 

@@ -22,6 +22,7 @@ import { usePriceStream } from "./hooks/usePriceStream";
 import { Button } from "./ui/Button";
 import { Card } from "./ui/Card";
 import { ChartCard } from "./ui/ChartCard";
+import { Collapsible } from "./ui/Collapsible";
 import { SectionTitle } from "./ui/SectionTitle";
 import { PnlOpenAreaChart, PnlClosedAreaChart } from "./ui/PnlSessionAreaCharts";
 import TipsV2 from "./TipsV2";
@@ -4668,14 +4669,20 @@ export default function App() {
             {tab === "stats_live" ? "סטטיסטיקות מסחר חי" : "סטטיסטיקות סימולציה (דמו)"}
           </SectionTitle>
           {tab === "stats_live" && (
-            <p style={{ fontSize: 13, color: "var(--muted)", marginTop: 8, marginBottom: 12, lineHeight: 1.5 }}>
-              יתרה ושווי נטו מוצגים מ־<strong>Polymarket (CLOB)</strong> כשמצב לייב פעיל; הגרף והטבלה — עסקאות מסחר חי בלבד (
-              <code style={{ fontSize: 12 }}>execution=live</code>
-              ), בלי דמו.               רשומות <code style={{ fontSize: 12 }}>RECONCILE</code> (סנכרון יומן פנימי מול היתרה האמיתית) לא
-              נספרות ב־PnL; גם <code style={{ fontSize: 12 }}>SETTLE_*</code> / <code style={{ fontSize: 12 }}>EXPIRE_0</code>{" "}
-              (פירוק מודל בסוף חלון) לא נכנסים לגרף/אחוז ניצחונות בלייב — כדי שלא יופיעו קפיצות מזויפות כשהיה drift
-              מול ה־CLOB. רשומות אלה עדיין ב־CSV ובהיסטוריה לביקורת.
-            </p>
+            <div style={{ marginTop: "var(--s-2)", marginBottom: "var(--s-3)", display: "grid", gap: "var(--s-2)" }}>
+              <p style={{ fontSize: "0.8125rem", color: "var(--muted)", margin: 0, lineHeight: 1.5 }}>
+                יתרה ושווי מ־<strong>Polymarket (CLOB)</strong> כשמצב לייב פעיל; הגרף והטבלה — עסקאות חי בלבד (
+                <code style={{ fontSize: "0.75rem" }}>execution=live</code>), בלי דמו.
+              </p>
+              <Collapsible title="על הנתונים בלייב" subtitle="אילו רשומות נכנסות ל־PnL ולגרף — ומה נשמר רק לביקורת">
+                <p style={{ fontSize: "0.8125rem", color: "var(--muted)", margin: 0, lineHeight: 1.6 }}>
+                  רשומות <code style={{ fontSize: "0.75rem" }}>RECONCILE</code> (סנכרון יומן פנימי מול היתרה האמיתית) לא
+                  נספרות ב־PnL; גם <code style={{ fontSize: "0.75rem" }}>SETTLE_*</code> / <code style={{ fontSize: "0.75rem" }}>EXPIRE_0</code>{" "}
+                  (פירוק מודל בסוף חלון) לא נכנסים לגרף/אחוז ניצחונות בלייב — כדי שלא יופיעו קפיצות מזויפות כשהיה drift
+                  מול ה־CLOB. רשומות אלה עדיין ב־CSV ובהיסטוריה לביקורת.
+                </p>
+              </Collapsible>
+            </div>
           )}
           {(() => {
             const statsLive = tab === "stats_live";
@@ -4751,9 +4758,9 @@ export default function App() {
 
             return (
               <>
-                <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+                <div style={{ display: "flex", gap: "var(--s-3)", flexWrap: "wrap", marginBottom: "var(--s-3)" }}>
                   {statsLive && !liveModeEffective && (
-                    <div className="alert-error" role="status" style={{ width: "100%", marginBottom: 4 }}>
+                    <div className="alert-error" role="status" style={{ width: "100%", marginBottom: "var(--s-1)" }}>
                       מצב לייב לא פעיל — הפעל «מסחר חי» מהלוח וודא מפתח. להלן רק עסקאות חי מהיומן (אם יש).
                     </div>
                   )}
@@ -4761,13 +4768,13 @@ export default function App() {
                     <div
                       style={{
                         width: "100%",
-                        padding: "10px 12px",
-                        borderRadius: 8,
+                        padding: "var(--s-2) var(--s-3)",
+                        borderRadius: "var(--radius-sm)",
                         background: "rgba(250, 204, 21, 0.12)",
                         border: "1px solid rgba(250, 204, 21, 0.35)",
                         color: "#facc15",
-                        fontSize: 13,
-                        marginBottom: 4,
+                        fontSize: "0.8125rem",
+                        marginBottom: "var(--s-1)",
                       }}
                     >
                       לא נטען תיק Polymarket — יתרה/שווי מוצגים כ־0. בדוק חיבור ל־CLOB. הגרף משקף עדיין עסקאות חי
@@ -4786,7 +4793,7 @@ export default function App() {
                       {statsLive && !livePortfolio?.ok ? "—" : `$${balance.toFixed(2)}`}
                     </strong>
                     {statsLive && livePortfolio?.ok && (
-                      <span style={{ fontSize: 10, color: "var(--muted)", marginInlineStart: 6 }}>(CLOB)</span>
+                      <span style={{ fontSize: "0.625rem", color: "var(--muted)", marginInlineStart: "var(--s-1)" }}>(CLOB)</span>
                     )}
                   </div>
                   <div className="stat-pill">
@@ -4795,7 +4802,7 @@ export default function App() {
                       {statsLive && !livePortfolio?.ok ? "—" : `$${equity.toFixed(2)}`}
                     </strong>
                     {statsLive && livePortfolio?.ok && (
-                      <span style={{ fontSize: 10, color: "var(--muted)", marginInlineStart: 6 }}>(Polymarket)</span>
+                      <span style={{ fontSize: "0.625rem", color: "var(--muted)", marginInlineStart: "var(--s-1)" }}>(Polymarket)</span>
                     )}
                   </div>
                   <div className="stat-pill">
@@ -4835,14 +4842,14 @@ export default function App() {
                     <div
                       style={{
                         width: "100%",
-                        padding: "10px 12px",
-                        borderRadius: 8,
+                        padding: "var(--s-2) var(--s-3)",
+                        borderRadius: "var(--radius-sm)",
                         background: "rgba(250, 204, 21, 0.10)",
                         border: "1px solid rgba(250, 204, 21, 0.30)",
                       }}
                       title="הדיוק הכיווני האמיתי נמדד מול resolved_outcome (האם הצד שנבחר באמת נפתר נכון), לא מול תווית ה-TP/רווח. זהו ה-ground-truth."
                     >
-                      <div style={{ fontSize: 13.5, fontWeight: 700 }}>
+                      <div style={{ fontSize: "0.84375rem", fontWeight: 700 }}>
                         דיוק כיווני אמיתי:{" "}
                         <strong
                           style={{
@@ -4864,7 +4871,7 @@ export default function App() {
                           {(accuracy.tp_win_rate_pct ?? winRate).toFixed(0)}%
                         </strong>
                       </div>
-                      <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 3 }}>
+                      <div style={{ fontSize: "0.6875rem", color: "var(--muted)", marginTop: "var(--s-1)" }}>
                         אחוז-הרווח הגבוה הוא ניצחונות-TP קטנים; הדיוק-הכיווני ≈ המחיר ההוגן = אין edge
                         {" "}(לפי {accuracy.n_resolved} עסקאות שנפתרו).
                       </div>
@@ -4876,15 +4883,8 @@ export default function App() {
                       {rr ? rr.toFixed(2) : "—"}
                     </strong>
                   </div>
-                  <button
-                    type="button"
-                    style={{
-                      padding: "10px 14px",
-                      borderRadius: 10,
-                      border: "none",
-                      background: "#334155",
-                      color: "#fff",
-                    }}
+                  <Button
+                    variant="danger"
                     onClick={async () => {
                       if (
                         !confirm(
@@ -4898,21 +4898,12 @@ export default function App() {
                     }}
                   >
                     איפוס נתוני סטטיסטיקה
-                  </button>
+                  </Button>
                   <a
+                    className="ui-btn ui-btn--primary"
                     href={engineUrl(statsLive ? "/api/demo/export.csv?live_only=true" : "/api/demo/export.csv")}
                     download={statsLive ? "live-trades.csv" : "demo-trades.csv"}
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      padding: "10px 14px",
-                      borderRadius: 10,
-                      background: "var(--accent)",
-                      color: "#fff",
-                      textDecoration: "none",
-                      fontWeight: 700,
-                    }}
+                    style={{ textDecoration: "none" }}
                   >
                     ייצוא CSV
                   </a>
@@ -4972,12 +4963,21 @@ export default function App() {
                   </div>
                 </ChartCard>
 
-                <h3 style={{ marginTop: 18 }}>
-                  היסטוריית עסקאות (בסשן הנוכחי{statsLive ? " — לייב בלבד" : ""})
-                </h3>
-                <p style={{ fontSize: 13, color: "var(--muted)", marginBottom: 8 }}>
-                  עמודת «תחילת חלון» מבוססת על שדה אורך החלון בכל עסקה (5 דק׳ / 15 דק׳). «עלות הכניסה» = מחיר ליחידה × חוזים בכניסה (ברוטו; העמלה בעמודה נפרדת). אחרי איפוס לוח או איפוס סטטיסטיקה מוצגות כאן רק עסקאות מההתחלה החדשה; הרשומות הישנות נשארות בקובץ לניתוח v3.
-                </p>
+                <div style={{ display: "flex", alignItems: "baseline", flexWrap: "wrap", gap: "var(--s-2)", marginTop: "var(--s-5)", marginBottom: "var(--s-2)" }}>
+                  <SectionTitle as="h3">
+                    היסטוריית עסקאות (בסשן הנוכחי{statsLive ? " — לייב בלבד" : ""})
+                  </SectionTitle>
+                  <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>
+                    «תחילת חלון» לפי אורך החלון (5 / 15 דק׳); «עלות הכניסה» = מחיר ליחידה × חוזים (ברוטו).
+                  </span>
+                </div>
+                <Collapsible title="על טבלת ההיסטוריה" subtitle="מה מוצג אחרי איפוס — ומה נשמר לניתוח v3">
+                  <p style={{ fontSize: "0.8125rem", color: "var(--muted)", margin: 0, lineHeight: 1.6 }}>
+                    עמודת «תחילת חלון» מבוססת על שדה אורך החלון בכל עסקה (5 דק׳ / 15 דק׳). «עלות הכניסה» = מחיר ליחידה × חוזים בכניסה (ברוטו; העמלה בעמודה נפרדת). אחרי איפוס לוח או איפוס סטטיסטיקה מוצגות כאן רק עסקאות מההתחלה החדשה; הרשומות הישנות נשארות בקובץ לניתוח v3.
+                  </p>
+                </Collapsible>
+                <div style={{ marginTop: "var(--s-3)" }} />
+
                 <TradesBySession
                   trades={trades}
                   logEntries={logEntries}
@@ -4999,41 +4999,92 @@ export default function App() {
       )}
 
       {tab === "help" && (
-        <Card padding="lg" style={{ lineHeight: 1.7 }}>
-          <SectionTitle as="h2">מילון מונחים ועזרה</SectionTitle>
-          <ul>
-            <li>
-              <strong>חוזה:</strong> יחידת המסחר ב־Polymarket; גודל מינימלי לפי כללי השוק (לרוב חמישה חוזים).
-            </li>
-            <li>
-              <strong>מחיר יעד לפתיחת החלון:</strong> ערך ה־BTC בתחילת החלון (כאן באמצעות שער עקיף); הרזולוציה הרשמית לפי Chainlink.
-            </li>
-            <li>
-              <strong>שוק BTC:</strong> ניתן לבחור חלון של <strong>חמש דקות</strong> —{" "}
-              <code>btc-updown-5m-{"{epoch}"}</code> — או <strong>חמש עשרה דקות</strong> —{" "}
-              <code>btc-updown-15m-{"{epoch}"}</code>.
-            </li>
-            <li>
-              <strong>סימולציה:</strong> ביצוע הזמנות וירטואליות מול ספר הזמנות בפועל, ללא רישום על גבי הבלוקצ׳יין.
-            </li>
-            <li>
-              <strong>מסחר חי:</strong> דורש התקנת py-clob-client ומפתח תקף; יש לעמוד בתנאי השימוש של Polymarket ובדיני המדינה החלים.
-            </li>
-            <li>
-              <strong>גידור:</strong> החזקה בו־זמנית בכיווני Up ו־Down; אינה שקולה לשורט במובן הקלאסי.
-            </li>
-          </ul>
-          <h3>תקלות נפוצות</h3>
-          <p>
-            אם לא נשלחה פקודה: ייתכן שנותר פחות מדקה לסיום החלון, או שהמחיר בבקשה לקנייה עולה על הגבול שהוגדר, או שאין
-            יתרה מספקת בחשבון הסימולציה.
-          </p>
-          <h3>הפעלה</h3>
-          <pre style={{ background: "var(--bg-elevated)", padding: 12, borderRadius: "var(--radius-sm)", border: "1px solid var(--border)" }}>
-            cd engine && pip install -r requirements.txt
-            cd .. && npm install && npm run dev
-          </pre>
-        </Card>
+        <div style={{ display: "grid", gap: "var(--s-4)", maxWidth: 1000, margin: "0 auto" }}>
+          <Card padding="lg">
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", marginBottom: "var(--s-2)" }}>
+              <span aria-hidden>📖</span>
+              <SectionTitle as="h3">מילון מונחים</SectionTitle>
+            </div>
+            <p style={{ fontSize: "0.8125rem", color: "var(--muted)", margin: "0 0 var(--s-4)" }}>
+              המונחים המרכזיים של המערכת — הסבר קצר לכל אחד.
+            </p>
+            <dl style={{ display: "grid", gap: "var(--s-3)", margin: 0 }}>
+              {[
+                {
+                  term: "חוזה",
+                  def: (
+                    <>יחידת המסחר ב־Polymarket; גודל מינימלי לפי כללי השוק (לרוב חמישה חוזים).</>
+                  ),
+                },
+                {
+                  term: "מחיר יעד לפתיחת החלון",
+                  def: (
+                    <>ערך ה־BTC בתחילת החלון (כאן באמצעות שער עקיף); הרזולוציה הרשמית לפי Chainlink.</>
+                  ),
+                },
+                {
+                  term: "שוק BTC",
+                  def: (
+                    <>
+                      ניתן לבחור חלון של <strong>חמש דקות</strong> — <code>btc-updown-5m-{"{epoch}"}</code> — או{" "}
+                      <strong>חמש עשרה דקות</strong> — <code>btc-updown-15m-{"{epoch}"}</code>.
+                    </>
+                  ),
+                },
+                {
+                  term: "סימולציה",
+                  def: (
+                    <>ביצוע הזמנות וירטואליות מול ספר הזמנות בפועל, ללא רישום על גבי הבלוקצ׳יין.</>
+                  ),
+                },
+                {
+                  term: "מסחר חי",
+                  def: (
+                    <>דורש התקנת py-clob-client ומפתח תקף; יש לעמוד בתנאי השימוש של Polymarket ובדיני המדינה החלים.</>
+                  ),
+                },
+                {
+                  term: "גידור",
+                  def: <>החזקה בו־זמנית בכיווני Up ו־Down; אינה שקולה לשורט במובן הקלאסי.</>,
+                },
+              ].map((row) => (
+                <div
+                  key={row.term}
+                  style={{
+                    background: "var(--bg-elevated)",
+                    border: "1px solid var(--border)",
+                    borderRadius: "var(--radius-md)",
+                    borderInlineStart: "3px solid var(--accent)",
+                    padding: "var(--s-3)",
+                  }}
+                >
+                  <dt style={{ fontWeight: 700, color: "var(--text)", marginBottom: "var(--s-1)" }}>{row.term}</dt>
+                  <dd style={{ margin: 0, fontSize: "0.875rem", color: "var(--text-secondary)", lineHeight: 1.6 }}>
+                    {row.def}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </Card>
+
+          <Card padding="lg">
+            <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", marginBottom: "var(--s-2)" }}>
+              <span aria-hidden>🛠️</span>
+              <SectionTitle as="h3">תקלות נפוצות</SectionTitle>
+            </div>
+            <p style={{ fontSize: "0.875rem", color: "var(--text-secondary)", margin: 0, lineHeight: 1.6 }}>
+              אם לא נשלחה פקודה: ייתכן שנותר פחות מדקה לסיום החלון, או שהמחיר בבקשה לקנייה עולה על הגבול שהוגדר, או שאין
+              יתרה מספקת בחשבון הסימולציה.
+            </p>
+          </Card>
+
+          <Collapsible title="הפעלה" subtitle="פקודות ההתקנה וההרצה המקומית" icon={<span aria-hidden>⚙️</span>}>
+            <pre style={{ background: "var(--bg-elevated)", padding: "var(--s-3)", borderRadius: "var(--radius-sm)", border: "1px solid var(--border)", margin: 0, color: "var(--text-secondary)" }}>
+              cd engine && pip install -r requirements.txt
+              cd .. && npm install && npm run dev
+            </pre>
+          </Collapsible>
+        </div>
       )}
       {tab === "tips_v2" && <TipsV2 />}
       {tab === "analytics_v3" && <AnalyticsV3 />}

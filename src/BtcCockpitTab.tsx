@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, isPageHidden } from "./api";
+import { Card } from "./ui/Card";
+import { SectionTitle } from "./ui/SectionTitle";
+import { Button } from "./ui/Button";
+import { Collapsible } from "./ui/Collapsible";
 
 /**
  * BtcCockpitTab — "קוקפיט מסחר ידני" for the owner's REAL Binance USDⓈ-M Futures account.
@@ -137,14 +141,14 @@ function fmtTime(ts: number | null | undefined): string {
   }
 }
 function pnlColor(v: number | null | undefined): string {
-  if (v == null || !Number.isFinite(v)) return "var(--muted,#94a3b8)";
-  return v >= 0 ? "#6ee7b7" : "#fca5a5";
+  if (v == null || !Number.isFinite(v)) return "var(--muted)";
+  return v >= 0 ? "var(--up)" : "var(--down)";
 }
 function sideColor(side: string | null | undefined): string {
   const s = String(side || "").toLowerCase();
-  if (s === "long" || s === "buy") return "#6ee7b7";
-  if (s === "short" || s === "sell") return "#fca5a5";
-  return "#e2e8f0";
+  if (s === "long" || s === "buy") return "var(--up)";
+  if (s === "short" || s === "sell") return "var(--down)";
+  return "var(--text)";
 }
 function sideLabel(side: string | null | undefined): string {
   const s = String(side || "").toLowerCase();
@@ -176,17 +180,17 @@ function Bar({ label, value, max, danger, color }: {
   const pct = Math.max(0, Math.min(100, (Math.abs(value) / (max || 1)) * 100));
   return (
     <div style={{ flex: "1 1 160px", minWidth: 150 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 4 }}>
-        <span style={{ color: "var(--muted,#94a3b8)", fontWeight: 700 }}>{label}</span>
-        <span style={{ color: danger ? "#fca5a5" : color, fontWeight: 700 }}>{value.toFixed(2)}%</span>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: "var(--s-1)" }}>
+        <span style={{ color: "var(--muted)", fontWeight: 700 }}>{label}</span>
+        <span style={{ color: danger ? "var(--down)" : color, fontWeight: 700 }}>{value.toFixed(2)}%</span>
       </div>
-      <div style={{ height: 8, borderRadius: 999, background: "#1e293b", overflow: "hidden" }}>
+      <div style={{ height: 8, borderRadius: 999, background: "var(--bg-elevated)", overflow: "hidden" }}>
         <div style={{
           width: `${pct}%`, height: "100%", borderRadius: 999,
-          background: danger ? "#dc2626" : color, transition: "width .3s",
+          background: danger ? "var(--down)" : color, transition: "width .3s",
         }} />
       </div>
-      <div style={{ fontSize: 11, color: "var(--muted,#64748b)", marginTop: 2 }}>סף: {max}%</div>
+      <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>סף: {max}%</div>
     </div>
   );
 }
@@ -418,32 +422,29 @@ export default function BtcCockpitTab() {
   const ledgerRows = ledger.slice(0, 40);
 
   return (
-    <div dir="rtl" style={{ padding: "4px 2px 40px", maxWidth: 1000, margin: "0 auto" }}>
+    <div dir="rtl" style={{ display: "grid", gap: "var(--s-4)", padding: "4px 2px 40px", maxWidth: 1000, margin: "0 auto" }}>
       {/* ── Header ── */}
-      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: "var(--s-2)" }}>
         <div>
-          <h2 style={{ margin: 0, fontSize: 24, fontWeight: 800, letterSpacing: "-0.02em" }}>
-            ₿ קוקפיט מסחר ידני — Binance Futures
-          </h2>
-          <p style={{ margin: "4px 0 0", color: "var(--muted,#94a3b8)", fontSize: 13 }}>
-            אתה מקבל כל החלטה. התפקיד של הכלי הוא <b>אכיפת בטיחות ושקיפות</b> — לא בוט אוטומטי ולא הבטחת רווח.
-            כל פקודה עוברת דרך שער הסיכון, סטופ-לוס תמיד מוצמד ומאומת בבורסה, ויש תקרות הפסד יומית/כוללת.
+          <SectionTitle as="h2">₿ קוקפיט מסחר ידני — Binance Futures</SectionTitle>
+          <p style={{ margin: "var(--s-1) 0 0", color: "var(--muted)", fontSize: "0.8125rem" }}>
+            אתה מקבל כל החלטה — הכלי אוכף בטיחות ושקיפות בלבד, לא בוט אוטומטי ולא הבטחת רווח.
           </p>
         </div>
-        <button type="button" onClick={() => void refreshAll()} style={btnStyle()}>↻ רענן</button>
+        <Button variant="ghost" onClick={() => void refreshAll()}>↻ רענן</Button>
       </div>
 
       {/* ── Live / testnet banner ── */}
       <div style={{
-        marginTop: 14, padding: "10px 14px", borderRadius: 12, display: "flex",
-        alignItems: "center", gap: 10, flexWrap: "wrap",
-        background: isLive ? "#7f1d1d22" : "#1e3a5f22",
-        border: `1px solid ${isLive ? "#7f1d1d" : "#1e3a5f"}`,
+        padding: "var(--s-3) var(--s-4)", borderRadius: "var(--radius-md)", display: "flex",
+        alignItems: "center", gap: "var(--s-3)", flexWrap: "wrap",
+        background: isLive ? "var(--down-muted)" : "var(--accent-muted)",
+        border: `1px solid ${isLive ? "var(--down)" : "var(--accent)"}`,
       }}>
         {isLive
-          ? <Pill color="#fecaca" bg="#7f1d1d">🔴 לייב — כסף אמיתי</Pill>
-          : <Pill color="#93c5fd" bg="#1e3a5f">🧪 TESTNET — בלי כסף אמיתי</Pill>}
-        <span style={{ fontSize: 13, color: "#cbd5e1" }}>
+          ? <Pill color="var(--down)" bg="var(--down-muted)">🔴 לייב — כסף אמיתי</Pill>
+          : <Pill color="var(--accent-bright)" bg="var(--accent-muted)">🧪 TESTNET — בלי כסף אמיתי</Pill>}
+        <span style={{ fontSize: "0.8125rem", color: "var(--text-secondary)" }}>
           {isLive
             ? "פקודות שתבצע ירוצו על החשבון האמיתי שלך."
             : (live?.reason_blocked ?? "לייב כבוי — פקודות ירוצו על TESTNET בלבד.")}
@@ -451,48 +452,70 @@ export default function BtcCockpitTab() {
       </div>
 
       {stateErr && (
-        <div style={{ marginTop: 12, color: "#fecaca", background: "#7f1d1d33", padding: 12, borderRadius: 10, fontSize: 13 }}>
+        <div style={{ color: "var(--down)", background: "var(--down-muted)", padding: "var(--s-3)", borderRadius: "var(--radius-sm)", fontSize: "0.8125rem", border: "1px solid var(--down)" }}>
           שגיאת קריאה מהבורסה: {stateErr}
         </div>
       )}
 
       {/* ── Account header card ── */}
-      <div style={cardStyle()}>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 18, alignItems: "flex-end" }}>
+      <Card padding="md">
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", marginBottom: "var(--s-3)", flexWrap: "wrap" }}>
+          <span aria-hidden>💼</span>
+          <SectionTitle as="h3" className="section-title--reset">חשבון</SectionTitle>
+          <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>יתרה זמינה ומרחק מתקרות ההפסד</span>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-5)", alignItems: "flex-end" }}>
           <div>
             <div style={labelStyle()}>יתרה (USDT)</div>
-            <div style={{ fontSize: 28, fontWeight: 800, lineHeight: 1.1 }}>{fmtUsd(equity)}</div>
+            <div style={{ fontSize: "1.75rem", fontWeight: 800, lineHeight: 1.1, fontVariantNumeric: "tabular-nums" }}>{fmtUsd(equity)}</div>
           </div>
           <div style={{ flex: 1 }} />
           {/* loss-cap bars */}
-          <Bar label="הפסד יומי" value={0} max={3} danger={!!caps && !caps.allow_new} color="#f59e0b" />
-          <Bar label="ירידה כוללת" value={0} max={10} danger={!!caps?.halt} color="#a855f7" />
+          <Bar label="הפסד יומי" value={0} max={3} danger={!!caps && !caps.allow_new} color="var(--live)" />
+          <Bar label="ירידה כוללת" value={0} max={10} danger={!!caps?.halt} color="var(--accent)" />
         </div>
         {caps && !caps.allow_new && (
-          <div style={{ marginTop: 10, fontSize: 13, color: "#fca5a5", fontWeight: 700 }}>
+          <div style={{ marginTop: "var(--s-3)", fontSize: "0.8125rem", color: "var(--down)", fontWeight: 700 }}>
             ⛔ תקרת הפסד הופעלה — אין כניסות חדשות. {caps.reason}
           </div>
         )}
-      </div>
+      </Card>
+
+      {/* ── How safety works (long explanation, collapsed by default) ── */}
+      <Collapsible
+        title="איך הבטיחות עובדת"
+        subtitle="מה הכלי אוכף מאחורי הקלעים לפני ואחרי כל פקודה"
+        icon="🛡️"
+      >
+        <p style={{ margin: 0, color: "var(--text-secondary)", fontSize: "0.8125rem", lineHeight: 1.7 }}>
+          התפקיד של הכלי הוא <b>אכיפת בטיחות ושקיפות</b> — לא בוט אוטומטי ולא הבטחת רווח.
+          כל פקודה עוברת דרך שער הסיכון (gate_order), שהוא מסלול האישור היחיד.
+          סטופ-לוס תמיד מוצמד בבורסה ומאומת אחרי הביצוע — אם הסטופ לא אומת, מנגנון
+          הגנת פוזיציה חשופה סוגר את הפוזיציה אוטומטית. יש תקרות הפסד יומית וכוללת
+          שחוסמות כניסות חדשות, וכפתור הביצוע נפתח רק כשהתצוגה המקדימה מאושרת וכל
+          בדיקות הבטיחות ירוקות.
+        </p>
+      </Collapsible>
 
       {/* ── Current position card ── */}
-      <div style={cardStyle()}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: hasOpenPosition ? 12 : 0, flexWrap: "wrap" }}>
-          <div style={{ fontSize: 16, fontWeight: 800 }}>פוזיציה נוכחית · {state?.symbol ?? symbol}</div>
+      <Card padding="md">
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", marginBottom: hasOpenPosition ? "var(--s-4)" : 0, flexWrap: "wrap" }}>
+          <span aria-hidden>📈</span>
+          <SectionTitle as="h3" className="section-title--reset">פוזיציה נוכחית · {state?.symbol ?? symbol}</SectionTitle>
           {hasOpenPosition
-            ? <Pill color={sideColor(pos?.side)} bg="#0b1220">{sideLabel(pos?.side)}</Pill>
-            : <span style={{ fontSize: 13, color: "var(--muted,#94a3b8)" }}>אין פוזיציה פתוחה</span>}
+            ? <Pill color={sideColor(pos?.side)} bg="var(--bg-elevated)">{sideLabel(pos?.side)}</Pill>
+            : <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>אין פוזיציה פתוחה</span>}
         </div>
 
         {hasOpenPosition && (
           <>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "10px 26px" }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-3)" }}>
               <Stat label="כמות" value={fmtNum(pos?.qty)} />
               <Stat label="כניסה" value={fmtPrice(pos?.entry_price)} />
               <Stat label="מינוף" value={pos?.leverage != null ? `×${pos.leverage}` : "—"} />
-              <Stat label="ליקווידציה" value={fmtPrice(state?.liquidation_price)} valueColor="#fca5a5" />
+              <Stat label="ליקווידציה" value={fmtPrice(state?.liquidation_price)} valueColor="var(--down)" />
               <Stat label="P&L ברוטו" value={fmtUsd(grossUpnl)} valueColor={pnlColor(grossUpnl)} />
-              <Stat label="עמלות (אומדן)" value={feeEst != null ? `-${fmtUsd(feeEst).replace("-", "")}` : "—"} valueColor="#fca5a5" />
+              <Stat label="עמלות (אומדן)" value={feeEst != null ? `-${fmtUsd(feeEst).replace("-", "")}` : "—"} valueColor="var(--down)" />
               <Stat label="P&L נטו" value={fmtUsd(netUpnl)} valueColor={pnlColor(netUpnl)} big />
             </div>
             <button
@@ -500,9 +523,9 @@ export default function BtcCockpitTab() {
               onClick={() => void doClose()}
               disabled={closing}
               style={{
-                marginTop: 14, width: "100%", padding: "14px 16px", borderRadius: 12,
-                border: "1px solid #7f1d1d", background: "#dc2626", color: "#fff",
-                fontSize: 17, fontWeight: 800, cursor: closing ? "wait" : "pointer",
+                marginTop: "var(--s-4)", width: "100%", padding: "14px 16px", borderRadius: "var(--radius-md)",
+                border: "1px solid var(--down)", background: "var(--down)", color: "#fff",
+                fontSize: "1.0625rem", fontWeight: 800, cursor: closing ? "wait" : "pointer",
                 opacity: closing ? 0.7 : 1,
               }}
             >
@@ -510,24 +533,28 @@ export default function BtcCockpitTab() {
             </button>
           </>
         )}
-      </div>
+      </Card>
 
       {/* ── Manual trade panel ── */}
-      <div style={cardStyle()}>
-        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 12 }}>פאנל מסחר ידני</div>
+      <Card padding="md">
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", marginBottom: "var(--s-4)", flexWrap: "wrap" }}>
+          <span aria-hidden>🎯</span>
+          <SectionTitle as="h3" className="section-title--reset">פאנל מסחר ידני</SectionTitle>
+          <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>בחר כיוון, מלא פרטים, הרץ תצוגה מקדימה — ואז בצע</span>
+        </div>
 
         {/* LONG / SHORT */}
-        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <div style={{ display: "flex", gap: "var(--s-2)", marginBottom: "var(--s-3)" }}>
           {(["long", "short"] as const).map((s) => (
             <button
               key={s}
               type="button"
               onClick={() => { setSide(s); invalidatePreview(); }}
               style={{
-                flex: 1, padding: "12px", borderRadius: 10, fontSize: 15, fontWeight: 800, cursor: "pointer",
-                border: `1px solid ${side === s ? (s === "long" ? "#065f46" : "#7f1d1d") : "#1e293b"}`,
-                background: side === s ? (s === "long" ? "#065f46" : "#7f1d1d") : "var(--card,#0f172a)",
-                color: side === s ? "#fff" : (s === "long" ? "#6ee7b7" : "#fca5a5"),
+                flex: 1, padding: "var(--s-3)", borderRadius: "var(--radius-sm)", fontSize: "0.9375rem", fontWeight: 800, cursor: "pointer",
+                border: `1px solid ${side === s ? (s === "long" ? "var(--up)" : "var(--down)") : "var(--border)"}`,
+                background: side === s ? (s === "long" ? "var(--up-muted)" : "var(--down-muted)") : "var(--card)",
+                color: side === s ? (s === "long" ? "var(--up)" : "var(--down)") : (s === "long" ? "var(--up)" : "var(--down)"),
               }}
             >
               {s === "long" ? "▲ לונג" : "▼ שורט"}
@@ -535,7 +562,7 @@ export default function BtcCockpitTab() {
           ))}
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "var(--s-3)" }}>
           <Field label="סימבול">
             <input value={symbol} onChange={(e) => { setSymbol(e.target.value.toUpperCase()); invalidatePreview(); }} style={inputStyle()} />
           </Field>
@@ -566,45 +593,45 @@ export default function BtcCockpitTab() {
           onClick={() => void doPreview()}
           disabled={previewing}
           style={{
-            marginTop: 14, width: "100%", padding: "12px", borderRadius: 10,
-            border: "1px solid #1e3a5f", background: "#1d4ed8", color: "#fff",
-            fontSize: 15, fontWeight: 800, cursor: previewing ? "wait" : "pointer", opacity: previewing ? 0.7 : 1,
+            marginTop: "var(--s-4)", width: "100%", padding: "var(--s-3)", borderRadius: "var(--radius-sm)",
+            border: "1px solid var(--accent)", background: "var(--accent)", color: "var(--text-on-accent)",
+            fontSize: "0.9375rem", fontWeight: 800, cursor: previewing ? "wait" : "pointer", opacity: previewing ? 0.7 : 1,
           }}
         >
           {previewing ? "מחשב תצוגה מקדימה…" : "🔍 תצוגה מקדימה + בדיקות בטיחות"}
         </button>
 
         {previewErr && (
-          <div style={{ marginTop: 10, color: "#fecaca", background: "#7f1d1d33", padding: 10, borderRadius: 10, fontSize: 13 }}>
+          <div style={{ marginTop: "var(--s-3)", color: "var(--down)", background: "var(--down-muted)", padding: "var(--s-3)", borderRadius: "var(--radius-sm)", fontSize: "0.8125rem", border: "1px solid var(--down)" }}>
             {previewErr}
           </div>
         )}
 
         {/* ── Preview output ── */}
         {preview && (
-          <div style={{ marginTop: 14, borderRadius: 12, background: "#0b1220", border: "1px solid #1e293b", padding: 14 }}>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: "10px 24px", marginBottom: 12 }}>
+          <div style={{ marginTop: "var(--s-4)", borderRadius: "var(--radius-md)", background: "var(--bg-elevated)", border: "1px solid var(--border)", padding: "var(--s-4)" }}>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-3)", marginBottom: "var(--s-4)" }}>
               <Stat label="כמות" value={fmtNum(preview.qty)} />
               <Stat label="נפח עסקה" value={fmtUsd(preview.notional)} />
               <Stat label="סיכון בפועל" value={fmtUsd(preview.risk_dollars)} />
               <Stat label="מינוף" value={preview.leverage != null ? `×${Number(preview.leverage).toFixed(1)}` : "—"} />
               <Stat label="יחס R:R" value={preview.rr != null ? `${Number(preview.rr).toFixed(2)}` : "—"} />
-              <Stat label="עמלות (סבב)" value={fmtUsd(preview.fee_est)} valueColor="#fca5a5" />
-              <Stat label="סליפג' (אומדן)" value={fmtUsd(preview.slippage_est)} valueColor="#fca5a5" />
-              <Stat label="ליקווידציה" value={fmtPrice(preview.liquidation_price)} valueColor="#fca5a5" />
+              <Stat label="עמלות (סבב)" value={fmtUsd(preview.fee_est)} valueColor="var(--down)" />
+              <Stat label="סליפג' (אומדן)" value={fmtUsd(preview.slippage_est)} valueColor="var(--down)" />
+              <Stat label="ליקווידציה" value={fmtPrice(preview.liquidation_price)} valueColor="var(--down)" />
               <Stat label="יעד נטו" value={fmtUsd(preview.net_target)} valueColor={pnlColor(preview.net_target)} />
               <Stat label="הפסד בסטופ (נטו)" value={fmtUsd(preview.net_if_stopped)} valueColor={pnlColor(preview.net_if_stopped)} />
             </div>
 
             {/* safety checks — ✅/❌ each */}
-            <div style={{ fontSize: 13, fontWeight: 800, color: "#93c5fd", marginBottom: 6 }}>בדיקות בטיחות</div>
-            <div style={{ display: "grid", gap: 5 }}>
+            <div style={{ fontSize: "0.8125rem", fontWeight: 800, color: "var(--accent-bright)", marginBottom: "var(--s-2)" }}>בדיקות בטיחות</div>
+            <div style={{ display: "grid", gap: "var(--s-1)" }}>
               {(preview.checks ?? []).map((c) => (
-                <div key={c.name} style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 13 }}>
+                <div key={c.name} style={{ display: "flex", gap: "var(--s-2)", alignItems: "flex-start", fontSize: "0.8125rem" }}>
                   <span style={{ flexShrink: 0 }}>{c.ok ? "✅" : "❌"}</span>
-                  <span style={{ color: c.ok ? "#cbd5e1" : "#fca5a5", fontWeight: c.ok ? 600 : 700 }}>
+                  <span style={{ color: c.ok ? "var(--text-secondary)" : "var(--down)", fontWeight: c.ok ? 600 : 700 }}>
                     {checkLabel(c.name)}
-                    {c.reason ? <span style={{ color: "var(--muted,#94a3b8)", fontWeight: 400 }}> — {c.reason}</span> : null}
+                    {c.reason ? <span style={{ color: "var(--muted)", fontWeight: 400 }}> — {c.reason}</span> : null}
                   </span>
                 </div>
               ))}
@@ -612,10 +639,10 @@ export default function BtcCockpitTab() {
 
             {/* overall verdict */}
             <div style={{
-              marginTop: 12, padding: "8px 12px", borderRadius: 10, fontSize: 14, fontWeight: 800,
-              color: preview.approved && allChecksGreen ? "#6ee7b7" : "#fca5a5",
-              background: preview.approved && allChecksGreen ? "#065f4633" : "#7f1d1d33",
-              border: `1px solid ${preview.approved && allChecksGreen ? "#065f46" : "#7f1d1d"}`,
+              marginTop: "var(--s-4)", padding: "var(--s-2) var(--s-3)", borderRadius: "var(--radius-sm)", fontSize: "0.875rem", fontWeight: 800,
+              color: preview.approved && allChecksGreen ? "var(--up)" : "var(--down)",
+              background: preview.approved && allChecksGreen ? "var(--up-muted)" : "var(--down-muted)",
+              border: `1px solid ${preview.approved && allChecksGreen ? "var(--up)" : "var(--down)"}`,
             }}>
               {preview.approved && allChecksGreen
                 ? "✅ כל הבדיקות עברו — מותר לבצע"
@@ -628,17 +655,17 @@ export default function BtcCockpitTab() {
               onClick={() => void doExecute()}
               disabled={!canExecute}
               style={{
-                marginTop: 12, width: "100%", padding: "15px 16px", borderRadius: 12,
-                border: `1px solid ${canExecute ? "#065f46" : "#1e293b"}`,
-                background: canExecute ? "#16a34a" : "#1e293b",
-                color: canExecute ? "#fff" : "#64748b",
-                fontSize: 17, fontWeight: 800, cursor: canExecute ? "pointer" : "not-allowed",
+                marginTop: "var(--s-4)", width: "100%", padding: "15px 16px", borderRadius: "var(--radius-md)",
+                border: `1px solid ${canExecute ? "var(--up)" : "var(--border)"}`,
+                background: canExecute ? "var(--up)" : "var(--bg-elevated)",
+                color: canExecute ? "#fff" : "var(--muted)",
+                fontSize: "1.0625rem", fontWeight: 800, cursor: canExecute ? "pointer" : "not-allowed",
               }}
             >
               {executing ? "מבצע…" : (isLive ? "בצע עסקה (כסף אמיתי)" : "בצע עסקה (TESTNET)")}
             </button>
             {!canExecute && (
-              <div style={{ fontSize: 12, color: "var(--muted,#94a3b8)", marginTop: 6, textAlign: "center" }}>
+              <div style={{ fontSize: 12, color: "var(--muted)", marginTop: "var(--s-2)", textAlign: "center" }}>
                 הכפתור נפתח רק כשהתצוגה המקדימה מאושרת וכל הבדיקות ירוקות.
               </div>
             )}
@@ -648,47 +675,51 @@ export default function BtcCockpitTab() {
         {/* trade result message */}
         {tradeMsg && (
           <div style={{
-            marginTop: 12, padding: 12, borderRadius: 10, fontSize: 14, fontWeight: 700,
-            color: tradeMsg.kind === "ok" ? "#6ee7b7" : tradeMsg.kind === "warn" ? "#fde68a" : "#fca5a5",
-            background: tradeMsg.kind === "ok" ? "#065f4633" : tradeMsg.kind === "warn" ? "#713f1233" : "#7f1d1d33",
-            border: `1px solid ${tradeMsg.kind === "ok" ? "#065f46" : tradeMsg.kind === "warn" ? "#713f12" : "#7f1d1d"}`,
+            marginTop: "var(--s-3)", padding: "var(--s-3)", borderRadius: "var(--radius-sm)", fontSize: "0.875rem", fontWeight: 700,
+            color: tradeMsg.kind === "ok" ? "var(--up)" : tradeMsg.kind === "warn" ? "#fde68a" : "var(--down)",
+            background: tradeMsg.kind === "ok" ? "var(--up-muted)" : tradeMsg.kind === "warn" ? "#713f1233" : "var(--down-muted)",
+            border: `1px solid ${tradeMsg.kind === "ok" ? "var(--up)" : tradeMsg.kind === "warn" ? "#713f12" : "var(--down)"}`,
           }}>
             {tradeMsg.text}
           </div>
         )}
-      </div>
+      </Card>
 
       {/* ── Recent trades (sidecar ledger) ── */}
-      <div style={cardStyle()}>
-        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 10 }}>עסקאות אחרונות (ספר ביקורת)</div>
+      <Card padding="md">
+        <div style={{ display: "flex", alignItems: "center", gap: "var(--s-2)", marginBottom: "var(--s-3)", flexWrap: "wrap" }}>
+          <span aria-hidden>🧾</span>
+          <SectionTitle as="h3" className="section-title--reset">עסקאות אחרונות</SectionTitle>
+          <span style={{ fontSize: "0.8125rem", color: "var(--muted)" }}>ספר ביקורת — כניסות, יציאות ותקלות</span>
+        </div>
         {ledgerRows.length === 0 ? (
-          <div style={{ padding: 24, textAlign: "center", color: "var(--muted,#94a3b8)", border: "1px dashed #1e293b", borderRadius: 12 }}>
+          <div style={{ padding: "var(--s-5)", textAlign: "center", color: "var(--muted)", border: "1px dashed var(--border)", borderRadius: "var(--radius-md)" }}>
             אין עדיין רישומים
           </div>
         ) : (
-          <div style={{ display: "grid", gap: 6 }}>
+          <div style={{ display: "grid", gap: "var(--s-2)" }}>
             {ledgerRows.map((r) => {
               const isFault = r.event === "fault";
               const isExit = r.event === "exit";
-              const accent = isFault ? "#7f1d1d" : isExit ? "#334155" : "#065f46";
+              const accent = isFault ? "var(--down)" : isExit ? "var(--border-strong)" : "var(--up)";
               const eventLabel = isFault ? "תקלה" : isExit ? "יציאה" : "כניסה";
               return (
                 <div key={r.id} style={{
-                  display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap",
-                  padding: "9px 12px", borderRadius: 10, background: "#0b1220",
-                  border: "1px solid #1e293b", borderInlineStart: `4px solid ${accent}`, overflowX: "auto",
+                  display: "flex", gap: "var(--s-3)", alignItems: "center", flexWrap: "wrap",
+                  padding: "9px var(--s-3)", borderRadius: "var(--radius-sm)", background: "var(--bg-elevated)",
+                  border: "1px solid var(--border)", borderInlineStart: `4px solid ${accent}`, overflowX: "auto",
                 }}>
-                  <Pill color="#cbd5e1" bg={accent}>{eventLabel}</Pill>
-                  <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>{fmtTime(r.ts)}</span>
-                  <span style={{ fontSize: 12, color: "#e2e8f0", whiteSpace: "nowrap" }}>{r.symbol ?? "—"}</span>
+                  <Pill color="var(--text-secondary)" bg="var(--card)">{eventLabel}</Pill>
+                  <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>{fmtTime(r.ts)}</span>
+                  <span style={{ fontSize: 12, color: "var(--text)", whiteSpace: "nowrap" }}>{r.symbol ?? "—"}</span>
                   {r.side && <span style={{ fontSize: 12, fontWeight: 800, color: sideColor(r.side), whiteSpace: "nowrap" }}>{sideLabel(r.side)}</span>}
-                  {r.qty != null && <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>×{fmtNum(r.qty)}</span>}
-                  {r.entry_price != null && <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>כניסה {fmtPrice(r.entry_price)}</span>}
-                  {r.exit_price != null && <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>יציאה {fmtPrice(r.exit_price)}</span>}
-                  {r.stop_price != null && <span style={{ fontSize: 12, color: "var(--muted,#94a3b8)", whiteSpace: "nowrap" }}>סטופ {fmtPrice(r.stop_price)}</span>}
-                  {r.fee != null && <span style={{ fontSize: 12, color: "#fca5a5", whiteSpace: "nowrap" }}>עמלה {fmtUsd(r.fee)}</span>}
+                  {r.qty != null && <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>×{fmtNum(r.qty)}</span>}
+                  {r.entry_price != null && <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>כניסה {fmtPrice(r.entry_price)}</span>}
+                  {r.exit_price != null && <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>יציאה {fmtPrice(r.exit_price)}</span>}
+                  {r.stop_price != null && <span style={{ fontSize: 12, color: "var(--muted)", whiteSpace: "nowrap" }}>סטופ {fmtPrice(r.stop_price)}</span>}
+                  {r.fee != null && <span style={{ fontSize: 12, color: "var(--down)", whiteSpace: "nowrap" }}>עמלה {fmtUsd(r.fee)}</span>}
                   {r.event === "entry" && (
-                    <span style={{ fontSize: 12, color: r.stop_verified ? "#6ee7b7" : "#fca5a5", whiteSpace: "nowrap" }}>
+                    <span style={{ fontSize: 12, color: r.stop_verified ? "var(--up)" : "var(--down)", whiteSpace: "nowrap" }}>
                       {r.stop_verified ? "סטופ אומת ✅" : "סטופ לא אומת ❌"}
                     </span>
                   )}
@@ -703,19 +734,26 @@ export default function BtcCockpitTab() {
             })}
           </div>
         )}
-      </div>
+      </Card>
     </div>
   );
 }
 
 // ── small layout helpers ─────────────────────────────────────────────────────
+// Standard stat tile: label + big value, on an elevated bordered surface.
 function Stat({ label, value, valueColor, big }: {
   label: string; value: string; valueColor?: string; big?: boolean;
 }) {
   return (
-    <div>
-      <div style={labelStyle()}>{label}</div>
-      <div style={{ fontSize: big ? 20 : 15, fontWeight: 800, color: valueColor ?? "#e2e8f0", lineHeight: 1.2 }}>{value}</div>
+    <div style={{
+      background: "var(--bg-elevated)", border: "1px solid var(--border)",
+      borderRadius: "var(--radius-md)", padding: "var(--s-3)", minWidth: 110,
+    }}>
+      <div style={{ fontSize: "0.75rem", color: "var(--muted)", fontWeight: 600, marginBottom: "var(--s-1)" }}>{label}</div>
+      <div style={{
+        fontSize: big ? "1.5rem" : "1.125rem", fontWeight: 700,
+        color: valueColor ?? "var(--text)", lineHeight: 1.2, fontVariantNumeric: "tabular-nums",
+      }}>{value}</div>
     </div>
   );
 }
@@ -729,24 +767,12 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function cardStyle(): React.CSSProperties {
-  return {
-    marginTop: 14, padding: 16, borderRadius: 12,
-    background: "var(--card,#0f172a)", border: "1px solid #1e293b",
-  };
-}
 function labelStyle(): React.CSSProperties {
-  return { fontSize: 12, color: "var(--muted,#94a3b8)", fontWeight: 700, marginBottom: 3 };
+  return { fontSize: "0.75rem", color: "var(--muted)", fontWeight: 600, marginBottom: "var(--s-1)" };
 }
 function inputStyle(): React.CSSProperties {
   return {
-    width: "100%", boxSizing: "border-box", padding: "9px 10px", borderRadius: 9,
-    border: "1px solid #1e293b", background: "#0b1220", color: "#e2e8f0", fontSize: 14,
-  };
-}
-function btnStyle(bg?: string): React.CSSProperties {
-  return {
-    padding: "7px 12px", borderRadius: 9, border: "1px solid #1e293b",
-    background: bg ?? "var(--card,#0f172a)", color: "#e2e8f0", fontSize: 13, fontWeight: 600, cursor: "pointer",
+    width: "100%", boxSizing: "border-box", padding: "9px 10px", borderRadius: "var(--radius-sm)",
+    border: "1px solid var(--border-strong)", background: "var(--bg-elevated)", color: "var(--text)", fontSize: 14,
   };
 }
