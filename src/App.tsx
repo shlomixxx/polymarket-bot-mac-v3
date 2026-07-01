@@ -4075,7 +4075,8 @@ export default function App() {
                 />
               </label>
               <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.55 }}>
-                חל על לולאת האסטרטגיה הראשית בלבד (לא Trigger Trader). סיכון מוגבר ליתרה — השתמש בתקרה וביתרה מתאימה.
+                חל על לולאת האסטרטגיה הראשית בלבד (לא Trigger Trader). <strong>אין יותר תקרת ×3 קבועה — התקרה שתגדיר כאן היא הגבול.</strong>{" "}
+                הגנה יחידה שנשארת: כניסה בודדת לעולם לא תעבור 25% מהיתרה. סיכון מוגבר ליתרה — בחר תקרה ויתרה מתאימה.
               </div>
             </div>
             <div
@@ -4430,7 +4431,7 @@ export default function App() {
                   </div>
                 ) : (
                   <div style={{ marginTop: 8, fontSize: 12, color: "var(--muted)" }}>
-                    ההכפלה נשלטת בקטע «שחזור אחרי הפסד» למטה (תקרה בטוחה עד ×3). כרגע: מקס ×{lossRecoveryMaxMult}, צעד {lossRecoveryStepPct}%.
+                    ההכפלה נשלטת בקטע «שחזור אחרי הפסד» למטה (התקרה = מה שתגדיר, בלי מגבלת ×3). כרגע: מקס ×{lossRecoveryMaxMult}, צעד {lossRecoveryStepPct}%.
                   </div>
                 )}
               </>

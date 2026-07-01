@@ -1543,7 +1543,7 @@ class ConfigBody(BaseModel):
     loss_recovery_enabled: bool = False
     loss_recovery_step_pct: float = 20.0
     loss_recovery_every_n_losses: int = 1
-    loss_recovery_max_multiplier: float = 3.0  # = HARD_MAX_LOSS_RECOVERY_MULT (incident 2026-06-15) — not 100000
+    loss_recovery_max_multiplier: float = 3.0  # user-set cap (no fixed ×3 hard cap anymore); default is conservative
     # ביצוע מובטח: "limit" (ברירת מחדל, תאימות לאחור) או "market" (FOK/FAK)
     order_mode: str = "limit"
     entry_slippage_pct: float = 2.0

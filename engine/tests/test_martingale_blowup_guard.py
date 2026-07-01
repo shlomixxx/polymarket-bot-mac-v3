@@ -27,18 +27,35 @@ def _runner(balance_usd: float = 1000.0) -> StrategyRunner:
     return StrategyRunner(eng)
 
 
-# ── (a) תקרת-הברזל ב-sizing: מכפיל 1525 בסטייט → effective = base × 3, לא base × 1525 ──
-def test_hard_ceiling_caps_sizing_at_3x():
+# ── (a) sizing נחסם ע"י המכפיל שהמשתמש הגדיר (config) — לא ע"י תקרת-ברזל קבועה של ×3 ──
+def test_sizing_capped_by_user_config_multiplier():
     r = _runner()
     cfg = StrategyConfig(
         investment_usd=20.0,
         loss_recovery_enabled=True,
-        loss_recovery_max_multiplier=100000.0,  # ה-config המסוכן מה-incident
+        loss_recovery_max_multiplier=50.0,  # המשתמש הגדיר תקרה 50×
     )
-    r.demo.state.loss_recovery_multiplier = 1525.0  # ה-state שטיפס בפרוד
+    r.demo.state.loss_recovery_multiplier = 1525.0  # גם אם ה-state התקלקל ל-1525×
     eff = r._effective_investment_usd(cfg)
-    assert eff == pytest.approx(20.0 * HARD_MAX_LOSS_RECOVERY_MULT)  # 60, לא 30500
-    assert eff == pytest.approx(60.0)
+    assert eff == pytest.approx(20.0 * 50.0)  # נחסם ל-config (50×), לא ל-1525× ולא ל-3×
+
+
+def test_config_multiplier_above_3_is_honored():
+    # התיקון: תקרת ×3 הישנה בוטלה — המכפיל שהמשתמש מגדיר נכבד (לא נחסם ל-3)
+    r = _runner()
+    cfg = StrategyConfig(investment_usd=20.0, loss_recovery_enabled=True,
+                         loss_recovery_max_multiplier=20.0)
+    r.demo.state.loss_recovery_multiplier = 20.0
+    assert r._effective_investment_usd(cfg) == pytest.approx(20.0 * 20.0)  # 400, לא 60
+
+
+def test_absolute_overflow_ceiling_still_bounds_insane_values():
+    # תקרת-overflow מוחלטת (לא פונקציונלית) מונעת ערכים אבסורדיים/גלישה נומרית
+    r = _runner()
+    cfg = StrategyConfig(investment_usd=20.0, loss_recovery_enabled=True,
+                         loss_recovery_max_multiplier=1e12)
+    r.demo.state.loss_recovery_multiplier = 1e12
+    assert r._effective_investment_usd(cfg) == pytest.approx(20.0 * HARD_MAX_LOSS_RECOVERY_MULT)
 
 
 # ── (b) שחזור-הפסד כבוי → sizing = base בדיוק (התנהגות לא משתנה) ──
@@ -60,21 +77,20 @@ def test_multiplier_at_or_below_ceiling_is_unchanged():
         assert r._effective_investment_usd(cfg) == pytest.approx(20.0 * m)
 
 
-# ── (c) הצבירה נחסמת ב-3 גם בקריאות חוזרות עם config מסוכן ──
-def test_climb_clamps_at_hard_ceiling():
+# ── (c) הצבירה נחסמת ב-config שהמשתמש הגדיר (לא ב-3 קבוע) ──
+def test_climb_clamps_at_user_config_cap():
     st = DemoState(balance_usd=1000.0, loss_recovery_streak=0, loss_recovery_multiplier=1.0)
-    # step גדול + cap ענק (כמו ה-incident): בלי התקרה המכפיל היה מתפוצץ
     for _ in range(50):
         apply_loss_recovery_from_settlements(
             st,
             enabled=True,
             step_pct=150.0,        # factor 2.5
             every_n_losses=1,
-            max_multiplier=100000.0,
+            max_multiplier=50.0,   # המשתמש הגדיר 50×
             settlement_trades=[{"realized_pnl": -10.0, "type": "SETTLE_LOSS"}],
         )
-        assert st.loss_recovery_multiplier <= HARD_MAX_LOSS_RECOVERY_MULT
-    assert st.loss_recovery_multiplier == pytest.approx(HARD_MAX_LOSS_RECOVERY_MULT)
+        assert st.loss_recovery_multiplier <= 50.0
+    assert st.loss_recovery_multiplier == pytest.approx(50.0)  # מטפס עד ה-config, לא נחסם ב-3
 
 
 # ── (d) בלם יחסי-ליתרה: כניסה גדולה מ-25% מהיתרה נחסמת, ונרשמת תקלה אחת מדודדפת ──

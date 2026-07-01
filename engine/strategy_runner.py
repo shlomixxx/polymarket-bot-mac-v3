@@ -28,12 +28,15 @@ DISCOVERY_NONE_RECORD_INTERVAL_SEC = 120.0
 _CB_COOLDOWN_SEC = 900.0  # 15 min — how long the circuit-breaker pauses new entries after a trip before auto-resuming
 # ── תקרת-ברזל מוחלטת למכפיל שחזור-הפסד ────────────────────────────────────────────────
 # 2026-06-15 INCIDENT: config ה-config סטה למצב מסוכן (loss_recovery_max_multiplier=100000)
-# והמכפיל בסטייט טיפס ל-1525×, אז הבוט ניסה להיכנס ל-~$30k שוב ושוב ("insufficient balance")
-# ורשם 274,840 תקלות שחנקו את ה-event loop. התקרה הזו היא בלם-ברזל בקוד: גם אם ה-config מתיר
-# 100000 וה-state כבר 1525, גודל הפוזיציה לעולם לא יעבור base × HARD_MAX_LOSS_RECOVERY_MULT.
-# חל גם על הצבירה (loss_recovery.py) — כך שהמכפיל המאוחסן עצמו לא יכול להצטבר מעבר לתקרה.
-# בלם בטיחות בלבד: כשהמכפיל ≤ 3 או ששחזור-הפסד כבוי — אין שום שינוי התנהגות.
-HARD_MAX_LOSS_RECOVERY_MULT = 3.0
+# והמכפיל בסטייט טיפס ל-1525×, אז הבוט ניסה להיכנס ל-~$30k שוב ושוב ("insufficient balance").
+# לפי בקשת הבעלים (2026-07): התקרה הפונקציונלית על ההכפלה היא עכשיו **מה שהמשתמש מגדיר**
+# (loss_recovery_max_multiplier) — אין יותר תקרת-ברזל קבועה של ×3. ההגנות שנשארות מהתקרית:
+#   (1) SETTLE_UNKNOWN לא נספר כהפסד (הסיבה השורשית — לא מזין את ההכפלה),
+#   (2) בלם יחסי-ליתרה MAX_ENTRY_FRACTION_OF_BALANCE (כניסה בודדת לעולם לא > X% מהיתרה),
+#   (3) התקרה שהמשתמש הגדיר חוסמת את ה-sizing גם אם ה-state התקלקל.
+# הקבוע כאן הוא כעת רק **תקרת-overflow מוחלטת** (ערך ענק) שמונעת ערכים אבסורדיים/גלישה נומרית —
+# הוא לא נועד להגביל שימוש רגיל; המשתמש שולט בתקרה בפועל דרך ההגדרות.
+HARD_MAX_LOSS_RECOVERY_MULT = 100000.0
 # בלם יחסי-ליתרה: לעולם לא ננסה כניסה שה-notional שלה עולה על X מהיתרה הנוכחית של הדמו.
 # מונע את הלולאה "לנסות להיכנס ל-$30k על יתרה של $7k בכל טיק" גם אם משהו אחר השתבש.
 MAX_ENTRY_FRACTION_OF_BALANCE = 0.25
@@ -95,7 +98,8 @@ class StrategyConfig:
     loss_recovery_enabled: bool = False
     loss_recovery_step_pct: float = 20.0
     loss_recovery_every_n_losses: int = 1
-    # ברירת מחדל = תקרת-הברזל (3.0). גם אם מישהו מעלה את ה-cap, ה-sizing נחסם ב-HARD_MAX_LOSS_RECOVERY_MULT.
+    # התקרה שהמשתמש מגדיר להכפלה — זו התקרה הפונקציונלית בפועל (אין יותר תקרת-ברזל קבועה של ×3).
+    # ברירת מחדל שמרנית 3.0; העלה בלוח לכמה שתרצה. רק תקרת-overflow ענקית מונעת ערכים אבסורדיים.
     loss_recovery_max_multiplier: float = 3.0
     # ביצוע: "limit" (GTC קלאסי) או "market" (FOK לכניסה, FAK ליציאה + retry ladder).
     # מטרה: להבטיח ביצוע מידי ולמנוע פוזיציה תקועה כשהשוק מדלג על יעד ה-TP.
@@ -603,10 +607,11 @@ class StrategyRunner:
         m = float(self.demo.state.loss_recovery_multiplier)
         if not math.isfinite(m) or m < 1.0:
             m = 1.0
-        # תקרת-ברזל מוחלטת: גם אם ה-state טיפס ל-1525× (incident 2026-06-15) או ה-config
-        # מתיר 100000 — הגודל בפועל לעולם לא יעבור base × HARD_MAX_LOSS_RECOVERY_MULT.
-        # כשהמכפיל ≤ התקרה אין שינוי התנהגות.
-        m = min(m, HARD_MAX_LOSS_RECOVERY_MULT)
+        # ה-sizing נחסם ע"י התקרה שהמשתמש הגדיר (loss_recovery_max_multiplier) — כך גם אם ה-state
+        # התקלקל (כמו 1525× בתקרית) הגודל לא יעבור base × config. תקרת-overflow מוחלטת נוספת
+        # (HARD_MAX_LOSS_RECOVERY_MULT) מונעת ערכים אבסורדיים בלבד. אין יותר תקרת-ברזל קבועה של ×3.
+        cfg_cap = max(1.0, float(getattr(cfg, "loss_recovery_max_multiplier", 1.0) or 1.0))
+        m = min(m, cfg_cap, HARD_MAX_LOSS_RECOVERY_MULT)
         return base * m
 
     def _live_trading_ok(self) -> bool:

@@ -31,13 +31,12 @@ def apply_loss_recovery_from_settlements(
         return lines
 
     n_period = max(1, int(every_n_losses))
-    # תקרת-ברזל מוחלטת על המכפיל המאוחסן: גם אם המשתמש/ה-config מתיר max_multiplier=100000,
-    # המכפיל לעולם לא יצטבר מעבר ל-HARD_MAX_LOSS_RECOVERY_MULT (incident 2026-06-15: 1525×).
-    # ה-sizing ב-strategy_runner גם הוא חוסם בתקרה הזו — זו שכבה שנייה כדי שה-state עצמו לא יתנפח.
+    # המכפיל המאוחסן מצטבר עד התקרה שהמשתמש הגדיר (max_multiplier) — אין יותר תקרת-ברזל של ×3.
+    # תקרת-overflow מוחלטת (HARD_MAX_LOSS_RECOVERY_MULT, ערך ענק) מונעת ערכים אבסורדיים בלבד.
     try:
         from strategy_runner import HARD_MAX_LOSS_RECOVERY_MULT as _HARD_CAP
     except Exception:
-        _HARD_CAP = 3.0  # keep in sync with strategy_runner.HARD_MAX_LOSS_RECOVERY_MULT
+        _HARD_CAP = 100000.0  # keep in sync with strategy_runner.HARD_MAX_LOSS_RECOVERY_MULT
     cap = min(max(1.0, float(max_multiplier)), float(_HARD_CAP))
     step = max(0.0, float(step_pct))
     factor = 1.0 + step / 100.0 if step > 0 else 1.0
