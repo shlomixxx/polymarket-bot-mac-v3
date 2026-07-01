@@ -1251,9 +1251,10 @@ class StrategyRunner:
             print(f"[chop_gate] eval failed (non-fatal, fail-open): {_e!r}", flush=True)
             return True
 
-    def _update_chop_campaign(self, *, cfg: StrategyConfig, had_loss: bool, multiplier: float) -> None:
-        """מעודכן על settlement אחרי loss_recovery. מסיים קמפיין כשהפסד קורה במכפיל המקסימלי
-        (החלמה מוצתה) → חזרה ל-WAITING. Non-fatal (לעולם לא מפיל את הלולאה)."""
+    def _update_chop_campaign(self, *, cfg: StrategyConfig, had_win: bool, had_loss: bool, multiplier: float) -> None:
+        """מעודכן על settlement אחרי loss_recovery. הקמפיין הוא אפיזודת-החלמה אחת שהדשדוש הזעיק:
+        מסיים ב-WIN (הגענו לרווח → ממתינים לדשדוש הבא) או בהפסד במכפיל המקסימלי (החלמה מוצתה).
+        Non-fatal (לעולם לא מפיל את הלולאה)."""
         try:
             if not getattr(cfg, "chop_armed_flw_enabled", False) or not self.rt.chop_campaign_active:
                 return
@@ -1262,14 +1263,18 @@ class StrategyRunner:
                 float(getattr(cfg, "loss_recovery_max_multiplier", 1.0) or 1.0),
                 HARD_MAX_LOSS_RECOVERY_MULT,
             )
-            if chop_gate.campaign_should_end(multiplier=float(multiplier), cap=cap, had_loss=bool(had_loss)):
+            if chop_gate.campaign_should_end(
+                had_win=bool(had_win), had_loss=bool(had_loss),
+                multiplier=float(multiplier), cap=cap,
+            ):
+                reason = (
+                    "ניצחון — הגענו לרווח" if had_win
+                    else f"הפסד במכפיל המקסימלי ({float(multiplier):.2f}×/{cap:.2f}×)"
+                )
                 self.rt.chop_campaign_active = False
                 self.rt.chop_campaign_state = "waiting"
                 self.rt.chop_campaign_direction = None
-                self.rt.log(
-                    f"🏁 Chop-FLW: הפסד במכפיל המקסימלי ({float(multiplier):.2f}×/{cap:.2f}×) — "
-                    f"סוף קמפיין, ממתינים לדשדוש הבא"
-                )
+                self.rt.log(f"🏁 Chop-FLW: {reason} — סוף קמפיין, ממתינים לדשדוש הבא")
         except Exception as _e:
             print(f"[chop_gate] campaign update failed (non-fatal): {_e!r}", flush=True)
 
@@ -1545,6 +1550,14 @@ class StrategyRunner:
                         and not t.get("settlement_error")
                         for t in settlement_trades
                     )
+                    # A real win (profit) — mirror of has_loss; excludes SETTLE_UNKNOWN/errors.
+                    # Drives the Chop-FLW campaign end-on-recovery (win → wait for next chop).
+                    has_win = any(
+                        float(t.get("realized_pnl") or 0) > 0
+                        and str(t.get("type") or "") != "SETTLE_UNKNOWN"
+                        and not t.get("settlement_error")
+                        for t in settlement_trades
+                    )
                     if cfg_lr.loss_recovery_enabled:
                         from loss_recovery import apply_loss_recovery_from_settlements
 
@@ -1606,11 +1619,12 @@ class StrategyRunner:
                                 "שחזור הפסד: כבוי בהגדרות המנוע — פירוק עם הפסד לא מגדיל מכפיל ולא משנה סכום לסלייס. "
                                 "הפעל «שחזור אחרי הפסד», לחץ שמור הגדרות, והפעל מחדש את המנוע אם צריך לטעון config מהדיסק."
                             )
-                    # Chop-Armed FLW: end the campaign if this settlement was a loss at the max
-                    # multiplier (recovery exhausted) → back to WAITING for the next chop. Reads the
-                    # multiplier AFTER loss_recovery ran above, so a same-window loss at cap is seen.
+                    # Chop-Armed FLW: end the campaign when the chop-armed recovery reaches profit
+                    # (win → wait for the next chop) OR when a loss lands at the max multiplier
+                    # (recovery exhausted). Reads the multiplier AFTER loss_recovery ran above.
                     self._update_chop_campaign(
                         cfg=cfg_lr,
+                        had_win=has_win,
                         had_loss=has_loss,
                         multiplier=float(self.demo.state.loss_recovery_multiplier or 1.0),
                     )

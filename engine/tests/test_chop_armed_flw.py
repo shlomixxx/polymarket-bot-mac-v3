@@ -55,29 +55,37 @@ def test_is_chop_never_raises_on_garbage():
 
 # ── Pure: campaign_should_end ────────────────────────────────────────────────
 
+def test_campaign_should_end_on_win():
+    # a WIN = the recovery reached profit → end the campaign and wait for the next chop
+    assert cg.campaign_should_end(had_win=True, had_loss=False, multiplier=1.0, cap=3.0) is True
+    assert cg.campaign_should_end(had_win=True, had_loss=False, multiplier=2.0, cap=3.0) is True
+
+
 def test_campaign_should_end_loss_at_cap():
-    assert cg.campaign_should_end(multiplier=3.0, cap=3.0, had_loss=True) is True
-    assert cg.campaign_should_end(multiplier=3.5, cap=3.0, had_loss=True) is True  # >= cap
+    # recovery exhausted: a loss while already at the max multiplier ends it
+    assert cg.campaign_should_end(had_win=False, had_loss=True, multiplier=3.0, cap=3.0) is True
+    assert cg.campaign_should_end(had_win=False, had_loss=True, multiplier=3.5, cap=3.0) is True
 
 
-def test_campaign_should_end_loss_below_cap_is_false():
-    assert cg.campaign_should_end(multiplier=1.0, cap=3.0, had_loss=True) is False
-    assert cg.campaign_should_end(multiplier=2.0, cap=3.0, had_loss=True) is False
+def test_campaign_should_end_loss_below_cap_continues():
+    # still room to double, no win yet → keep the campaign going
+    assert cg.campaign_should_end(had_win=False, had_loss=True, multiplier=1.0, cap=3.0) is False
+    assert cg.campaign_should_end(had_win=False, had_loss=True, multiplier=2.0, cap=3.0) is False
 
 
-def test_campaign_should_end_win_never_ends():
-    assert cg.campaign_should_end(multiplier=3.0, cap=3.0, had_loss=False) is False
-    assert cg.campaign_should_end(multiplier=99.0, cap=3.0, had_loss=False) is False
+def test_campaign_should_end_unknown_settlement_is_false():
+    # neither win nor loss (SETTLE_UNKNOWN) → no change
+    assert cg.campaign_should_end(had_win=False, had_loss=False, multiplier=3.0, cap=3.0) is False
 
 
 def test_campaign_should_end_cap1_any_loss_ends():
     # max multiplier 1× (no doubling) → any loss ends the campaign at once
-    assert cg.campaign_should_end(multiplier=1.0, cap=1.0, had_loss=True) is True
+    assert cg.campaign_should_end(had_win=False, had_loss=True, multiplier=1.0, cap=1.0) is True
 
 
 def test_campaign_should_end_never_raises_on_garbage():
-    assert cg.campaign_should_end(multiplier=None, cap=None, had_loss=True) is False  # type: ignore[arg-type]
-    assert cg.campaign_should_end(multiplier="x", cap="y", had_loss=True) is False  # type: ignore[arg-type]
+    assert cg.campaign_should_end(had_win=False, had_loss=True, multiplier=None, cap=None) is False  # type: ignore[arg-type]
+    assert cg.campaign_should_end(had_win=False, had_loss=True, multiplier="x", cap="y") is False  # type: ignore[arg-type]
 
 
 # ── Wiring: gate + campaign on the real StrategyRunner ──────────────────────────
@@ -182,15 +190,26 @@ def test_campaign_escalates_on_loss_below_cap_stays_active():
     with tempfile.TemporaryDirectory() as d:
         _fresh_tracker(Path(d))
         r = _armed_runner(Path(d), max_mult=3.0)
-        r._update_chop_campaign(cfg=r.rt.config, had_loss=True, multiplier=2.0)  # below cap
+        r._update_chop_campaign(cfg=r.rt.config, had_win=False, had_loss=True, multiplier=2.0)  # below cap
         assert r.rt.chop_campaign_active is True
 
 
-def test_campaign_resets_on_win_stays_active():
+def test_campaign_ends_on_win_and_waits_for_next_chop():
     with tempfile.TemporaryDirectory() as d:
         _fresh_tracker(Path(d))
         r = _armed_runner(Path(d), max_mult=3.0)
-        r._update_chop_campaign(cfg=r.rt.config, had_loss=False, multiplier=1.0)  # a win
+        # the recovery reached profit → campaign ends, back to WAITING for a fresh chop
+        r._update_chop_campaign(cfg=r.rt.config, had_win=True, had_loss=False, multiplier=1.0)
+        assert r.rt.chop_campaign_active is False
+        assert r.rt.chop_campaign_state == "waiting"
+        assert r.rt.chop_campaign_direction is None
+
+
+def test_campaign_unknown_settlement_stays_active():
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_tracker(Path(d))
+        r = _armed_runner(Path(d), max_mult=3.0)
+        r._update_chop_campaign(cfg=r.rt.config, had_win=False, had_loss=False, multiplier=1.0)  # UNKNOWN
         assert r.rt.chop_campaign_active is True
 
 
@@ -198,7 +217,7 @@ def test_campaign_ends_on_loss_at_cap():
     with tempfile.TemporaryDirectory() as d:
         _fresh_tracker(Path(d))
         r = _armed_runner(Path(d), max_mult=3.0)
-        r._update_chop_campaign(cfg=r.rt.config, had_loss=True, multiplier=3.0)  # loss at cap
+        r._update_chop_campaign(cfg=r.rt.config, had_win=False, had_loss=True, multiplier=3.0)  # loss at cap
         assert r.rt.chop_campaign_active is False
         assert r.rt.chop_campaign_state == "waiting"
         assert r.rt.chop_campaign_direction is None
@@ -208,7 +227,7 @@ def test_campaign_ends_immediately_when_cap_is_1():
     with tempfile.TemporaryDirectory() as d:
         _fresh_tracker(Path(d))
         r = _armed_runner(Path(d), max_mult=1.0)  # no doubling
-        r._update_chop_campaign(cfg=r.rt.config, had_loss=True, multiplier=1.0)
+        r._update_chop_campaign(cfg=r.rt.config, had_win=False, had_loss=True, multiplier=1.0)
         assert r.rt.chop_campaign_active is False
 
 
@@ -216,8 +235,8 @@ def test_rearm_on_next_chop_after_end():
     with tempfile.TemporaryDirectory() as d:
         ht = _fresh_tracker(Path(d))
         r = _armed_runner(Path(d), max_mult=3.0)
-        # end the campaign
-        r._update_chop_campaign(cfg=r.rt.config, had_loss=True, multiplier=3.0)
+        # end the campaign (recovery win)
+        r._update_chop_campaign(cfg=r.rt.config, had_win=True, had_loss=False, multiplier=1.0)
         assert r.rt.chop_campaign_active is False
         # a fresh chop appears → gate re-arms
         _seed(ht, ["Down", "Up", "Down", "Up"])

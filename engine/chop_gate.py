@@ -35,14 +35,20 @@ def is_chop(sides: Any, n: Any) -> bool:
         return False
 
 
-def campaign_should_end(*, multiplier: Any, cap: Any, had_loss: Any) -> bool:
-    """True iff a loss just occurred while the martingale is already at (or above) the cap.
+def campaign_should_end(*, had_win: Any, had_loss: Any, multiplier: Any, cap: Any) -> bool:
+    """True when the chop campaign is over → back to WAITING for the next chop.
 
-    That's the "recovery exhausted" condition: keep doubling on every loss up to `cap`,
-    and only when a loss lands at the cap does the campaign end (→ wait for next chop).
-    With cap==1.0 (no doubling) any loss ends the campaign immediately. Never raises.
+    Two ways a campaign ends:
+      1. WIN — the recovery reached profit. A chop arms ONE recovery episode: we double on
+         each loss until we win, and the moment we win (in profit) we stop and wait for the
+         next chop. (This is the fix: previously a win kept the bot trading every window.)
+      2. Recovery exhausted — a loss while the martingale is already at (or above) the cap.
+         With cap==1.0 (no doubling) any loss ends it immediately.
+    An UNKNOWN settlement (neither win nor loss) leaves the campaign unchanged. Never raises.
     """
     try:
+        if had_win:
+            return True
         if not had_loss:
             return False
         return float(multiplier) >= float(cap)
