@@ -447,6 +447,8 @@ def _save_persisted_config() -> None:
             "follow_last_winner_lookback": int(getattr(c, "follow_last_winner_lookback", 1)),
             "follow_last_winner_mode": str(getattr(c, "follow_last_winner_mode", "forward")),
             "follow_last_winner_min_btc_drift_pct": float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0)),
+            "chop_armed_flw_enabled": bool(getattr(c, "chop_armed_flw_enabled", False)),
+            "chop_length_n": int(getattr(c, "chop_length_n", 4)),
             # Decision-mode (opt-in: let the signal pick the side) — MUST persist or it reverts to manual on restart.
             "decision_mode": str(getattr(c, "decision_mode", "manual")),
             "decision_min_confidence": float(getattr(c, "decision_min_confidence", 60.0)),
@@ -1561,6 +1563,8 @@ class ConfigBody(BaseModel):
     follow_last_winner_lookback: int = 1
     follow_last_winner_mode: str = "forward"
     follow_last_winner_min_btc_drift_pct: float = 0.0
+    chop_armed_flw_enabled: bool = False
+    chop_length_n: int = 4
     circuit_breaker_enabled: bool = False
     circuit_breaker_max_consecutive_losses: int = 0
     circuit_breaker_halt_at_cap: bool = False
@@ -1611,6 +1615,8 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "follow_last_winner_lookback must be between 1 and 5")
     if body.follow_last_winner_mode not in ("forward", "reverse"):
         raise HTTPException(400, "follow_last_winner_mode must be 'forward' or 'reverse'")
+    if int(body.chop_length_n) < 2 or int(body.chop_length_n) > 10:
+        raise HTTPException(400, "chop_length_n must be between 2 and 10")
     if float(body.follow_last_winner_min_btc_drift_pct) < 0 or float(body.follow_last_winner_min_btc_drift_pct) > 10:
         raise HTTPException(400, "follow_last_winner_min_btc_drift_pct must be between 0 and 10")
     if float(body.circuit_breaker_equity_floor_pct) < 0 or float(body.circuit_breaker_equity_floor_pct) > 100:
@@ -1705,6 +1711,12 @@ async def get_strategy_config():
         "follow_last_winner_lookback": int(getattr(c, "follow_last_winner_lookback", 1)),
         "follow_last_winner_mode": str(getattr(c, "follow_last_winner_mode", "forward")),
         "follow_last_winner_min_btc_drift_pct": float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0)),
+        "chop_armed_flw_enabled": bool(getattr(c, "chop_armed_flw_enabled", False)),
+        "chop_length_n": int(getattr(c, "chop_length_n", 4)),
+        # live Chop-Armed FLW campaign state (read-only; from RuntimeState) for the UI badge
+        "chop_campaign_state": str(getattr(runner.rt, "chop_campaign_state", "waiting")),
+        "chop_campaign_active": bool(getattr(runner.rt, "chop_campaign_active", False)),
+        "chop_campaign_direction": getattr(runner.rt, "chop_campaign_direction", None),
         "decision_mode": str(getattr(c, "decision_mode", "manual")),
         "decision_min_confidence": float(getattr(c, "decision_min_confidence", 60.0)),
         "mode": runner.rt.mode,

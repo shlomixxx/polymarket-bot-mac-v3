@@ -131,6 +131,12 @@ class StrategyConfig:
     follow_last_winner_lookback: int = 1
     follow_last_winner_mode: Literal["forward", "reverse"] = "forward"
     follow_last_winner_min_btc_drift_pct: float = 0.0
+    # Chop-Armed Follow-the-Winner — OPT-IN, OFF by default. Only START trading right after a
+    # "chop" of N strictly-alternating windows (🔴🟢🔴🟢), then follow the last winner with the
+    # bounded martingale (loss_recovery), and end the campaign when a loss lands at the max
+    # multiplier — back to waiting for the next chop. Direction reuses _resolve_follow_winner_side.
+    chop_armed_flw_enabled: bool = False
+    chop_length_n: int = 4                    # strictly-alternating windows that define a "chop" (2-10)
     # Circuit-breaker — OPT-IN, OFF by default (no behavior change until enabled). A safety
     # brake that blocks NEW entries when a risk condition trips; open positions still exit.
     circuit_breaker_enabled: bool = False
@@ -167,6 +173,11 @@ class StrategyRuntime:
     circuit_breaker_reason: str = ""
     circuit_breaker_baseline_usd: Optional[float] = None  # session equity baseline (lazy-init)
     circuit_breaker_cooldown_until: float = 0.0
+    # Chop-Armed FLW campaign state (per-session; resets on restart, like circuit-breaker state).
+    chop_campaign_active: bool = False               # True = armed/active campaign in progress
+    chop_campaign_direction: Optional[str] = None    # "Up"/"Down" the campaign is following (informational)
+    chop_campaign_state: str = "waiting"             # "waiting" | "armed" | "active" — for UI/status
+    chop_armed_epoch: int = 0                         # epoch the campaign was armed (dedup/logging)
     last_tp_ts: float = 0.0
     last_tp_side: Optional[str] = None
     tp_happened_this_window: bool = False
@@ -298,6 +309,11 @@ class StrategyRuntime:
         self.circuit_breaker_tripped = False
         self.circuit_breaker_reason = ""
         self.circuit_breaker_cooldown_until = 0.0
+        # A demo reset clears any in-flight chop campaign → back to waiting for a fresh chop.
+        self.chop_campaign_active = False
+        self.chop_campaign_direction = None
+        self.chop_campaign_state = "waiting"
+        self.chop_armed_epoch = 0
 
     def status(
         self,
@@ -1006,6 +1022,9 @@ class StrategyRunner:
         except Exception as _e:
             print(f"[circuit_breaker] eval failed (non-fatal, fail-open): {_e!r}", flush=True)
         # ── end circuit-breaker ──
+        # ── Chop-Armed FLW gate: only allow entries once a chop has armed a campaign ──
+        if not self._check_chop_gate(cfg=cfg):
+            return False
         if cfg.max_trades_per_hour > 0 and len(self.rt.trade_timestamps) >= cfg.max_trades_per_hour:
             self.rt.status(
                 f"סטטוס: הגיע למקס׳ עסקאות לשעה ({cfg.max_trades_per_hour}) — עצירה זמנית",
@@ -1166,6 +1185,93 @@ class StrategyRunner:
             )
         except Exception as e:
             self.rt.log(f"היסטוריה: כשל ברישום — {e!r}")
+
+    def _last_winner_side(self, cfg: StrategyConfig) -> Optional[str]:
+        """הצד המנצח של החלון הסגור האחרון ('Up'/'Down') — כיוון 'עקוב אחרי המנצח'. None אם אין."""
+        try:
+            from history_tracker import get_last_window_winners
+            from market_discovery import window_step_sec
+            try:
+                window_sec = window_step_sec(cfg.btc_window)
+            except Exception:
+                window_sec = 300
+            winners = get_last_window_winners(window_sec=window_sec, limit=1, min_drift_pct=0.0)
+            if winners and winners[0].get("side_won") in ("Up", "Down"):
+                return winners[0]["side_won"]
+        except Exception:
+            pass
+        return None
+
+    def _check_chop_gate(self, *, cfg: StrategyConfig) -> bool:
+        """שער כניסה ל-Chop-Armed FLW. Fail-OPEN (מחזיר True) בכל שגיאה — לעולם לא מפיל את הלולאה.
+
+        True = מותר להיכנס (הפיצ'ר כבוי, או שקמפיין כבר פעיל, או שזה עתה זוהה דשדוש שהזעיק קמפיין).
+        False = ממתינים לדשדוש (WAITING).
+        """
+        try:
+            import chop_gate
+            if not getattr(cfg, "chop_armed_flw_enabled", False):
+                return True  # פיצ'ר כבוי → no-op, כניסות כרגיל
+            # קמפיין פעיל → כניסות מותרות; מעדכנים כיוון (עקוב אחרי המנצח האחרון) ומצב לפי המכפיל.
+            if self.rt.chop_campaign_active:
+                mult = float(self.demo.state.loss_recovery_multiplier or 1.0)
+                self.rt.chop_campaign_state = "active" if mult > 1.0 else "armed"
+                latest = self._last_winner_side(cfg)
+                if latest is not None:
+                    self.rt.chop_campaign_direction = latest
+                return True
+            # אין קמפיין → מחפשים דשדוש טרי ב-N החלונות האחרונים (נרות גולמיים, בלי סינון drift).
+            from history_tracker import get_last_window_winners
+            from market_discovery import window_step_sec
+            try:
+                window_sec = window_step_sec(cfg.btc_window)
+            except Exception:
+                window_sec = 300
+            n = int(getattr(cfg, "chop_length_n", 4) or 4)
+            winners = get_last_window_winners(window_sec=window_sec, limit=n, min_drift_pct=0.0)
+            sides = [w.get("side_won") for w in winners]  # most-recent-first
+            strip = " ".join("🟢" if s == "Up" else "🔴" for s in reversed(sides)) if sides else "—"
+            if chop_gate.is_chop(sides, n):
+                self.rt.chop_campaign_active = True
+                self.rt.chop_campaign_state = "armed"
+                self.rt.chop_campaign_direction = sides[0]  # המנצח האחרון = follow-forward
+                self.rt.chop_armed_epoch = self.rt.current_epoch
+                self.rt.status(
+                    f"🎯 Chop-FLW: זוהה דשדוש ({strip}) → נכנסים לפי המנצח {self.rt.chop_campaign_direction}",
+                    key="chop_armed", repeat_interval_sec=5.0,
+                )
+                return True
+            self.rt.chop_campaign_state = "waiting"
+            self.rt.status(
+                f"⏳ Chop-FLW: ממתין לדשדוש באורך {n} ({strip})",
+                key="chop_waiting", repeat_interval_sec=30.0,
+            )
+            return False
+        except Exception as _e:
+            print(f"[chop_gate] eval failed (non-fatal, fail-open): {_e!r}", flush=True)
+            return True
+
+    def _update_chop_campaign(self, *, cfg: StrategyConfig, had_loss: bool, multiplier: float) -> None:
+        """מעודכן על settlement אחרי loss_recovery. מסיים קמפיין כשהפסד קורה במכפיל המקסימלי
+        (החלמה מוצתה) → חזרה ל-WAITING. Non-fatal (לעולם לא מפיל את הלולאה)."""
+        try:
+            if not getattr(cfg, "chop_armed_flw_enabled", False) or not self.rt.chop_campaign_active:
+                return
+            import chop_gate
+            cap = min(
+                float(getattr(cfg, "loss_recovery_max_multiplier", 1.0) or 1.0),
+                HARD_MAX_LOSS_RECOVERY_MULT,
+            )
+            if chop_gate.campaign_should_end(multiplier=float(multiplier), cap=cap, had_loss=bool(had_loss)):
+                self.rt.chop_campaign_active = False
+                self.rt.chop_campaign_state = "waiting"
+                self.rt.chop_campaign_direction = None
+                self.rt.log(
+                    f"🏁 Chop-FLW: הפסד במכפיל המקסימלי ({float(multiplier):.2f}×/{cap:.2f}×) — "
+                    f"סוף קמפיין, ממתינים לדשדוש הבא"
+                )
+        except Exception as _e:
+            print(f"[chop_gate] campaign update failed (non-fatal): {_e!r}", flush=True)
 
     def _resolve_follow_winner_side(self, cfg: StrategyConfig) -> Optional[str]:
         """מחזיר 'Up'/'Down' לפי תוצאת חלון/ות קודמים. None = fallback ל-side_preference.
@@ -1500,6 +1606,14 @@ class StrategyRunner:
                                 "שחזור הפסד: כבוי בהגדרות המנוע — פירוק עם הפסד לא מגדיל מכפיל ולא משנה סכום לסלייס. "
                                 "הפעל «שחזור אחרי הפסד», לחץ שמור הגדרות, והפעל מחדש את המנוע אם צריך לטעון config מהדיסק."
                             )
+                    # Chop-Armed FLW: end the campaign if this settlement was a loss at the max
+                    # multiplier (recovery exhausted) → back to WAITING for the next chop. Reads the
+                    # multiplier AFTER loss_recovery ran above, so a same-window loss at cap is seen.
+                    self._update_chop_campaign(
+                        cfg=cfg_lr,
+                        had_loss=has_loss,
+                        multiplier=float(self.demo.state.loss_recovery_multiplier or 1.0),
+                    )
             self.rt.log(f"מעבר חלון → {m.slug}")
             # current_epoch כבר עודכן בתוך ה-lock כסנטינל — לא לעדכן שוב.
             self.rt.dca_done_slices = 0
@@ -2163,6 +2277,24 @@ class StrategyRunner:
                     "lookback": int(getattr(cfg, "follow_last_winner_lookback", 1) or 1),
                     "mode": str(getattr(cfg, "follow_last_winner_mode", "forward")),
                     "ts": time.time(),
+                }
+        # Chop-Armed FLW: the feature IS "follow the last winner" — set the direction to the last
+        # winner whenever it's on (independent of the separate FLW toggle). The chop GATE
+        # (_entry_limits_ok, runs later) decides IF we actually enter; direction only matters when
+        # we do, so this is order-independent and correct.
+        if (
+            getattr(cfg, "chop_armed_flw_enabled", False)
+            and flw_side is None
+            and not (pos_u or pos_d)
+        ):
+            flw_side = self._last_winner_side(cfg)
+            if flw_side is not None:
+                self.rt.status(
+                    f"🎯 Chop-FLW: עוקב אחרי המנצח האחרון → {flw_side}",
+                    key="chop_flw_dir", repeat_interval_sec=30.0,
+                )
+                self.rt._last_flw_decision = {
+                    "side": flw_side, "lookback": 1, "mode": "chop_armed", "ts": time.time(),
                 }
         if _sig_decided_side == "Up":
             if ask_u is None:

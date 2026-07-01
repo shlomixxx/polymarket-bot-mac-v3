@@ -1854,6 +1854,13 @@ export default function App() {
   /** מצב ריצה מהשרת (תמיד מסונכרן) */
   const [lossRecoveryStreak, setLossRecoveryStreak] = useState(0);
   const [lossRecoveryMultLive, setLossRecoveryMultLive] = useState(1);
+  /** Chop-Armed FLW — הגדרות + מצב קמפיין חי + תצוגת חלונות/ניצחונות */
+  const [chopArmedFlwEnabled, setChopArmedFlwEnabled] = useState(false);
+  const [chopLengthN, setChopLengthN] = useState(4);
+  const [chopCampaignState, setChopCampaignState] = useState<"waiting" | "armed" | "active">("waiting");
+  const [chopCampaignDirection, setChopCampaignDirection] = useState<string | null>(null);
+  const [recentWindows, setRecentWindows] = useState<Array<{ side_won: string | null; epoch: number }>>([]);
+  const [botWins, setBotWins] = useState<{ wins: number; n: number; pct: number | null }>({ wins: 0, n: 0, pct: null });
   /** שוק Polymarket: חלון 5 או 15 דק׳ (לא מספר חוזים) */
   const [btcWindow, setBtcWindow] = useState<"5m" | "15m">("5m");
   /** מינ׳ חוזים — לפחות max(זה, מינ׳ השוק) */
@@ -1914,7 +1921,7 @@ export default function App() {
     try {
       // PR-F: /api/demo/state (היסטוריה מלאה ~19MB) נטען בלולאה איטית נפרדת (ראה fetchFullState),
       // לא בלולאה המהירה הזו — חוסך הורדת ~19MB כל ~1s. ה-snapshot (500ms) שומר P&L חי טרי.
-      const [m, b, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw, lwo] = await Promise.all([
+      const [m, b, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw, lwo, hist] = await Promise.all([
         api<Market>("/api/market/current", { timeoutMs: TIMEOUT_MS_MARKET_CURRENT }),
         api<{ price: number; source?: string; history: { t: number; p: number }[] }>("/api/btc/live"),
         api<{ lines: string[] }>("/api/strategy/logs"),
@@ -1934,6 +1941,9 @@ export default function App() {
           last: { side_won?: string | null; btc_open?: number | null; btc_close?: number | null; drift_pct?: number | null; epoch?: number | null } | null;
           flw_preview: { side?: string | null; lookback?: number; mode?: string; min_drift_pct?: number; fallback_side_preference?: string; samples?: Array<{ epoch: number; side_won: string; btc_open?: number; btc_close?: number }> } | null;
         }>("/api/history/last-window-outcome").catch(() => null),
+        api<{ windows?: Array<{ side_won: string | null; epoch: number }> }>(
+          "/api/history/recent?limit=16"
+        ).catch(() => ({ windows: [] })),
       ]);
       if (lm) {
         setLiveMode(Boolean(lm.enabled));
@@ -1984,6 +1994,15 @@ export default function App() {
         // read-only — תמיד מסונכרן מהשרת (גם בזמן עריכה), כדי שהבאנר ישקף את המצב האמיתי
         if (typeof lr.circuit_breaker_tripped === "boolean") setCircuitBreakerTripped(lr.circuit_breaker_tripped);
         if (typeof lr.circuit_breaker_reason === "string") setCircuitBreakerReason(lr.circuit_breaker_reason);
+        // Chop-Armed FLW live campaign state (read-only) + bot wins for the "can't see wins" display
+        if (typeof lr.chop_campaign_state === "string") setChopCampaignState(lr.chop_campaign_state as "waiting" | "armed" | "active");
+        setChopCampaignDirection((lr.chop_campaign_direction as string) ?? null);
+        if (typeof lr.bot_run_wins_n === "number" && typeof lr.bot_run_exit_trades_n === "number")
+          setBotWins({
+            wins: lr.bot_run_wins_n as number,
+            n: lr.bot_run_exit_trades_n as number,
+            pct: typeof lr.bot_run_win_rate_pct === "number" ? (lr.bot_run_win_rate_pct as number) : null,
+          });
       }
       // חשוב: יש רענון כל שנייה. לא נדרוס ערכים שהמשתמש עורך לפני "שמור".
       // כשאין עריכה פתוחה — מסנכרנים את כל ההגדרות מהשרת (אחרת אחרי F5 חוזרים לברירות מחדל מקומיות).
@@ -2050,9 +2069,12 @@ export default function App() {
         if (typeof c.follow_last_winner_lookback === "number") setFlwLookback(c.follow_last_winner_lookback);
         if (c.follow_last_winner_mode === "forward" || c.follow_last_winner_mode === "reverse") setFlwMode(c.follow_last_winner_mode);
         if (typeof c.follow_last_winner_min_btc_drift_pct === "number") setFlwMinDrift(c.follow_last_winner_min_btc_drift_pct);
+        if (typeof c.chop_armed_flw_enabled === "boolean") setChopArmedFlwEnabled(c.chop_armed_flw_enabled);
+        if (typeof c.chop_length_n === "number") setChopLengthN(c.chop_length_n);
       }
       setOb(obSummary);
       if (lwo) setLastWindowOutcome(lwo as typeof lastWindowOutcome);
+      if (hist && Array.isArray(hist.windows)) setRecentWindows(hist.windows);
       refreshFailCount.current = 0;
       setErr("");
     } catch (e: unknown) {
@@ -2286,6 +2308,8 @@ export default function App() {
           follow_last_winner_lookback: Math.max(1, Math.min(5, Math.floor(flwLookback))),
           follow_last_winner_mode: flwMode,
           follow_last_winner_min_btc_drift_pct: Math.max(0, Math.min(10, flwMinDrift)),
+          chop_armed_flw_enabled: chopArmedFlwEnabled,
+          chop_length_n: Math.max(2, Math.min(10, Math.floor(chopLengthN))),
         }),
       });
       cfgDirtyRef.current = false;
@@ -2325,7 +2349,8 @@ export default function App() {
       retryMaxAttempts, holdToResolutionEnabled, holdToResolutionMinDcaSlices,
       holdToResolutionMinPrice, holdToResolutionStopLoss,
       investmentMode, investmentPctOfPortfolio,
-      flwEnabled, flwLookback, flwMode, flwMinDrift]);
+      flwEnabled, flwLookback, flwMode, flwMinDrift,
+      chopArmedFlwEnabled, chopLengthN]);
 
   const setMode = (m: "off" | "semi" | "auto") => {
     const prevMode = botMode;
@@ -4333,6 +4358,119 @@ export default function App() {
                 )}
               </div>
             )}
+          </div>
+
+          {/* Chop-Armed Follow-the-Winner — נכנס רק אחרי דשדוש, עוקב אחרי המנצח עם הכפלה מוגבלת */}
+          <div
+            style={{
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-sm)",
+              padding: 12,
+              marginBottom: 16,
+              background: "var(--bg-elevated)",
+              boxShadow: chopArmedFlwEnabled ? "inset 0 0 0 1px var(--accent-bright)" : undefined,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}>
+                <input
+                  type="checkbox"
+                  checked={chopArmedFlwEnabled}
+                  onChange={(e) => { setChopArmedFlwEnabled(e.target.checked); markCfgDirty(); }}
+                />
+                🎯 כניסה אחרי דשדוש + מעקב מנצח (Chop-Armed FLW)
+              </label>
+              {chopArmedFlwEnabled && (() => {
+                const st = chopCampaignState;
+                const bg = st === "active" ? "var(--up)" : st === "armed" ? "#f59e0b" : "var(--muted)";
+                const label =
+                  st === "active" ? `🔥 קמפיין פעיל ×${lossRecoveryMultLive.toFixed(2)}`
+                  : st === "armed" ? "🎯 דשדוש זוהה — נכנס"
+                  : "⏳ ממתין לדשדוש";
+                return (
+                  <span style={{ fontSize: 12, fontWeight: 700, color: "#0b0b0b", background: bg, padding: "3px 10px", borderRadius: 999 }}>
+                    {label}{chopCampaignDirection ? ` · ${chopCampaignDirection === "Up" ? "🟢 Up" : "🔴 Down"}` : ""}
+                  </span>
+                );
+              })()}
+            </div>
+
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 8, lineHeight: 1.6 }}>
+              הבוט <strong>מחכה</strong> עד שיהיו N נרות מתחלפים ברצף (דשדוש, למשל 4 = 🔴🟢🔴🟢), ואז נכנס{" "}
+              <strong>לפי המנצח האחרון</strong>, מכפיל על כל הפסד עד התקרה, ומתאפס לבסיס אחרי ניצחון.
+              הפסד בתקרת ההכפלה מסיים את הקמפיין — וממתינים לדשדוש הבא. כך מצמצמים את רצף ההפסדים שמנפח את ההכפלה.
+            </div>
+
+            {chopArmedFlwEnabled && (
+              <>
+                <div style={{ marginTop: 10, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
+                  <label style={{ fontSize: 13 }}>
+                    כמה נרות מתחלפים (דשדוש) לפני כניסה{" "}
+                    <span title="4 = 🔴🟢🔴🟢 · 5 = 🔴🟢🔴🟢🔴">?</span>
+                    <input
+                      type="number" min={2} max={10} step={1} value={chopLengthN}
+                      onChange={(e) => { setChopLengthN(Math.max(2, Math.min(10, Math.floor(Number(e.target.value) || 4)))); markCfgDirty(); }}
+                      style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
+                    />
+                  </label>
+                </div>
+
+                {!lossRecoveryEnabled ? (
+                  <div style={{ marginTop: 10, fontSize: 12, color: "#f59e0b", lineHeight: 1.6 }}>
+                    ⚠ «שחזור אחרי הפסד» כבוי — בלי הכפלה, כל הפסד מסיים מיד את הקמפיין.{" "}
+                    <button
+                      type="button"
+                      onClick={() => { setLossRecoveryEnabled(true); setLossRecoveryStepPct(100); setLossRecoveryEveryN(1); markCfgDirty(); }}
+                      style={{ padding: "3px 10px", fontSize: 12, borderRadius: 6, cursor: "pointer", marginInlineStart: 4 }}
+                    >
+                      הפעל הכפלה ×2 מהיר
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 8, fontSize: 12, color: "var(--muted)" }}>
+                    ההכפלה נשלטת בקטע «שחזור אחרי הפסד» למטה (תקרה בטוחה עד ×3). כרגע: מקס ×{lossRecoveryMaxMult}, צעד {lossRecoveryStepPct}%.
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* חלונות אחרונים (🟢/🔴) + ניצחונות הבוט — כדי שרואים שהמנוע עובד וזוכר */}
+            <div style={{ marginTop: 12, padding: 10, borderRadius: "var(--radius-sm)", background: "var(--bg)" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
+                <span>חלונות אחרונים (ישן ← חדש)</span>
+                <span style={{ color: "var(--muted)" }}>
+                  ניצחונות הבוט: <strong style={{ color: "var(--up)" }}>{botWins.wins}</strong>/{botWins.n}
+                  {botWins.pct != null ? ` (${botWins.pct}%)` : ""}
+                </span>
+              </div>
+              {recentWindows.length > 0 ? (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                  {recentWindows.slice().reverse().map((w, i, arr) => {
+                    const up = w.side_won === "Up";
+                    const known = w.side_won === "Up" || w.side_won === "Down";
+                    const isLast = i === arr.length - 1;
+                    return (
+                      <span
+                        key={w.epoch}
+                        title={`${new Date(w.epoch * 1000).toLocaleTimeString()} — ${known ? (up ? "עלה 🟢" : "ירד 🔴") : "לא ידוע"}`}
+                        style={{
+                          width: 20, height: 20, borderRadius: 6, display: "inline-block",
+                          background: known ? (up ? "var(--up)" : "var(--down)") : "var(--muted)",
+                          opacity: known ? 1 : 0.4,
+                          outline: isLast ? "2px solid var(--accent-bright)" : undefined,
+                          outlineOffset: 1,
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+              ) : (
+                <div style={{ fontSize: 12, color: "var(--muted)" }}>טוען היסטוריית חלונות…</div>
+              )}
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>
+                🟢 = BTC עלה (Up) · 🔴 = BTC ירד (Down) · מסגרת = החלון האחרון. הנתונים נשמרים בשרת וממשיכים אחרי הפעלה מחדש.
+              </div>
+            </div>
           </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
