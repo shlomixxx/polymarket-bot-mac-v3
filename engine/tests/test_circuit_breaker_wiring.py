@@ -68,6 +68,28 @@ def test_circuit_breaker_stays_blocked_during_cooldown_without_reevaluating():
     assert r.rt.circuit_breaker_cooldown_until == cooldown_until
 
 
+def test_disabling_breaker_mid_cooldown_frees_entries_immediately():
+    """USER BUG: the breaker trips (arming a 15-min cooldown) and the user then UNCHECKS the
+    'circuit breaker' box. The stale cooldown must NOT keep blocking — disabling the toggle has
+    to free new entries on the very next tick and drop the trip/cooldown state at once."""
+    r, cfg = _runner_with_streak(enabled=True, streak=3, max_losses=3)
+    now = time.time()
+
+    # Trip it → cooldown armed, entries blocked.
+    assert r._entry_limits_ok(now=now, cfg=cfg, planned_cost_usd=1.0) is False
+    assert r.rt.circuit_breaker_cooldown_until > now
+    assert r.rt.circuit_breaker_tripped is True
+
+    # User unchecks the box mid-cooldown.
+    cfg.circuit_breaker_enabled = False
+
+    # Next tick must ALLOW entries and clear the stale trip/cooldown immediately.
+    assert r._entry_limits_ok(now=now, cfg=cfg, planned_cost_usd=1.0) is True
+    assert r.rt.circuit_breaker_tripped is False
+    assert r.rt.circuit_breaker_reason == ""
+    assert r.rt.circuit_breaker_cooldown_until == 0.0
+
+
 def test_circuit_breaker_self_recovers_after_cooldown():
     """After the cooldown expires the breaker auto-resumes: streak is reset to 0, the
     tripped flag clears, and entries are allowed again — no permanent deadlock."""

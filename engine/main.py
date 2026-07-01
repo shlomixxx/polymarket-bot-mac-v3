@@ -1626,6 +1626,12 @@ async def strategy_config(body: ConfigBody):
         if hasattr(c, k):
             setattr(c, k, v)
     c.side_preference = body.side_preference  # type: ignore
+    # Disabling the circuit-breaker must free entries at once: drop any live trip/cooldown
+    # (RuntimeState, not config) so the UI banner clears immediately instead of on the next tick.
+    if not body.circuit_breaker_enabled:
+        runner.rt.circuit_breaker_cooldown_until = 0.0
+        runner.rt.circuit_breaker_tripped = False
+        runner.rt.circuit_breaker_reason = ""
     await _clamp_min_contracts_to_market_floor()
     saved = {**body.model_dump(), "min_contracts": runner.rt.config.min_contracts}
     append_event(
