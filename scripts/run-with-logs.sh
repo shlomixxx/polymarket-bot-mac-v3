@@ -37,6 +37,53 @@ if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
   exit 1
 fi
 
+# ── בדיקת פורטים תפוסים לפני ההרצה ────────────────────────────────────────────
+# סיבה נפוצה ל"Failed to fetch": הבוט כבר רץ (או תהליך תקוע מריצה קודמת) מחזיק
+# את 8767 (המנוע) או 5175 (ה-UI). אז Vite (strictPort) נופל מיד, concurrently -k
+# הורג את המנוע וה-Electron, ולא נפתח כלום — כישלון שקט. כאן מזהים ומסבירים ברור.
+port_pid() {
+  # מדפיס PID אחד שמאזין על הפורט, אם קיים.
+  # awk 'NR==1' במקום head — כדי לא ליצור SIGPIPE שנופל תחת set -o pipefail ב-bash 3.2 של macOS.
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | awk 'NR==1{print; exit}'
+}
+
+ENGINE_PORT=8767
+UI_PORT=5175
+
+# || true — אם הפורט פנוי, lsof מחזיר 1; לא רוצים ש-set -e יפיל את הסקריפט.
+engine_pid="$(port_pid "$ENGINE_PORT" || true)"
+ui_pid="$(port_pid "$UI_PORT" || true)"
+
+if [[ -n "$engine_pid" || -n "$ui_pid" ]]; then
+  # אם המנוע כבר מגיב תקין ל-/api/health — כנראה הבוט כבר רץ מחלון אחר.
+  engine_healthy=0
+  if [[ -n "$engine_pid" ]] && command -v curl >/dev/null 2>&1; then
+    if curl -fsS -m 3 "http://127.0.0.1:${ENGINE_PORT}/api/health" >/dev/null 2>&1; then
+      engine_healthy=1
+    fi
+  fi
+
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [[ "$engine_healthy" -eq 1 ]]; then
+    echo "ℹ️  נראה שהבוט כבר רץ (המנוע מגיב על פורט ${ENGINE_PORT})."
+    echo "   פתח את הכתובת בדפדפן:  http://127.0.0.1:${UI_PORT}"
+    echo "   אין צורך להריץ שוב. אם אתה רוצה הרצה נקייה — סגור קודם את החלון הישן."
+  else
+    echo "⚠️  פורט תפוס — יש תהליך שמחזיק אותו (כנראה הרצה קודמת שלא נסגרה)."
+  fi
+  [[ -n "$engine_pid" ]] && echo "   • פורט ${ENGINE_PORT} (מנוע) תפוס ע\"י PID ${engine_pid}"
+  [[ -n "$ui_pid" ]] && echo "   • פורט ${UI_PORT} (ממשק) תפוס ע\"י PID ${ui_pid}"
+  echo ""
+  echo "   כדי לשחרר ולהריץ מחדש, הרץ בטרמינל:"
+  [[ -n "$engine_pid" ]] && echo "     kill ${engine_pid}"
+  [[ -n "$ui_pid" ]] && echo "     kill ${ui_pid}"
+  echo "   ואז לחץ שוב פעמיים על run-bot.command"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  exit 1
+fi
+
 # Python למנוע — חייב uvicorn; פותרים אותו Python שבו התקנת pip (לעיתים 3.12 מ־python.org)
 # בעוד ש־python3 ב־PATH הוא 3.13 מ־Homebrew בלי חבילות.
 if ! ENGINE_PY="$(bash "$ROOT/scripts/resolve-engine-python.sh" 2>/dev/null)"; then
