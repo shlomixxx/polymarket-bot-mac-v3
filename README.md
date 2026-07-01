@@ -113,6 +113,21 @@ npm run build:web
   מחזירים את המקור (`source` / `price_to_beat_source`) וה-`price_to_beat_note` משקף אותו.
 - **הערה:** פירוק ה-settlement בדמו עדיין משתמש בפרוקסי Binance 1m (מחוץ להיקף השינוי הזה).
 
+## אסטרטגיית "Chop-Armed Follow-the-Winner" (opt-in)
+
+הפחתת סיכון מרטינגייל: הבוט **מחכה** עד שיהיו N נרות 5-דק׳ מתחלפים ברצף ("דשדוש",
+`chop_length_n`, למשל 4 = 🔴🟢🔴🟢), ואז נכנס **לפי המנצח האחרון** (FLW-forward), מכפיל על
+הפסד עד התקרה (`loss_recovery`, חסום קשיח ל-×3), מתאפס לבסיס אחרי ניצחון, ומסיים את הקמפיין
+כשהפסד נוחת במכפיל המקסימלי — חזרה ל-WAITING עד הדשדוש הבא. כך נמנע רצף ההפסדים שמנפח את
+ההכפלה בדשדוש.
+
+- לוגיקה טהורה: [`engine/chop_gate.py`](engine/chop_gate.py) (`is_chop`, `campaign_should_end`).
+- שער כניסה + מצב קמפיין: `_check_chop_gate` / `_update_chop_campaign` ב-[`engine/strategy_runner.py`](engine/strategy_runner.py)
+  (fail-open, לעולם לא מפיל את הלולאה); כיוון נגזר מ-`get_last_window_winners` (היסטוריה על `/data`).
+- הגדרות: `chop_armed_flw_enabled` (כבוי כברירת מחדל), `chop_length_n` (2-10). לוח הבקרה מציג
+  תג מצב קמפיין חי + רצועת חלונות אחרונים (🔴🟢) + ניצחונות הבוט.
+- עלות זניחה: קריאת SQLite מקומית אחת לחלון (כמו FLW), בלי loops/endpoints חדשים.
+
 ## מבנה תיקייה (עיקרי)
 
 - `engine/` — FastAPI, דמו, אסטרטגיה; `chainlink_price_stream.py` (פיד המחירים המדויק)  
