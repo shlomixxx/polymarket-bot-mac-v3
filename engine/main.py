@@ -64,6 +64,7 @@ from btc_price import (
     fetch_chainlink_btc_usd_polygon_at_window_start,
     fetch_close_price_at_window_end,
     fetch_open_price_at_window_start,
+    fetch_window_price_series,
     fetch_window_start_end_btc_usd,
 )
 from chainlink_price_stream import chainlink_stream
@@ -1212,10 +1213,28 @@ async def btc_live():
     except Exception as e:
         raise HTTPException(502, str(e))
     price_buf.add(p)
+
+    # קו חלק שמתפרס על כל החלון הנוכחי (כמו Polymarket) — נזרע מ-Binance 1s klines,
+    # מיושר ל-live tick כדי שהקצה יגע במחיר החי בלי קפיצה. נופל לבאפר החי אם לא זמין.
+    history = [{"t": a, "p": b} for a, b in price_buf.points]
+    try:
+        window_sec = 900 if getattr(runner.rt.config, "btc_window", "5m") == "15m" else 300
+        window_epoch = int(time.time() // window_sec) * window_sec
+        series = await fetch_window_price_series(window_epoch, window_sec)
+        series = [(t, pp) for (t, pp) in series if t >= window_epoch]
+        if series:
+            # יישור: מזיזים את סדרת Binance כך שהנקודה האחרונה תשווה למחיר החי (Chainlink)
+            offset = p - series[-1][1]
+            merged = [{"t": t, "p": round(pp + offset, 2)} for (t, pp) in series]
+            merged.append({"t": time.time(), "p": p})
+            history = merged
+    except Exception:
+        pass
+
     return {
         "price": p,
         "source": source,
-        "history": [{"t": a, "p": b} for a, b in price_buf.points],
+        "history": history,
     }
 
 

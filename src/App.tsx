@@ -13,10 +13,14 @@ import {
   chartTooltipStyle,
   chartStroke,
   smoothCurveType,
-  computeBtcPriceChartYDomain,
 } from "./chartConstants";
 import { formatPnlAxisTime, formatPctAxisTick } from "./pnlChartFormatters";
 import { growLiveTrail } from "./livePnlTrail";
+import {
+  computeEffectiveMinContracts,
+  effectiveInvestmentUsd,
+  contractsFromInvestment,
+} from "./investmentSizing";
 import { useChartAnimationGate } from "./hooks/useChartAnimationGate";
 import { usePriceStream } from "./hooks/usePriceStream";
 import { Button } from "./ui/Button";
@@ -25,6 +29,14 @@ import { ChartCard } from "./ui/ChartCard";
 import { Collapsible } from "./ui/Collapsible";
 import { SectionTitle } from "./ui/SectionTitle";
 import { PnlOpenAreaChart, PnlClosedAreaChart } from "./ui/PnlSessionAreaCharts";
+import { BtcWindowChart } from "./ui/BtcWindowChart";
+import {
+  WindowCircles,
+  WindowDetailPanel,
+  WindowsStatsPanel,
+  TradeWindowChip,
+} from "./ui/WindowCircles";
+import type { RecentWindow, HourlyBucket } from "./windowStats";
 import TipsV2 from "./TipsV2";
 import SignalsPanel from "./SignalsPanel";
 import TriggerTrader from "./TriggerTrader";
@@ -497,6 +509,7 @@ function TradesBySession({
   priceToBeatUsd = null,
   marketEpoch = null,
   priceToBeatNote = "",
+  recentWindows = [],
 }: {
   trades: Trade[];
   logEntries?: LogEntry[];
@@ -510,6 +523,8 @@ function TradesBySession({
   /** epoch של השוק הפעיל — להתאמה לכניסה (שדה epoch בעסקת BUY) */
   marketEpoch?: number | null;
   priceToBeatNote?: string;
+  /** חלונות אחרונים (מ-/api/history/recent) — לרצועת ההקשר של העסקה */
+  recentWindows?: RecentWindow[];
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   /** מסלול PnL אחרון לפי session — כשהשרת מחזיר רגעית pnl_path ריק (throttle / מרוץ) לא נוריד את הגרף */
@@ -1069,6 +1084,16 @@ function TradesBySession({
                     ) : null}
                   </div>
                 )}
+                <TradeWindowChip
+                  epoch={epochForRetro}
+                  windowSec={windowSecForRetro}
+                  btcStart={btcRef}
+                  btcEnd={btcEndPx}
+                  side={side}
+                  resolvedOutcome={resolvedMarket}
+                  settleWon={settleWon}
+                  recentWindows={recentWindows}
+                />
                 {(() => {
                   const serverPnlRaw =
                     ((lastExit?.pnl_path ?? liveLeg?.pnl_path) as
@@ -1595,12 +1620,6 @@ function TradesBySession({
   );
 }
 
-/** מינ׳ חוזים אפקטיבי: max(הגדרת משתמש, מינ׳ השוק) — בלי תלות בשמות ישנים של state */
-function computeEffectiveMinContracts(minContracts: number, orderMinSize: number | undefined): number {
-  const oms = orderMinSize != null ? Math.ceil(orderMinSize) : 5;
-  return Math.max(minContracts, oms);
-}
-
 const PRESETS = {
   simple: {
     name: "מתחיל פשוט",
@@ -1860,7 +1879,9 @@ export default function App() {
   const [chopLengthN, setChopLengthN] = useState(4);
   const [chopCampaignState, setChopCampaignState] = useState<"waiting" | "armed" | "active">("waiting");
   const [chopCampaignDirection, setChopCampaignDirection] = useState<string | null>(null);
-  const [recentWindows, setRecentWindows] = useState<Array<{ side_won: string | null; epoch: number }>>([]);
+  const [recentWindows, setRecentWindows] = useState<RecentWindow[]>([]);
+  const [selectedWindowEpoch, setSelectedWindowEpoch] = useState<number | null>(null);
+  const [hourlyHistory, setHourlyHistory] = useState<HourlyBucket[]>([]);
   const [botWins, setBotWins] = useState<{ wins: number; n: number; pct: number | null }>({ wins: 0, n: 0, pct: null });
   /** שוק Polymarket: חלון 5 או 15 דק׳ (לא מספר חוזים) */
   const [btcWindow, setBtcWindow] = useState<"5m" | "15m">("5m");
@@ -1906,12 +1927,41 @@ export default function App() {
     setMinContracts((prev) => Math.max(prev, exchangeMinContractsCeil));
   }, [market?.slug, exchangeMinContractsCeil]);
 
-  const contracts = useMemo(() => {
-    const price = entryCents / 100;
-    if (price <= 0) return 0;
-    const n = Math.floor(inv / price);
-    return n >= effectiveMinContracts ? n : 0;
-  }, [inv, entryCents, effectiveMinContracts]);
+  /** שווי התיק הנוכחי (equity snapshot) — אותו מקור שהמנוע משתמש בו לחישוב % מהתיק */
+  const equityNow = useMemo(() => {
+    const eq = ((demoState as any).last_mark || {}).equity;
+    const bal = (demoState as any).balance_usd;
+    const v = Number(eq ?? bal ?? 0);
+    return Number.isFinite(v) ? v : 0;
+  }, [demoState]);
+
+  /**
+   * הסכום האפקטיבי ב-$ שהמנוע ישתמש בו לכניסה הבאה — משקף את צד-השרת:
+   * מצב קבוע → הסכום ב-$; מצב אחוז → equity × אחוז/100; ובשני המצבים × מכפיל
+   * loss-recovery כשהוא פעיל. עד התיקון התצוגה התעלמה מהאחוז והשתמשה תמיד ב-inv.
+   */
+  const effectiveInvUsd = useMemo(
+    () =>
+      effectiveInvestmentUsd({
+        mode: investmentMode,
+        fixedUsd: inv,
+        pctOfPortfolio: investmentPctOfPortfolio,
+        equityUsd: equityNow,
+        lossRecoveryEnabled,
+        lossRecoveryMult: lossRecoveryMultLive,
+      }),
+    [investmentMode, inv, investmentPctOfPortfolio, equityNow, lossRecoveryEnabled, lossRecoveryMultLive]
+  );
+
+  const contracts = useMemo(
+    () =>
+      contractsFromInvestment({
+        investmentUsd: effectiveInvUsd,
+        entryCents,
+        minContracts: effectiveMinContracts,
+      }),
+    [effectiveInvUsd, entryCents, effectiveMinContracts]
+  );
 
   const refreshInFlight = useRef(false);
   const refreshFailCount = useRef(0);
@@ -1922,7 +1972,7 @@ export default function App() {
     try {
       // PR-F: /api/demo/state (היסטוריה מלאה ~19MB) נטען בלולאה איטית נפרדת (ראה fetchFullState),
       // לא בלולאה המהירה הזו — חוסך הורדת ~19MB כל ~1s. ה-snapshot (500ms) שומר P&L חי טרי.
-      const [m, b, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw, lwo, hist] = await Promise.all([
+      const [m, b, lg, pe, cfg, obSummary, logEnt, lm, pmClobRaw, lwo, hist, hourlyRes] = await Promise.all([
         api<Market>("/api/market/current", { timeoutMs: TIMEOUT_MS_MARKET_CURRENT }),
         api<{ price: number; source?: string; history: { t: number; p: number }[] }>("/api/btc/live"),
         api<{ lines: string[] }>("/api/strategy/logs"),
@@ -1942,9 +1992,10 @@ export default function App() {
           last: { side_won?: string | null; btc_open?: number | null; btc_close?: number | null; drift_pct?: number | null; epoch?: number | null } | null;
           flw_preview: { side?: string | null; lookback?: number; mode?: string; min_drift_pct?: number; fallback_side_preference?: string; samples?: Array<{ epoch: number; side_won: string; btc_open?: number; btc_close?: number }> } | null;
         }>("/api/history/last-window-outcome").catch(() => null),
-        api<{ windows?: Array<{ side_won: string | null; epoch: number }> }>(
-          "/api/history/recent?limit=16"
+        api<{ windows?: RecentWindow[] }>(
+          "/api/history/recent?limit=100"
         ).catch(() => ({ windows: [] })),
+        api<{ hourly?: HourlyBucket[] }>("/api/history/hourly").catch(() => ({ hourly: [] })),
       ]);
       if (lm) {
         setLiveMode(Boolean(lm.enabled));
@@ -2076,6 +2127,7 @@ export default function App() {
       setOb(obSummary);
       if (lwo) setLastWindowOutcome(lwo as typeof lastWindowOutcome);
       if (hist && Array.isArray(hist.windows)) setRecentWindows(hist.windows);
+      if (hourlyRes && Array.isArray(hourlyRes.hourly)) setHourlyHistory(hourlyRes.hourly);
       refreshFailCount.current = 0;
       setErr("");
     } catch (e: unknown) {
@@ -2369,25 +2421,6 @@ export default function App() {
     })();
   };
 
-  const chartData = useMemo(() => {
-    return (btc.history || []).map((x, i) => {
-      const ts = Number(x.t);
-      return {
-        i,
-        p: x.p,
-        ts,
-        t: new Date(ts * 1000).toLocaleTimeString("he-IL"),
-      };
-    });
-  }, [btc.history]);
-
-  const btcChartYDomain = useMemo(
-    () => computeBtcPriceChartYDomain(
-      chartData.map((d) => Number(d.p)),
-      market?.price_to_beat ?? null,
-    ),
-    [chartData, market?.price_to_beat],
-  );
 
   const cumPnlChartData = useMemo(() => {
     const rawTrades = ((demoState as any).trades as Trade[]) || [];
@@ -2936,69 +2969,19 @@ export default function App() {
 
           <ChartCard
             title="מחיר BTC"
-            subtitle="דגימות אחרונות במחשב המקומי; יעד הרזולוציה: Chainlink BTC/USD"
-            height={280}
+            subtitle="חלון נוכחי · יעד הרזולוציה: Chainlink BTC/USD"
+            height={340}
           >
-            <div style={{ width: "100%", height: 220 }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData} margin={{ top: 6, right: 8, bottom: 4, left: 4 }}>
-                  <XAxis
-                    dataKey="ts"
-                    type="number"
-                    domain={["dataMin", "dataMax"]}
-                    tick={{ ...chartAxisTick, fontSize: 10 }}
-                    tickFormatter={(v) => formatPnlAxisTime(Number(v))}
-                    allowDecimals
-                  />
-                  <YAxis
-                    domain={btcChartYDomain ?? (["auto", "auto"] as const)}
-                    tick={{ ...chartAxisTick, fontSize: 10 }}
-                    width={72}
-                    tickFormatter={(v) =>
-                      typeof v === "number" && Number.isFinite(v)
-                        ? v.toLocaleString(undefined, { maximumFractionDigits: 0 })
-                        : ""
-                    }
-                  />
-                  <Tooltip
-                    contentStyle={chartTooltipStyle}
-                    labelStyle={{ color: "var(--text-secondary)" }}
-                    itemStyle={{ color: "var(--text)" }}
-                    labelFormatter={(label) =>
-                      Number.isFinite(Number(label)) ? formatPnlAxisTime(Number(label)) : String(label)
-                    }
-                    formatter={(value) => [
-                      typeof value === "number" && Number.isFinite(value)
-                        ? `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                        : String(value),
-                      "מחיר",
-                    ]}
-                  />
-                  {market?.price_to_beat != null && (
-                    <ReferenceLine
-                      y={market.price_to_beat}
-                      stroke="var(--accent-bright)"
-                      strokeOpacity={0.65}
-                      strokeDasharray="4 4"
-                      label={{ value: "מחיר יעד לפתיחת החלון", fill: "var(--text-secondary)", fontSize: 11 }}
-                    />
-                  )}
-                  <Line
-                    type="linear"
-                    dataKey="p"
-                    stroke="var(--chart-line-primary)"
-                    dot={false}
-                    strokeWidth={chartStroke.width}
-                    strokeLinecap={chartStroke.linecap}
-                    strokeLinejoin={chartStroke.linejoin}
-                    isAnimationActive
-                    animationDuration={380}
-                    animationEasing="ease-out"
-                    connectNulls
-                  />
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
+            <BtcWindowChart
+              data={btc.history}
+              priceToBeat={market?.price_to_beat ?? null}
+              currentPrice={btc.price}
+              source={btc.source}
+              secondsLeft={effectiveWindowSecondsLeft ?? market?.seconds_left ?? null}
+              diff={diff}
+              windowSec={market?.window_sec ?? 300}
+              epoch={market?.epoch ?? 0}
+            />
           </ChartCard>
 
           <div style={{ marginTop: 16, display: "flex", gap: 12, flexWrap: "wrap", alignItems: "stretch" }}>
@@ -3426,9 +3409,17 @@ export default function App() {
                 style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
               />
               <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
-                מחושב דינמית כל כניסה מול שווי התיק (equity snapshot){lossRecoveryEnabled
-                  ? ` · מכפיל loss recovery ×${lossRecoveryMultLive.toFixed(2)}`
-                  : ""}
+                {equityNow > 0 ? (
+                  <>
+                    יעד השקעה אצל המנוע כרגע:{" "}
+                    <strong className="tabular-nums">${effectiveInvUsd.toFixed(2)}</strong>{" "}
+                    ({investmentPctOfPortfolio}% מתוך שווי תיק ${equityNow.toFixed(2)}
+                    {lossRecoveryEnabled ? ` × מכפיל ${lossRecoveryMultLive.toFixed(2)}` : ""})
+                    {lossRecoveryEnabled ? ` · הפסדים רצופים: ${lossRecoveryStreak}` : ""}
+                  </>
+                ) : (
+                  <>מחושב דינמית כל כניסה מול שווי התיק (equity snapshot) — ממתין לטעינת שווי התיק…</>
+                )}
               </div>
             </label>
           )}
@@ -3506,8 +3497,14 @@ export default function App() {
           <div style={{ marginBottom: 12, color: contracts ? "var(--up)" : "#f87171" }}>
             ≈ {contracts || `לא מספיק למינ׳ ${effectiveMinContracts}`} חוזים
             {contracts
-              ? ` (מינ׳ ${effectiveMinContracts} — עומד)`
-              : ` — צריך לפחות ${((effectiveMinContracts * entryCents) / 100).toFixed(2)}$ ב-${entryCents}¢`}
+              ? ` (מינ׳ ${effectiveMinContracts} — עומד · $${effectiveInvUsd.toFixed(2)} ב-${entryCents}¢)`
+              : investmentMode === "percent" && equityNow <= 0
+                ? ` — ממתין לטעינת שווי התיק…`
+                : ` — צריך לפחות ${((effectiveMinContracts * entryCents) / 100).toFixed(2)}$ ב-${entryCents}¢${
+                    investmentMode === "percent"
+                      ? ` (${investmentPctOfPortfolio}% מ-$${equityNow.toFixed(2)} = $${effectiveInvUsd.toFixed(2)} — העלה את האחוז)`
+                      : ""
+                  }`}
           </div>
 
           <label>
@@ -4447,26 +4444,20 @@ export default function App() {
                 </span>
               </div>
               {recentWindows.length > 0 ? (
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                  {recentWindows.slice().reverse().map((w, i, arr) => {
-                    const up = w.side_won === "Up";
-                    const known = w.side_won === "Up" || w.side_won === "Down";
-                    const isLast = i === arr.length - 1;
-                    return (
-                      <span
-                        key={w.epoch}
-                        title={`${new Date(w.epoch * 1000).toLocaleTimeString()} — ${known ? (up ? "עלה 🟢" : "ירד 🔴") : "לא ידוע"}`}
-                        style={{
-                          width: 20, height: 20, borderRadius: 6, display: "inline-block",
-                          background: known ? (up ? "var(--up)" : "var(--down)") : "var(--muted)",
-                          opacity: known ? 1 : 0.4,
-                          outline: isLast ? "2px solid var(--accent-bright)" : undefined,
-                          outlineOffset: 1,
-                        }}
-                      />
-                    );
-                  })}
-                </div>
+                <>
+                  <WindowCircles
+                    windows={recentWindows.slice(-16)}
+                    selectedEpoch={selectedWindowEpoch}
+                    onSelect={setSelectedWindowEpoch}
+                  />
+                  {selectedWindowEpoch != null &&
+                    (() => {
+                      const w = recentWindows.find((x) => x.epoch === selectedWindowEpoch);
+                      return w ? (
+                        <WindowDetailPanel window={w} onClose={() => setSelectedWindowEpoch(null)} />
+                      ) : null;
+                    })()}
+                </>
               ) : (
                 <div style={{ fontSize: 12, color: "var(--muted)" }}>טוען היסטוריית חלונות…</div>
               )}
@@ -4911,6 +4902,19 @@ export default function App() {
                   </a>
                 </div>
 
+                {tab === "stats" && recentWindows.length > 0 && (
+                  <Card padding="lg" style={{ marginBottom: "var(--s-4)" }}>
+                    <SectionTitle as="h3">סטטיסטיקת חלונות (BTC 🟢/🔴)</SectionTitle>
+                    <WindowsStatsPanel
+                      windows={recentWindows}
+                      hourly={hourlyHistory}
+                      selectedEpoch={selectedWindowEpoch}
+                      onSelect={setSelectedWindowEpoch}
+                      botWins={botWins}
+                    />
+                  </Card>
+                )}
+
                 <ChartCard
                   title="רווח והפסד מצטברים"
                   subtitle={
@@ -4993,6 +4997,7 @@ export default function App() {
                   priceToBeatUsd={market?.price_to_beat ?? null}
                   marketEpoch={market?.epoch ?? null}
                   priceToBeatNote={market?.price_to_beat_note ?? ""}
+                  recentWindows={recentWindows}
                 />
               </>
             );

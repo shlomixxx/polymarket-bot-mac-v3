@@ -357,11 +357,57 @@ async def fetch_window_start_end_btc_usd(
     }
 
 
-class PriceHistoryBuffer:
-    """דגימות למסך גרף בתוך החלון."""
+# סדרת מחיר לכל אורך החלון (Binance 1s klines) — כדי שהקו בגרף יתפרס חלק על כל
+# החלון כמו ב-Polymarket, גם אם המנוע עלה באמצע החלון (הבאפר החי לא יכול למלא אחורה).
+_WINDOW_SERIES_CACHE: dict[tuple[int, int], tuple[float, list[tuple[float, float]]]] = {}
+_WINDOW_SERIES_TTL_SEC = 2.0
 
-    def __init__(self, max_points: int = 120):
+
+async def fetch_window_price_series(
+    window_epoch_sec: int, window_sec: int
+) -> list[tuple[float, float]]:
+    """סדרת (t, close) בקצב 1s לכל טווח [epoch, min(now, epoch+window_sec)] מ-Binance.
+    נותן קו חלק שמתפרס על כל החלון (פרוקסי ל-Chainlink; המתקשר מיישר ל-live tick)."""
+    now = time.time()
+    key = (int(window_epoch_sec), int(window_sec))
+    cached = _WINDOW_SERIES_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _WINDOW_SERIES_TTL_SEC:
+        return cached[1]
+    start_ms = int(window_epoch_sec * 1000)
+    end_ms = int(min(now, window_epoch_sec + window_sec) * 1000)
+    try:
+        client = _get_binance_client()
+        r = await client.get(
+            BINANCE_KLINES,
+            params={
+                "symbol": "BTCUSDT",
+                "interval": "1s",
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": 1000,
+            },
+            timeout=6.0,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # [0]=openTime(ms), [4]=close
+        series = [(float(k[0]) / 1000.0, round(float(k[4]), 2)) for k in data]
+    except Exception:
+        return cached[1] if cached is not None else []
+    _WINDOW_SERIES_CACHE[key] = (now, series)
+    if len(_WINDOW_SERIES_CACHE) > 8:
+        for k in list(_WINDOW_SERIES_CACHE)[:-4]:
+            _WINDOW_SERIES_CACHE.pop(k, None)
+    return series
+
+
+class PriceHistoryBuffer:
+    """דגימות למסך גרף — מכסה חלון שלם (5 או 15 דק׳) כדי שהקו הכתום בגרף בסגנון
+    Polymarket יתפרס על כל החלון. חסום גם לפי זמן (~16.6 דק׳) וגם לפי כמות (תקרת בטיחות)."""
+
+    def __init__(self, max_points: int = 1200, max_age_sec: float = 1000.0):
         self.max_points = max_points
+        self.max_age_sec = max_age_sec
         self.points: list[tuple[float, float]] = []
 
     def add(self, price: float) -> None:
@@ -372,6 +418,11 @@ class PriceHistoryBuffer:
         except (TypeError, ValueError):
             return
         self.points.append((t, p))
+        # מסנן דגימות ישנות מ~16.6 דק׳ (חלון 15m + מרווח) — הגרף מסנן ל-t>=epoch,
+        # אבל כאן שומרים על מטען קטן ומכסים חלון מלא ללא תלות בקצב הדגימה.
+        cutoff = t - self.max_age_sec
+        if self.points and self.points[0][0] < cutoff:
+            self.points = [pt for pt in self.points if pt[0] >= cutoff]
         if len(self.points) > self.max_points:
             self.points = self.points[-self.max_points :]
 

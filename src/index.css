@@ -43,6 +43,12 @@
   --chart-fill-start: rgba(147, 169, 201, 0.22);
   --chart-fill-end: rgba(147, 169, 201, 0);
 
+  /* גרף מחיר BTC בסגנון Polymarket (כתום ביטקוין, מותאם לרקע הכהה) */
+  --btc-orange: #f7931a;
+  --btc-fill-start: rgba(247, 147, 26, 0.34);
+  --btc-fill-end: rgba(247, 147, 26, 0);
+  --btc-target: rgba(209, 213, 219, 0.5);
+
   --s-1: 4px;
   --s-2: 8px;
   --s-3: 12px;
