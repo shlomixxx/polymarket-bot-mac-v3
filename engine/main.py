@@ -1799,6 +1799,26 @@ async def strategy_mode(body: ModeBody):
     return {"ok": True, "mode": body.mode}
 
 
+class DataSourceBody(BaseModel):
+    data_source: str  # polymarket | binance
+
+
+@app.get("/api/data-source")
+async def get_data_source():
+    return {"data_source": getattr(runner.rt.config, "data_source", "polymarket")}
+
+
+@app.post("/api/data-source")
+async def set_data_source(body: DataSourceBody):
+    import data_source as _data_source
+    if body.data_source not in _data_source.VALID_DATA_SOURCES:
+        raise HTTPException(400, "data_source must be 'polymarket' or 'binance'")
+    runner.rt.config.data_source = body.data_source  # type: ignore
+    _data_source.set_active(body.data_source)
+    _save_persisted_config()
+    return {"ok": True, "data_source": _data_source.get_active()}
+
+
 @app.post("/api/strategy/reset-loss-recovery")
 async def reset_loss_recovery():
     """Reset the loss-recovery RUNTIME state (demo.state) to defaults: clears a stale
