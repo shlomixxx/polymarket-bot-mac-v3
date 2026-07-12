@@ -379,6 +379,8 @@ def _load_persisted_config() -> None:
                 runner.rt.live_trading = bool(data.get("live_trading"))
             except Exception:
                 runner.rt.live_trading = False
+        import data_source as _data_source
+        _data_source.set_active(getattr(runner.rt.config, "data_source", "polymarket"))
     except Exception as e:
         print(f"[polymarket-bot] אזהרה: לא ניתן לטעון config שמור — {e}", flush=True)
 
@@ -432,6 +434,7 @@ def _save_persisted_config() -> None:
             "loss_recovery_every_n_losses": getattr(c, "loss_recovery_every_n_losses", 1),
             "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 3.0),
             "order_mode": getattr(c, "order_mode", "limit"),
+            "data_source": str(getattr(c, "data_source", "polymarket")),
             "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
             "market_max_entry_price_cents": float(getattr(c, "market_max_entry_price_cents", 80.0)),
             "exit_slippage_pct": getattr(c, "exit_slippage_pct", 5.0),
@@ -1565,6 +1568,7 @@ class ConfigBody(BaseModel):
     loss_recovery_max_multiplier: float = 3.0  # user-set cap (no fixed ×3 hard cap anymore); default is conservative
     # ביצוע מובטח: "limit" (ברירת מחדל, תאימות לאחור) או "market" (FOK/FAK)
     order_mode: str = "limit"
+    data_source: str = "polymarket"  # polymarket | binance — מקור נתוני BTC
     entry_slippage_pct: float = 2.0
     market_max_entry_price_cents: float = 80.0  # תקרת מחיר למצב market (0/100 = ללא תקרה)
     exit_slippage_pct: float = 5.0
@@ -1612,6 +1616,8 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "loss_recovery_max_multiplier must be >= 1")
     if body.order_mode not in ("limit", "market"):
         raise HTTPException(400, "order_mode must be 'limit' or 'market'")
+    if body.data_source not in ("polymarket", "binance"):
+        raise HTTPException(400, "data_source must be 'polymarket' or 'binance'")
     if float(body.entry_slippage_pct) < 0 or float(body.entry_slippage_pct) > 50:
         raise HTTPException(400, "entry_slippage_pct must be between 0 and 50")
     if float(body.market_max_entry_price_cents) < 0 or float(body.market_max_entry_price_cents) > 100:
@@ -1657,6 +1663,8 @@ async def strategy_config(body: ConfigBody):
         runner.rt.circuit_breaker_cooldown_until = 0.0
         runner.rt.circuit_breaker_tripped = False
         runner.rt.circuit_breaker_reason = ""
+    import data_source as _data_source
+    _data_source.set_active(runner.rt.config.data_source)
     await _clamp_min_contracts_to_market_floor()
     saved = {**body.model_dump(), "min_contracts": runner.rt.config.min_contracts}
     append_event(
@@ -1714,6 +1722,7 @@ async def get_strategy_config():
         "circuit_breaker_reason": str(getattr(runner.rt, "circuit_breaker_reason", "")),
         "floor_stop_pct": float(getattr(c, "floor_stop_pct", 0.0)),
         "order_mode": getattr(c, "order_mode", "limit"),
+        "data_source": str(getattr(c, "data_source", "polymarket")),
         "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
         "market_max_entry_price_cents": float(getattr(c, "market_max_entry_price_cents", 80.0)),
         "exit_slippage_pct": getattr(c, "exit_slippage_pct", 5.0),

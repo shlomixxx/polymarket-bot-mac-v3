@@ -104,6 +104,9 @@ class StrategyConfig:
     # ביצוע: "limit" (GTC קלאסי) או "market" (FOK לכניסה, FAK ליציאה + retry ladder).
     # מטרה: להבטיח ביצוע מידי ולמנוע פוזיציה תקועה כשהשוק מדלג על יעד ה-TP.
     order_mode: Literal["limit", "market"] = "limit"
+    # מקור נתוני BTC: "polymarket" (Chainlink stream) או "binance". שולט מאיפה נקראים
+    # מחיר נוכחי, "מחיר לנצח", והסטטיסטיקה/דמו. אינו משנה לאן נשלחות פקודות (זה M2).
+    data_source: Literal["polymarket", "binance"] = "polymarket"
     entry_slippage_pct: float = 2.0  # תקרת slippage לכניסת MARKET BUY
     exit_slippage_pct: float = 5.0   # תקרת slippage ליציאת MARKET SELL (רחבה — עדיף לצאת)
     # תקרת מחיר שפויה למצב market בלבד: לא נכנסים אם ה-Ask של הצד הנבחר עולה על
