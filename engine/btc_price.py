@@ -236,12 +236,16 @@ async def fetch_btc_spot_usdt() -> float:
 
 
 async def fetch_btc_current_usd() -> tuple[float, str]:
-    """מחיר BTC נוכחי — מעדיף את פיד Chainlink Data Stream של Polymarket (המקור שלפיו השוק נסגר);
-    נופל ל-Binance spot רק אם הפיד לא טרי/לא זמין.
+    """מחיר BTC נוכחי לפי מקור-הנתונים הפעיל.
 
-    מחזיר (price, source) כאשר source ∈ {"chainlink_stream", "binance_fallback"}.
-    ה-import של הפיד עצל כדי לא לקשור את btc_price ל-chainlink_price_stream בזמן טעינה.
+    מצב "binance": קורא ישירות Binance spot ומחזיר source="binance".
+    מצב "polymarket": מעדיף את פיד Chainlink Data Stream של Polymarket (המקור שלפיו
+    השוק נסגר); נופל ל-Binance spot רק אם הפיד לא טרי/לא זמין (source="binance_fallback").
     """
+    import data_source
+    if data_source.get_active() == "binance":
+        price = await fetch_btc_spot_usdt()
+        return price, "binance"
     try:
         from chainlink_price_stream import chainlink_stream
 
