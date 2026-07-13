@@ -2846,8 +2846,8 @@ export default function App() {
             <Card padding="md" style={{ marginBottom: "var(--s-4)" }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
                 <div style={{ color: "var(--muted)", fontSize: 14 }}>{market.title}</div>
-                <span className="badge-mode" title="מקור הנתונים של המספרים בעמוד">
-                  מקור: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
+                <span className="badge-mode" title="מקור נתוני המחיר של ה-BTC (לא בורסת הביצוע)">
+                  מקור מחיר: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
                 </span>
               </div>
               <div style={{ fontSize: 13, marginTop: 4 }}>
@@ -4692,8 +4692,8 @@ export default function App() {
             <SectionTitle as="h2">
               {tab === "stats_live" ? "סטטיסטיקות מסחר חי" : "סטטיסטיקות סימולציה (דמו)"}
             </SectionTitle>
-            <span className="badge-mode" title="מקור הנתונים של המספרים בעמוד">
-              מקור: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
+            <span className="badge-mode" title="מקור נתוני המחיר של ה-BTC (לא בורסת הביצוע)">
+              מקור מחיר: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
             </span>
           </div>
           {tab === "stats_live" && (
