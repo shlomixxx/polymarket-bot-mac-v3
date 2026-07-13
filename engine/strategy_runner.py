@@ -10,11 +10,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional
 
-import httpx
-
-import live_clob
+import venues
 from demo_engine import DemoEngine, FEE_RATE
-from market_discovery import discover_active_btc_window, get_clob_book, seconds_until_window_end
+from market_discovery import seconds_until_window_end
 from order_validation import validate_contracts_for_market
 from pricing_limits import MAX_LEGIT_SHARE_PRICE_USD, MIN_LEGIT_SHARE_PRICE_USD
 
@@ -486,40 +484,6 @@ def market_entry_price_too_high(
     return a > cents / 100.0
 
 
-# B-4: לקוח httpx משותף עם keep-alive ל-fallback של ה-REST. ה-fallback רץ בתוך לולאת טיק של
-# 0.12s כש-WS מתיישן — לקוח-לכל-קריאה משלם TLS handshake בכל פעם ומושך 429. ללא result cache:
-# ה-WS כבר מקדים, ו-get_clob_book עדיין מושך חי בכל קריאה (מחיר ה-order נשאר טרי).
-_BOOK_CLIENT: Optional[httpx.AsyncClient] = None
-
-
-def _get_book_client() -> httpx.AsyncClient:
-    global _BOOK_CLIENT
-    if _BOOK_CLIENT is None:
-        _BOOK_CLIENT = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=2.0, read=6.0, write=6.0, pool=6.0),
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
-        )
-    return _BOOK_CLIENT
-
-
-async def fetch_best_bid_ask(token_id: str) -> tuple[Optional[float], Optional[float]]:
-    from ws_price_stream import price_stream
-    bid, ask = price_stream.get_best_bid_ask(token_id)
-    if bid is not None or ask is not None:
-        tp = price_stream.get_price(token_id)
-        if tp and (time.time() - tp.ts) < 30.0:
-            return bid, ask
-    try:
-        book = await get_clob_book(_get_book_client(), token_id)
-    except Exception:
-        return bid, ask
-    bids = book.get("bids") or []
-    asks = book.get("asks") or []
-    rest_bid = float(bids[0]["price"]) if bids else None
-    rest_ask = float(asks[0]["price"]) if asks else None
-    return rest_bid, rest_ask
-
-
 class StrategyRunner:
     def __init__(self, demo: DemoEngine):
         self.demo = demo
@@ -528,6 +492,9 @@ class StrategyRunner:
         self._stop = asyncio.Event()
         # FIX #24: guard נגד זיהוי rollover כפול אם _tick רץ פעמיים בתוך אותה שנייה.
         self._rollover_lock: asyncio.Lock = asyncio.Lock()
+        # M2a: seam לבחירת venue (Polymarket / Predict.fun) — ברירת מחדל Polymarket,
+        # התנהגות זהה byte-for-byte (pure delegation ל-live_clob/market_discovery הקיימים).
+        self._venue = venues.get_venue("polymarket")
         # FIX #22: שחזור DCA counters מ-state אם השרת קם אחרי קריסה באמצע DCA
         self._restore_dca_counters_from_state()
 
@@ -545,6 +512,13 @@ class StrategyRunner:
         except AttributeError:
             # state ישן ללא השדות החדשים — לא נורא, מתחילים מ-0
             pass
+
+    @property
+    def venue(self):
+        return self._venue
+
+    def select_venue(self, name: str) -> None:
+        self._venue = venues.get_venue(name)
 
     def _persist_dca_counters(self) -> None:
         """שומר את ה-DCA counters ל-DemoState ולדיסק. נקרא אחרי כל מוטציה."""
@@ -643,12 +617,12 @@ class StrategyRunner:
         no_bid_count = 0
         sell_fail_msgs: list[str] = []
         for p in positions_snapshot:
-            bid, _ = await fetch_best_bid_ask(p.token_id)
+            bid, _ = await self._venue.best_bid_ask(p.token_id)
             if bid is None or bid <= 0:
                 no_bid_count += 1
                 continue
             cfg = self.rt.config
-            lo = await live_clob.place_exit_order(
+            lo = await self._venue.place_exit_order(
                 p.token_id,
                 float(p.contracts),
                 float(bid),
@@ -752,7 +726,7 @@ class StrategyRunner:
         if not force and (now - float(self.rt._last_live_reconcile_ts or 0) < 120.0):
             return
         try:
-            portfolio = await live_clob.fetch_live_portfolio(force=True)
+            portfolio = await self._venue.fetch_portfolio(force=True)
         except Exception as e:
             self.rt.log(f"reconcile לייב: שגיאת fetch — {e}")
             self._note_reconcile_fail(str(e))  # F8
@@ -807,7 +781,7 @@ class StrategyRunner:
             use_live = live_request and self._live_trading_ok()
             if use_live:
                 lim = float(p.get("limit") or 1.0)
-                lo = await live_clob.place_entry_order(
+                lo = await self._venue.place_entry_order(
                     str(p["token"]),
                     n_adj,
                     lim,
@@ -897,13 +871,13 @@ class StrategyRunner:
                 return {"ok": False, "error": verr or "גודל לא תקין"}
             use_live = live_request and self._live_trading_ok()
             if use_live:
-                _, ask = await fetch_best_bid_ask(str(p["token"]))
+                _, ask = await self._venue.best_bid_ask(str(p["token"]))
                 if ask is None:
                     self.rt.log("גידור לייב: אין Ask")
                     return {"ok": False, "error": "אין Ask לגידור"}
                 ask_f = float(ask)
                 cfg_h = self.rt.config
-                lo = await live_clob.place_entry_order(
+                lo = await self._venue.place_entry_order(
                     str(p["token"]),
                     n_adj,
                     ask_f,
@@ -1347,7 +1321,7 @@ class StrategyRunner:
         if not self.demo.state.positions:
             return
         try:
-            m = await discover_active_btc_window(self.rt.config.btc_window)
+            m = await self._venue.discover_active_window(self.rt.config.btc_window)
         except Exception:
             return
         if not m:
@@ -1421,7 +1395,7 @@ class StrategyRunner:
             )
         except Exception:
             pass
-        m = await discover_active_btc_window(self.rt.config.btc_window)
+        m = await self._venue.discover_active_window(self.rt.config.btc_window)
         if not m:
             self.rt.log(f"לא נמצא שוק BTC Up/Down חלון {self.rt.config.btc_window} פעיל")
             # F5: גילוי נכשל לגמרי (גם ה-stale-cache נעלם). רושמים תקלה רק אם זה נמשך >60s,
@@ -1666,8 +1640,8 @@ class StrategyRunner:
         min_left = sec_left / 60.0
         cfg = self.rt.config
         token_up, token_down = m.token_up, m.token_down
-        bid_u, ask_u = await fetch_best_bid_ask(token_up)
-        bid_d, ask_d = await fetch_best_bid_ask(token_down)
+        bid_u, ask_u = await self._venue.best_bid_ask(token_up)
+        bid_d, ask_d = await self._venue.best_bid_ask(token_down)
         missing: list[str] = []
         if ask_u is None:
             missing.append("Up")
@@ -1860,7 +1834,7 @@ class StrategyRunner:
             if tok_ff not in active_tokens_ps:
                 self.rt._tp_fail_fault_ts.pop(tok_ff, None)
         for p in list(self.demo.state.positions):
-            b, _ = await fetch_best_bid_ask(p.token_id)
+            b, _ = await self._venue.best_bid_ask(p.token_id)
             if b is None:
                 continue
             upnl = self.demo.unrealized_pnl_pct(p.token_id, b)
@@ -2000,10 +1974,10 @@ class StrategyRunner:
                             key=f"tp_cooldown_{p.token_id}",
                         )
                         continue
-                    _, bid_tp = await fetch_best_bid_ask(p.token_id)
+                    _, bid_tp = await self._venue.best_bid_ask(p.token_id)
                     if bid_tp is None:
                         continue
-                    lo = await live_clob.place_exit_order(
+                    lo = await self._venue.place_exit_order(
                         p.token_id,
                         pos_contracts,
                         float(bid_tp),
@@ -2037,7 +2011,7 @@ class StrategyRunner:
                             # לא Data API (שמעוכב). סנכרן p.contracts ישירות לשרשרת; אם 0 — הסר פוזיציה.
                             chain_bal: Optional[float] = None
                             try:
-                                chain_bal = await live_clob.fetch_chain_shares_for_token(p.token_id)
+                                chain_bal = await self._venue.fetch_chain_shares_for_token(p.token_id)
                             except Exception as e:
                                 self.rt.log(f"TP לייב: שגיאת שליפת יתרת שרשרת — {e}")
                             if chain_bal is not None and chain_bal < 1e-4:
@@ -2210,7 +2184,7 @@ class StrategyRunner:
                         return
                     n = n_h
                     if self._live_trading_ok():
-                        lo = await live_clob.place_entry_order(
+                        lo = await self._venue.place_entry_order(
                             str(other_token),
                             float(n),
                             float(other_ask),
@@ -2388,7 +2362,7 @@ class StrategyRunner:
                 return
 
         # Ask מעודכן מיד לפני חישוב כמות — Ask בתחילת הטיק עלול להיות ישן; בדמו/לייב המילוי משתמש ב-best ask מחדש
-        _, ask_entry = await fetch_best_bid_ask(str(token))
+        _, ask_entry = await self._venue.best_bid_ask(str(token))
         if ask_entry is not None:
             try:
                 ae = float(ask_entry)
@@ -2430,7 +2404,7 @@ class StrategyRunner:
                 if pos_idx >= 0:
                     p_dca = self.demo.state.positions[pos_idx]
                     # שולפים bid עדכני לטוקן
-                    bid_now, _ = await fetch_best_bid_ask(str(token))
+                    bid_now, _ = await self._venue.best_bid_ask(str(token))
                     if bid_now is not None and p_dca.avg_cost > 0:
                         drop_pct = (p_dca.avg_cost - float(bid_now)) / p_dca.avg_cost * 100.0
                         if drop_pct >= cfg.dca_discount_pct:
@@ -2650,7 +2624,7 @@ class StrategyRunner:
             return
 
         if self._live_trading_ok():
-            lo = await live_clob.place_entry_order(
+            lo = await self._venue.place_entry_order(
                 str(token),
                 float(n),
                 float(lim),

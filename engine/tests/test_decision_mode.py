@@ -70,9 +70,9 @@ async def _drive_tick(runner: StrategyRunner, *, ask_up: float, ask_down: float,
             return ask_down
         return None
 
-    with patch.object(strategy_runner, "discover_active_btc_window",
+    with patch.object(runner._venue, "discover_active_window",
                       AsyncMock(return_value=_fake_market())), \
-         patch.object(strategy_runner, "fetch_best_bid_ask", side_effect=fake_bid_ask), \
+         patch.object(runner._venue, "best_bid_ask", side_effect=fake_bid_ask), \
          patch.object(strategy_runner, "seconds_until_window_end", return_value=200), \
          patch.object(runner.demo, "mark_to_market", AsyncMock(return_value={})), \
          patch.object(runner.demo, "best_ask", side_effect=fake_best_ask):

@@ -52,15 +52,17 @@ async def test_rollover_lock_sentinel_prevents_double_settlement():
             return []
 
         # patch כל מה שצריך כדי שה-tick יגיע ל-rollover block
-        with patch(
-            "strategy_runner.discover_active_btc_window",
+        with patch.object(
+            runner._venue,
+            "discover_active_window",
             new=AsyncMock(return_value=fake_m),
         ), patch.object(
             eng, "expire_all_outside_tokens", side_effect=fake_expire
         ), patch.object(
             runner, "_live_reconcile_if_enabled", new=AsyncMock(return_value=None)
-        ), patch(
-            "strategy_runner.fetch_best_bid_ask",
+        ), patch.object(
+            runner._venue,
+            "best_bid_ask",
             new=AsyncMock(return_value=(None, None)),
         ):
             # שני ticks מקבילים
@@ -111,15 +113,17 @@ async def test_rollover_lock_sequential_ticks_work_normally():
             expire_count += 1
             return []
 
-        with patch(
-            "strategy_runner.discover_active_btc_window",
+        with patch.object(
+            runner._venue,
+            "discover_active_window",
             new=AsyncMock(return_value=FakeMarket()),
         ), patch.object(
             eng, "expire_all_outside_tokens", side_effect=fake_expire
         ), patch.object(
             runner, "_live_reconcile_if_enabled", new=AsyncMock(return_value=None)
-        ), patch(
-            "strategy_runner.fetch_best_bid_ask",
+        ), patch.object(
+            runner._venue,
+            "best_bid_ask",
             new=AsyncMock(return_value=(None, None)),
         ):
             await runner._tick()
