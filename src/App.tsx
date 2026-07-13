@@ -2351,6 +2351,7 @@ export default function App() {
           decision_min_confidence: Math.max(50, Math.min(100, decisionMinConfidence)),
           floor_stop_pct: Math.max(0, Math.min(100, floorStopPct)),
           order_mode: orderMode,
+          data_source: dataSource,
           entry_slippage_pct: Math.max(0, entrySlippagePct),
           market_max_entry_price_cents: Math.max(0, Math.min(100, marketMaxEntryPriceCents)),
           exit_slippage_pct: Math.max(0, exitSlippagePct),

@@ -1658,7 +1658,7 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "loss_recovery_max_multiplier must be >= 1")
     if body.order_mode not in ("limit", "market"):
         raise HTTPException(400, "order_mode must be 'limit' or 'market'")
-    if body.data_source not in ("polymarket", "binance"):
+    if "data_source" in body.model_fields_set and body.data_source not in ("polymarket", "binance"):
         raise HTTPException(400, "data_source must be 'polymarket' or 'binance'")
     if float(body.entry_slippage_pct) < 0 or float(body.entry_slippage_pct) > 50:
         raise HTTPException(400, "entry_slippage_pct must be between 0 and 50")
@@ -1696,6 +1696,8 @@ async def strategy_config(body: ConfigBody):
     body.decision_min_confidence = max(50.0, min(100.0, float(body.decision_min_confidence)))
     c = runner.rt.config
     for k, v in body.model_dump().items():
+        if k == "data_source":
+            continue  # handled explicitly below so a partial save can't silently revert the venue
         if hasattr(c, k):
             setattr(c, k, v)
     c.side_preference = body.side_preference  # type: ignore
@@ -1705,10 +1707,12 @@ async def strategy_config(body: ConfigBody):
         runner.rt.circuit_breaker_cooldown_until = 0.0
         runner.rt.circuit_breaker_tripped = False
         runner.rt.circuit_breaker_reason = ""
+    if "data_source" in body.model_fields_set:
+        runner.rt.config.data_source = body.data_source  # type: ignore
     import data_source as _data_source
     _data_source.set_active(runner.rt.config.data_source)
     await _clamp_min_contracts_to_market_floor()
-    saved = {**body.model_dump(), "min_contracts": runner.rt.config.min_contracts}
+    saved = {**body.model_dump(), "min_contracts": runner.rt.config.min_contracts, "data_source": runner.rt.config.data_source}
     append_event(
         "strategy_config_updated",
         {"config": saved, "mode": runner.rt.mode},
