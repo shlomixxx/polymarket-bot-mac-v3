@@ -229,6 +229,12 @@ h3 {
   border: 1px solid var(--border-strong) !important;
 }
 
+/* כפתור מקור נתונים (Polymarket/Binance) — הדגשה עדינה כש-Binance פעיל */
+.header-mode-btn[data-venue="binance"] {
+  border-color: rgba(247, 147, 26, 0.4) !important;
+  color: #f7931a !important;
+}
+
 .ui-card {
   background: var(--card);
   border-radius: var(--radius-md);

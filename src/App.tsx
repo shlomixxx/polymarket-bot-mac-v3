@@ -1677,6 +1677,8 @@ export default function App() {
       .catch(() => setBotTokenRequired(false));
   }, []);
   const [liveMode, setLiveMode] = useState(false);
+  /** מקור נתוני BTC הפעיל (לוח, סטטיסטיקה ודמו) — Polymarket (Chainlink) או Binance */
+  const [dataSource, setDataSource] = useState<"polymarket" | "binance">("polymarket");
   /** מצב "כסף אמיתי" בפועל מצד המנוע (לאחר kill-switch/מפתח) — לצגת חסימה אם יש */
   const [liveModeEffective, setLiveModeEffective] = useState(false);
   const [liveModeBlockedReason, setLiveModeBlockedReason] = useState<string | null>(null);
@@ -2036,6 +2038,10 @@ export default function App() {
           setBotMode(m);
           setRequireApproval(m === "semi");
         }
+      }
+      {
+        const c = cfg as Record<string, unknown>;
+        if (c.data_source === "polymarket" || c.data_source === "binance") setDataSource(c.data_source);
       }
       if (typeof (cfg as any).last_status === "string") setEngineStatus((cfg as any).last_status);
       if (typeof (cfg as any).last_tick_ts === "number") setEngineLastTickTs((cfg as any).last_tick_ts);
@@ -2568,6 +2574,25 @@ export default function App() {
           <span className={`badge-mode ${liveMode ? "badge-mode--live" : "badge-mode--demo"}`}>
             {liveMode ? (liveModeEffective ? "מסחר חי" : "מסחר חי (חסום)") : "סימולציה"}
           </span>
+          <button
+            type="button"
+            className="ui-btn ui-btn--ghost header-mode-btn"
+            data-venue={dataSource}
+            title="מקור נתוני BTC — לוח, סטטיסטיקה ודמו"
+            onClick={async () => {
+              const next = dataSource === "polymarket" ? "binance" : "polymarket";
+              setDataSource(next); // אופטימי
+              try {
+                await api("/api/data-source", { method: "POST", body: JSON.stringify({ data_source: next }) });
+                void refresh();
+              } catch (e) {
+                setDataSource(dataSource); // rollback
+                alert(e instanceof Error ? e.message : "כשל בעדכון מקור נתונים");
+              }
+            }}
+          >
+            נתונים: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
+          </button>
           <Button
             variant="primary"
             className="header-mode-btn"
@@ -2819,7 +2844,12 @@ export default function App() {
         <>
           {market && (
             <Card padding="md" style={{ marginBottom: "var(--s-4)" }}>
-              <div style={{ color: "var(--muted)", fontSize: 14 }}>{market.title}</div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <div style={{ color: "var(--muted)", fontSize: 14 }}>{market.title}</div>
+                <span className="badge-mode" title="מקור הנתונים של המספרים בעמוד">
+                  מקור: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
+                </span>
+              </div>
               <div style={{ fontSize: 13, marginTop: 4 }}>
                 נותרו {Math.floor((effectiveWindowSecondsLeft ?? market.seconds_left) / 60)}:
                 {String(Math.floor((effectiveWindowSecondsLeft ?? market.seconds_left) % 60)).padStart(2, "0")} עד סיום החלון · אורך החלון{" "}
@@ -4658,9 +4688,14 @@ export default function App() {
 
       {(tab === "stats" || tab === "stats_live") && (
         <Card padding="lg">
-          <SectionTitle as="h2">
-            {tab === "stats_live" ? "סטטיסטיקות מסחר חי" : "סטטיסטיקות סימולציה (דמו)"}
-          </SectionTitle>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+            <SectionTitle as="h2">
+              {tab === "stats_live" ? "סטטיסטיקות מסחר חי" : "סטטיסטיקות סימולציה (דמו)"}
+            </SectionTitle>
+            <span className="badge-mode" title="מקור הנתונים של המספרים בעמוד">
+              מקור: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
+            </span>
+          </div>
           {tab === "stats_live" && (
             <div style={{ marginTop: "var(--s-2)", marginBottom: "var(--s-3)", display: "grid", gap: "var(--s-2)" }}>
               <p style={{ fontSize: "0.8125rem", color: "var(--muted)", margin: 0, lineHeight: 1.5 }}>
