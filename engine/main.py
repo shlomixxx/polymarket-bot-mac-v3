@@ -381,6 +381,7 @@ def _load_persisted_config() -> None:
                 runner.rt.live_trading = False
         import data_source as _data_source
         _data_source.set_active(getattr(runner.rt.config, "data_source", "polymarket"))
+        runner.select_venue(getattr(runner.rt.config, "order_venue", "polymarket"))
     except Exception as e:
         print(f"[polymarket-bot] אזהרה: לא ניתן לטעון config שמור — {e}", flush=True)
 
@@ -435,6 +436,7 @@ def _save_persisted_config() -> None:
             "loss_recovery_max_multiplier": getattr(c, "loss_recovery_max_multiplier", 3.0),
             "order_mode": getattr(c, "order_mode", "limit"),
             "data_source": str(getattr(c, "data_source", "polymarket")),
+            "order_venue": str(getattr(c, "order_venue", "polymarket")),
             "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
             "market_max_entry_price_cents": float(getattr(c, "market_max_entry_price_cents", 80.0)),
             "exit_slippage_pct": getattr(c, "exit_slippage_pct", 5.0),
@@ -1611,6 +1613,7 @@ class ConfigBody(BaseModel):
     # ביצוע מובטח: "limit" (ברירת מחדל, תאימות לאחור) או "market" (FOK/FAK)
     order_mode: str = "limit"
     data_source: str = "polymarket"  # polymarket | binance — מקור נתוני BTC
+    order_venue: str = "polymarket"  # polymarket | predict_fun — יעד ביצוע הפקודות
     entry_slippage_pct: float = 2.0
     market_max_entry_price_cents: float = 80.0  # תקרת מחיר למצב market (0/100 = ללא תקרה)
     exit_slippage_pct: float = 5.0
@@ -1660,6 +1663,8 @@ async def strategy_config(body: ConfigBody):
         raise HTTPException(400, "order_mode must be 'limit' or 'market'")
     if "data_source" in body.model_fields_set and body.data_source not in ("polymarket", "binance"):
         raise HTTPException(400, "data_source must be 'polymarket' or 'binance'")
+    if "order_venue" in body.model_fields_set and body.order_venue not in ("polymarket", "predict_fun"):
+        raise HTTPException(400, "order_venue must be 'polymarket' or 'predict_fun'")
     if float(body.entry_slippage_pct) < 0 or float(body.entry_slippage_pct) > 50:
         raise HTTPException(400, "entry_slippage_pct must be between 0 and 50")
     if float(body.market_max_entry_price_cents) < 0 or float(body.market_max_entry_price_cents) > 100:
@@ -1698,6 +1703,8 @@ async def strategy_config(body: ConfigBody):
     for k, v in body.model_dump().items():
         if k == "data_source":
             continue  # handled explicitly below so a partial save can't silently revert the venue
+        if k == "order_venue":
+            continue  # handled explicitly below so a partial save can't silently revert the venue
         if hasattr(c, k):
             setattr(c, k, v)
     c.side_preference = body.side_preference  # type: ignore
@@ -1711,8 +1718,16 @@ async def strategy_config(body: ConfigBody):
         runner.rt.config.data_source = body.data_source  # type: ignore
     import data_source as _data_source
     _data_source.set_active(runner.rt.config.data_source)
+    if "order_venue" in body.model_fields_set:
+        runner.rt.config.order_venue = body.order_venue  # type: ignore
+        runner.select_venue(runner.rt.config.order_venue)
     await _clamp_min_contracts_to_market_floor()
-    saved = {**body.model_dump(), "min_contracts": runner.rt.config.min_contracts, "data_source": runner.rt.config.data_source}
+    saved = {
+        **body.model_dump(),
+        "min_contracts": runner.rt.config.min_contracts,
+        "data_source": runner.rt.config.data_source,
+        "order_venue": runner.rt.config.order_venue,
+    }
     append_event(
         "strategy_config_updated",
         {"config": saved, "mode": runner.rt.mode},
@@ -1769,6 +1784,7 @@ async def get_strategy_config():
         "floor_stop_pct": float(getattr(c, "floor_stop_pct", 0.0)),
         "order_mode": getattr(c, "order_mode", "limit"),
         "data_source": str(getattr(c, "data_source", "polymarket")),
+        "order_venue": str(getattr(c, "order_venue", "polymarket")),
         "entry_slippage_pct": getattr(c, "entry_slippage_pct", 2.0),
         "market_max_entry_price_cents": float(getattr(c, "market_max_entry_price_cents", 80.0)),
         "exit_slippage_pct": getattr(c, "exit_slippage_pct", 5.0),
@@ -1863,6 +1879,26 @@ async def set_data_source(body: DataSourceBody):
     _data_source.set_active(body.data_source)
     _save_persisted_config()
     return {"ok": True, "data_source": _data_source.get_active()}
+
+
+class OrderVenueBody(BaseModel):
+    order_venue: str  # polymarket | predict_fun
+
+
+@app.get("/api/order-venue")
+async def get_order_venue():
+    return {"order_venue": getattr(runner.rt.config, "order_venue", "polymarket")}
+
+
+@app.post("/api/order-venue")
+async def set_order_venue(body: OrderVenueBody):
+    import venues
+    if body.order_venue not in venues.VALID_ORDER_VENUES:
+        raise HTTPException(400, "order_venue must be 'polymarket' or 'predict_fun'")
+    runner.rt.config.order_venue = body.order_venue  # type: ignore
+    runner.select_venue(body.order_venue)
+    _save_persisted_config()
+    return {"ok": True, "order_venue": runner.rt.config.order_venue}
 
 
 @app.post("/api/strategy/reset-loss-recovery")

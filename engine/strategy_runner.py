@@ -105,6 +105,9 @@ class StrategyConfig:
     # מקור נתוני BTC: "polymarket" (Chainlink stream) או "binance". שולט מאיפה נקראים
     # מחיר נוכחי, "מחיר לנצח", והסטטיסטיקה/דמו. אינו משנה לאן נשלחות פקודות (זה M2).
     data_source: Literal["polymarket", "binance"] = "polymarket"
+    # יעד ביצוע הפקודות (M2a): "polymarket" (ברירת מחדל) או "predict_fun". שולט לאן
+    # נשלחות פקודות buy/sell בפועל — עצמאי מ-data_source (שם/מקור המחיר).
+    order_venue: Literal["polymarket", "predict_fun"] = "polymarket"
     entry_slippage_pct: float = 2.0  # תקרת slippage לכניסת MARKET BUY
     exit_slippage_pct: float = 5.0   # תקרת slippage ליציאת MARKET SELL (רחבה — עדיף לצאת)
     # תקרת מחיר שפויה למצב market בלבד: לא נכנסים אם ה-Ask של הצד הנבחר עולה על
