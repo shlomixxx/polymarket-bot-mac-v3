@@ -1304,7 +1304,7 @@ class DemoEngine:
     async def _attach_window_btc_to_tp_trade(self, trade: dict[str, Any], *, side: str) -> None:
         """מחירי BTC בתחילת/סוף חלון (כמו בפירוק) — למעקב גם אחרי TP, לא רק SETTLE_*."""
         import data_source
-        trade["data_source"] = data_source.get_active()
+        trade.setdefault("data_source", data_source.get_active())
         ep, ws = self._infer_epoch_window_for_exit_trade(trade)
         if ep is None:
             return
