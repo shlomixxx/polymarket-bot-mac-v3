@@ -1178,14 +1178,13 @@ async def market_current():
                 if (
                     ob is not None
                     and last_epoch_for_open == epoch
-                    and cached_ptb_source not in ("chainlink_stream", "chainlink_polygon_window", "binance_1m")
+                    and cached_ptb_source not in ("chainlink_stream", "chainlink_polygon_window")
                 ):
                     cached_open = ob
                     cached_ptb_source = "binance_1m_fallback"
             except Exception:
                 pass
             # שדרוג לאורקל Polygon (cache פר-epoch ב-_CHAINLINK_AT_WINDOW_CACHE → זול בחזרה).
-            # רלוונטי רק במצב polymarket — במצב binance אין ל-Chainlink מקום ב-PTB בכלל.
             try:
                 ptb = await asyncio.wait_for(
                     fetch_chainlink_btc_usd_polygon_at_window_start(epoch), timeout=10.0
@@ -1196,12 +1195,17 @@ async def market_current():
                 ptb is not None
                 and last_epoch_for_open == epoch
                 and cached_ptb_source != "chainlink_stream"
-                and _data_source.get_active() != "binance"
             ):
                 cached_open = ptb
                 cached_ptb_source = "chainlink_polygon_window"
 
-        asyncio.create_task(_populate_price_to_beat_fallback(m.epoch))
+        # ה-fallback הזה כולו Chainlink/Binance-כ-fallback-ל-Chainlink — רלוונטי רק
+        # במצב polymarket. במצב binance המחיר נלכד סינכרונית למטה בכל פול; אין להריץ
+        # את המשימה הזאת ברקע כי בלוק אורקל ה-Polygon שלה מבוסס Chainlink ועלול
+        # "לדרוס" את ה-binance_1m בתנאי מרוץ (ה-return המוקדם למטה מונע קריאה ל-
+        # chainlink_stream.get_price_to_beat, אך לא למשימת הרקע הזו לולא ה-guard כאן).
+        if _active != "binance":
+            asyncio.create_task(_populate_price_to_beat_fallback(m.epoch))
 
     # מקור "מחיר לנצח" לפי מקור-הנתונים הפעיל: במצב binance — נר פתיחת Binance 1m בלבד
     # (בלוק Chainlink לא נקרא כלל); במצב polymarket — הטיק המדויק בפיד Chainlink Data
