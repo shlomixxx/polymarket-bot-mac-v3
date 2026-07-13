@@ -37,3 +37,17 @@ def test_partial_config_save_keeps_order_venue(client):
     body = main.ConfigBody().model_dump(); body.pop("order_venue", None)
     assert client.post("/api/strategy/config", json=body).status_code == 200
     assert main.runner.rt.config.order_venue == "predict_fun"   # NOT reverted
+
+
+def test_cannot_select_predict_fun_while_live(client):
+    main.runner.rt.live_trading = True
+    try:
+        r = client.post("/api/order-venue", json={"order_venue": "predict_fun"})
+        assert r.status_code == 400
+        assert main.runner.rt.config.order_venue == "polymarket"   # unchanged
+        assert main.runner._venue.name == "polymarket"
+        # config-POST path also guarded
+        body = main.ConfigBody(order_venue="predict_fun").model_dump()
+        assert client.post("/api/strategy/config", json=body).status_code == 400
+    finally:
+        main.runner.rt.live_trading = False

@@ -1719,6 +1719,8 @@ async def strategy_config(body: ConfigBody):
     import data_source as _data_source
     _data_source.set_active(runner.rt.config.data_source)
     if "order_venue" in body.model_fields_set:
+        if body.order_venue == "predict_fun" and getattr(runner.rt, "live_trading", False):
+            raise HTTPException(400, "cannot switch order venue to Predict.fun while real-money (live) trading is ON — Predict.fun order placement is not enabled yet (testnet-first, M2b). Turn off live trading first.")
         runner.rt.config.order_venue = body.order_venue  # type: ignore
         runner.select_venue(runner.rt.config.order_venue)
     await _clamp_min_contracts_to_market_floor()
@@ -1895,6 +1897,8 @@ async def set_order_venue(body: OrderVenueBody):
     import venues
     if body.order_venue not in venues.VALID_ORDER_VENUES:
         raise HTTPException(400, "order_venue must be 'polymarket' or 'predict_fun'")
+    if body.order_venue == "predict_fun" and getattr(runner.rt, "live_trading", False):
+        raise HTTPException(400, "cannot switch order venue to Predict.fun while real-money (live) trading is ON — Predict.fun order placement is not enabled yet (testnet-first, M2b). Turn off live trading first.")
     runner.rt.config.order_venue = body.order_venue  # type: ignore
     runner.select_venue(body.order_venue)
     _save_persisted_config()
