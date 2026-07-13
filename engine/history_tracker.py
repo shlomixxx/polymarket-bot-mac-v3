@@ -26,6 +26,7 @@ def _get_conn() -> sqlite3.Connection:
                 slug TEXT NOT NULL,
                 window_sec INTEGER NOT NULL DEFAULT 300,
                 side_won TEXT,
+                side_won_polymarket TEXT,
                 btc_open REAL,
                 btc_close REAL,
                 ts_recorded REAL NOT NULL,
@@ -34,6 +35,12 @@ def _get_conn() -> sqlite3.Connection:
                 UNIQUE(epoch, slug)
             )
         """)
+        # מיגרציה אידמפוטנטית: DB ישן שנוצר לפני הוספת side_won_polymarket לא יקבל אותה
+        # מ-CREATE TABLE IF NOT EXISTS (הטבלה כבר קיימת) — מוסיפים אותה כאן רק אם חסרה,
+        # כדי שהאתחול לעולם לא יקרוס על DB קיים.
+        cols = [row["name"] for row in _conn.execute("PRAGMA table_info(window_results)").fetchall()]
+        if "side_won_polymarket" not in cols:
+            _conn.execute("ALTER TABLE window_results ADD COLUMN side_won_polymarket TEXT")
         _conn.commit()
     return _conn
 
@@ -45,6 +52,7 @@ def record_window_result(
     btc_open: Optional[float] = None,
     btc_close: Optional[float] = None,
     window_sec: int = 300,
+    side_won_polymarket: Optional[str] = None,
 ) -> bool:
     """שומר תוצאת חלון. מחזיר True אם נשמר בהצלחה.
 
@@ -53,6 +61,11 @@ def record_window_result(
     באותו record — לא לדרוס (idempotent: שני הנתיבים שיקרא את אותם kline יחזירו אותו
     תוצאה). זה מאפשר ל-strategy_runner ול-auto_history_recorder לרשום את אותו חלון
     בלי שאחד "מנצח" את השני, וגם מתקן רישומים חלקיים.
+
+    side_won_polymarket: תוצאת אותו חלון לפי אורקל Chainlink (Polygon) — ה-oracle
+    שממנו Polymarket עצמו נסגר. אופציונלי (None אם לא חושב/נכשל); אז get_recent_windows
+    / get_last_window_winners / get_hourly_breakdown נופלים ל-side_won (Binance) במצב
+    polymarket.
     """
     try:
         import datetime
@@ -68,10 +81,12 @@ def record_window_result(
         conn.execute(
             """
             INSERT INTO window_results
-              (epoch, slug, window_sec, side_won, btc_open, btc_close, ts_recorded, hour_utc, weekday)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (epoch, slug, window_sec, side_won, side_won_polymarket, btc_open, btc_close,
+               ts_recorded, hour_utc, weekday)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(epoch, slug) DO UPDATE SET
               side_won = COALESCE(side_won, excluded.side_won),
+              side_won_polymarket = COALESCE(side_won_polymarket, excluded.side_won_polymarket),
               btc_open = COALESCE(btc_open, excluded.btc_open),
               btc_close = COALESCE(btc_close, excluded.btc_close),
               window_sec = excluded.window_sec,
@@ -80,7 +95,10 @@ def record_window_result(
                 ELSE ts_recorded
               END
             """,
-            (epoch, slug, window_sec, side_won, btc_open, btc_close, time.time(), dt.hour, dt.weekday()),
+            (
+                epoch, slug, window_sec, side_won, side_won_polymarket, btc_open, btc_close,
+                time.time(), dt.hour, dt.weekday(),
+            ),
         )
         conn.commit()
         return conn.total_changes > 0
@@ -182,28 +200,47 @@ def get_win_rate_stats(window_sec: int = 300) -> dict[str, Any]:
         return {"available": False, "error": str(e)}
 
 
-def get_recent_windows(limit: int = 20, window_sec: int = 300) -> list[dict]:
-    """מחזיר חלונות אחרונים לתצוגה ב-UI."""
+def _route_side_won(rows: list[dict], data_source: str) -> list[dict]:
+    """מיישם את בחירת ה-side_won לפי data_source ("polymarket" → COALESCE(side_won_polymarket,
+    side_won); אחרת ("binance"/כל דבר אחר) → side_won כרגיל). צורת ה-dict נשארת זהה
+    (side_won_polymarket מוסר מהתשובה — הצרכנים/ה-UI ממשיכים לקרוא רק side_won)."""
+    if data_source == "polymarket":
+        for r in rows:
+            r["side_won"] = r.get("side_won_polymarket") or r.get("side_won")
+    for r in rows:
+        r.pop("side_won_polymarket", None)
+    return rows
+
+
+def get_recent_windows(limit: int = 20, window_sec: int = 300, data_source: str = "binance") -> list[dict]:
+    """מחזיר חלונות אחרונים לתצוגה ב-UI.
+
+    data_source: "binance" (ברירת מחדל, תואם-לאחור) → side_won כרגיל.
+    "polymarket" → side_won מוחלף ב-COALESCE(side_won_polymarket, side_won) — התוצאה לפי
+    אורקל Chainlink כשקיימת, אחרת נופל ל-Binance (שורות ישנות בלי ערך polymarket).
+    """
     try:
         conn = _get_conn()
         cur = conn.execute(
             """
-            SELECT epoch, slug, side_won, btc_open, btc_close, ts_recorded
+            SELECT epoch, slug, side_won, side_won_polymarket, btc_open, btc_close, ts_recorded
             FROM window_results
             WHERE window_sec=?
             ORDER BY epoch DESC LIMIT ?
             """,
             (window_sec, limit),
         )
-        return [dict(row) for row in cur.fetchall()]
+        rows = [dict(row) for row in cur.fetchall()]
     except Exception:
         return []
+    return _route_side_won(rows, data_source)
 
 
 def get_last_window_winners(
     window_sec: int = 300,
     limit: int = 5,
     min_drift_pct: float = 0.0,
+    data_source: str = "binance",
 ) -> list[dict[str, Any]]:
     """N חלונות אחרונים שנסגרו עם תוצאה ידועה (פיצ'ר Follow Last Winner).
 
@@ -211,6 +248,8 @@ def get_last_window_winners(
     - limit: כמה חלונות אחרונים להחזיר אחרי הסינון.
     - min_drift_pct: אם > 0, מסנן חלונות שהזזת BTC בהם < X% (רעש).
       0 = ללא סינון. אחוז מוחלט: |btc_close-btc_open|/btc_open*100.
+    - data_source: "binance" (ברירת מחדל) → side_won כרגיל; "polymarket" → side_won
+      מוחלף ב-COALESCE(side_won_polymarket, side_won) (עוקב אחרי אורקל Chainlink).
 
     הסידור: epoch DESC — הראשון ברשימה הוא החלון העדכני ביותר.
     """
@@ -220,7 +259,7 @@ def get_last_window_winners(
         fetch_limit = max(limit * 6, limit) if min_drift_pct > 0 else limit
         cur = conn.execute(
             """
-            SELECT epoch, slug, window_sec, side_won, btc_open, btc_close, ts_recorded
+            SELECT epoch, slug, window_sec, side_won, side_won_polymarket, btc_open, btc_close, ts_recorded
             FROM window_results
             WHERE window_sec = ? AND side_won IS NOT NULL
             ORDER BY epoch DESC LIMIT ?
@@ -230,6 +269,7 @@ def get_last_window_winners(
         rows = [dict(row) for row in cur.fetchall()]
     except Exception:
         return []
+    rows = _route_side_won(rows, data_source)
     if min_drift_pct <= 0:
         return rows[:limit]
     filtered: list[dict[str, Any]] = []
@@ -253,15 +293,21 @@ def get_last_window_winners(
     return filtered
 
 
-def get_hourly_breakdown(window_sec: int = 300) -> list[dict]:
-    """פירוט win rate לכל שעה (0-23 UTC)."""
+def get_hourly_breakdown(window_sec: int = 300, data_source: str = "binance") -> list[dict]:
+    """פירוט win rate לכל שעה (0-23 UTC).
+
+    data_source: "polymarket" → הספירה לפי COALESCE(side_won_polymarket, side_won);
+    אחרת (ברירת מחדל "binance") → side_won כרגיל. side_expr נבנה מקבוע פנימי בלבד
+    (לא מקלט משתמש) — אין כאן SQL injection.
+    """
+    side_expr = "COALESCE(side_won_polymarket, side_won)" if data_source == "polymarket" else "side_won"
     try:
         conn = _get_conn()
         cur = conn.execute(
-            """
+            f"""
             SELECT hour_utc,
               COUNT(*) as total,
-              SUM(CASE WHEN side_won='Up' THEN 1 ELSE 0 END) as up_wins
+              SUM(CASE WHEN {side_expr}='Up' THEN 1 ELSE 0 END) as up_wins
             FROM window_results
             WHERE window_sec=? AND side_won IS NOT NULL
             GROUP BY hour_utc

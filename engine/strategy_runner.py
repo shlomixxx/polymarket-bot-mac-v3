@@ -1176,11 +1176,15 @@ class StrategyRunner:
         try:
             from history_tracker import get_last_window_winners
             from market_discovery import window_step_sec
+            import data_source
             try:
                 window_sec = window_step_sec(cfg.btc_window)
             except Exception:
                 window_sec = 300
-            winners = get_last_window_winners(window_sec=window_sec, limit=1, min_drift_pct=0.0)
+            winners = get_last_window_winners(
+                window_sec=window_sec, limit=1, min_drift_pct=0.0,
+                data_source=data_source.get_active(),
+            )
             if winners and winners[0].get("side_won") in ("Up", "Down"):
                 return winners[0]["side_won"]
         except Exception:
@@ -1208,12 +1212,16 @@ class StrategyRunner:
             # אין קמפיין → מחפשים דשדוש טרי ב-N החלונות האחרונים (נרות גולמיים, בלי סינון drift).
             from history_tracker import get_last_window_winners
             from market_discovery import window_step_sec
+            import data_source
             try:
                 window_sec = window_step_sec(cfg.btc_window)
             except Exception:
                 window_sec = 300
             n = int(getattr(cfg, "chop_length_n", 4) or 4)
-            winners = get_last_window_winners(window_sec=window_sec, limit=n, min_drift_pct=0.0)
+            winners = get_last_window_winners(
+                window_sec=window_sec, limit=n, min_drift_pct=0.0,
+                data_source=data_source.get_active(),
+            )
             sides = [w.get("side_won") for w in winners]  # most-recent-first
             strip = " ".join("🟢" if s == "Up" else "🔴" for s in reversed(sides)) if sides else "—"
             if chop_gate.is_chop(sides, n):
@@ -1275,6 +1283,7 @@ class StrategyRunner:
         """
         from history_tracker import get_last_window_winners
         from market_discovery import window_step_sec
+        import data_source
 
         try:
             window_sec = window_step_sec(cfg.btc_window)
@@ -1284,7 +1293,8 @@ class StrategyRunner:
         lookback = max(1, min(5, lookback))
         min_drift = float(getattr(cfg, "follow_last_winner_min_btc_drift_pct", 0.0) or 0.0)
         winners = get_last_window_winners(
-            window_sec=window_sec, limit=lookback, min_drift_pct=min_drift
+            window_sec=window_sec, limit=lookback, min_drift_pct=min_drift,
+            data_source=data_source.get_active(),
         )
         if not winners:
             self.rt.status(

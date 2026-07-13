@@ -217,3 +217,61 @@ def test_resolve_follow_winner_side_clamps_lookback():
         side = runner._resolve_follow_winner_side(cfg)
         # 10 Up בהיסטוריה → גם clamp ל-5 → רוב Up
         assert side == "Up"
+
+
+def test_resolve_follow_winner_side_routes_by_active_data_source():
+    """FLW חייב לעקוב אחרי המנצח לפי ה-oracle של המקור הפעיל (Binance vs Polymarket/Chainlink),
+    לא תמיד לפי Binance. הבדיקה זורעת שורה שבה שני ה-oracles חלוקים."""
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["DATA_ROOT"] = str(d)
+        import importlib
+        import history_tracker
+        importlib.reload(history_tracker)
+        # Binance side_won=Down, Polymarket(Chainlink) side_won=Up — המקורות חלוקים בכוונה.
+        history_tracker.record_window_result(
+            epoch=100, slug="s1", side_won="Down", side_won_polymarket="Up",
+            btc_open=100.0, btc_close=99.0,
+        )
+        import strategy_runner
+        importlib.reload(strategy_runner)
+        import data_source
+        cfg = strategy_runner.StrategyConfig(
+            follow_last_winner_enabled=True,
+            follow_last_winner_lookback=1,
+            follow_last_winner_mode="forward",
+        )
+        from demo_engine import DemoEngine
+        demo = DemoEngine(Path(d) / "state.json")
+        runner = strategy_runner.StrategyRunner(demo=demo)
+        runner.rt.config = cfg
+        try:
+            data_source.set_active("binance")
+            assert runner._resolve_follow_winner_side(cfg) == "Down"
+            data_source.set_active("polymarket")
+            assert runner._resolve_follow_winner_side(cfg) == "Up"
+        finally:
+            data_source.set_active("polymarket")  # cleanup
+
+
+def test_resolve_follow_winner_side_calls_get_last_window_winners_with_active_source():
+    """Guardrail: מוודא שהקריאה עצמה מעבירה data_source (לא רק בודק תוצאה סופית)."""
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["DATA_ROOT"] = str(d)
+        import importlib
+        import history_tracker
+        importlib.reload(history_tracker)
+        import strategy_runner
+        importlib.reload(strategy_runner)
+        import data_source
+        cfg = strategy_runner.StrategyConfig(follow_last_winner_enabled=True, follow_last_winner_lookback=1)
+        from demo_engine import DemoEngine
+        demo = DemoEngine(Path(d) / "state.json")
+        runner = strategy_runner.StrategyRunner(demo=demo)
+        runner.rt.config = cfg
+        try:
+            data_source.set_active("binance")
+            with patch("history_tracker.get_last_window_winners", return_value=[]) as mocked:
+                runner._resolve_follow_winner_side(cfg)
+                assert mocked.call_args.kwargs.get("data_source") == "binance"
+        finally:
+            data_source.set_active("polymarket")  # cleanup

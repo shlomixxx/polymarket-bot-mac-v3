@@ -622,6 +622,16 @@ async def _backfill_missing_history_windows(
                 if btc_open is None or btc_close is None:
                     continue
                 side_won = "Up" if btc_close >= btc_open else "Down"
+                # תוצאה לפי אורקל Chainlink (Polygon) — עטוף try/except כדי שכשל RPC
+                # לעולם לא ימנע את השלמת ה-backfill (שנשען על Binance).
+                side_won_polymarket = None
+                try:
+                    cl_start = await fetch_chainlink_btc_usd_polygon_at_window_start(int(ep))
+                    cl_end = await fetch_chainlink_btc_usd_polygon_at_window_start(int(ep) + int(ws))
+                    if cl_start is not None and cl_end is not None:
+                        side_won_polymarket = "Up" if cl_end >= cl_start else "Down"
+                except Exception:
+                    side_won_polymarket = None
                 window_label = "5m" if ws == 300 else "15m"
                 slug = f"btc-updown-{window_label}-{ep}"
                 record_window_result(
@@ -631,6 +641,7 @@ async def _backfill_missing_history_windows(
                     side_won=side_won,
                     btc_open=btc_open,
                     btc_close=btc_close,
+                    side_won_polymarket=side_won_polymarket,
                 )
                 total_filled += 1
                 # קצב — לא להכריח את Binance עם 60+ בקשות במכה
@@ -726,6 +737,20 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
                     if btc_open is not None and btc_close is not None:
                         # FIX #2: tie ⇒ Up (זהה ל-demo_engine.py:482 ול-Dashboard text).
                         side_won = "Up" if btc_close >= btc_open else "Down"
+                        # תוצאת אותו חלון לפי אורקל Chainlink (Polygon) — ה-oracle שממנו
+                        # Polymarket עצמו נסגר. בעטיפת try/except: כשל RPC של Polygon
+                        # לעולם לא אמור להפיל את רישום ה-Binance (which is the source of
+                        # truth for "binance" mode and the fallback for "polymarket" mode).
+                        side_won_polymarket = None
+                        try:
+                            cl_start = await fetch_chainlink_btc_usd_polygon_at_window_start(prev_epoch)
+                            cl_end = await fetch_chainlink_btc_usd_polygon_at_window_start(
+                                prev_epoch + prev_window_sec
+                            )
+                            if cl_start is not None and cl_end is not None:
+                                side_won_polymarket = "Up" if cl_end >= cl_start else "Down"
+                        except Exception:
+                            side_won_polymarket = None
                         record_window_result(
                             epoch=prev_epoch,
                             slug=prev_slug,
@@ -733,6 +758,7 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
                             side_won=side_won,
                             btc_open=btc_open,
                             btc_close=btc_close,
+                            side_won_polymarket=side_won_polymarket,
                         )
                         _last_recorded_epoch = prev_epoch
                         _binance_miss_streak = 0  # F4: הצלחה — מאפסים את רצף הכשלים
@@ -2696,15 +2722,20 @@ async def history_record(body: WindowResultBody):
 
 @app.get("/api/history/recent")
 async def history_recent(limit: int = 20, window_sec: int = 300):
-    """חלונות אחרונים מההיסטוריה."""
-    rows = get_recent_windows(limit=min(int(limit), 100), window_sec=int(window_sec))
+    """חלונות אחרונים מההיסטוריה — side_won מנותב לפי מקור-הנתונים הפעיל (Binance/Polymarket)."""
+    import data_source as _data_source
+    rows = get_recent_windows(
+        limit=min(int(limit), 100), window_sec=int(window_sec),
+        data_source=_data_source.get_active(),
+    )
     return {"windows": rows}
 
 
 @app.get("/api/history/hourly")
 async def history_hourly(window_sec: int = 300):
-    """פירוט win rate לפי שעה (0-23 UTC)."""
-    rows = get_hourly_breakdown(window_sec=int(window_sec))
+    """פירוט win rate לפי שעה (0-23 UTC) — מנותב לפי מקור-הנתונים הפעיל."""
+    import data_source as _data_source
+    rows = get_hourly_breakdown(window_sec=int(window_sec), data_source=_data_source.get_active())
     return {"hourly": rows}
 
 
@@ -2941,7 +2972,9 @@ async def history_last_window_outcome(request: Request):
     SQLite לשנייה/לקוח; מתבטל מיד ב-POST config. ה-cache כאן בלבד — לעולם לא בתוך
     get_last_window_winners, שהוא על נתיב ה-FLW entry החי (Guardrail).
     """
+    import data_source as _data_source
     c = runner.rt.config
+    ds = _data_source.get_active()
     try:
         from market_discovery import window_step_sec
         ws = window_step_sec(getattr(c, "btc_window", "5m"))
@@ -2952,12 +2985,13 @@ async def history_last_window_outcome(request: Request):
     flw_mode = str(getattr(c, "follow_last_winner_mode", "forward"))
     flw_min_drift = float(getattr(c, "follow_last_winner_min_btc_drift_pct", 0.0) or 0.0)
     flw_side_pref = getattr(c, "side_preference", "Up")
-    cache_key = (ws, flw_enabled, flw_lookback, flw_mode, flw_min_drift, flw_side_pref)
+    # ds בתוך המפתח: מעבר Binance↔Polymarket מייצר cache-miss מיידי (בלי תלות ב-invalidate נפרד).
+    cache_key = (ws, flw_enabled, flw_lookback, flw_mode, flw_min_drift, flw_side_pref, ds)
     cached_payload = _LWO_CACHE.get(cache_key)
     if cached_payload is not None:
         return etag_json_response(cached_payload, request.headers.get("if-none-match"))
     # תמיד לוקחים את החלון האחרון (ללא סינון drift) לתצוגה
-    latest = get_last_window_winners(window_sec=ws, limit=1, min_drift_pct=0.0)
+    latest = get_last_window_winners(window_sec=ws, limit=1, min_drift_pct=0.0, data_source=ds)
     last_out: Optional[dict[str, Any]] = None
     if latest:
         r = latest[0]
@@ -2987,7 +3021,9 @@ async def history_last_window_outcome(request: Request):
     if flw_enabled:
         try:
             side = runner._resolve_follow_winner_side(c)
-            sample = get_last_window_winners(window_sec=ws, limit=flw_lookback, min_drift_pct=flw_min_drift)
+            sample = get_last_window_winners(
+                window_sec=ws, limit=flw_lookback, min_drift_pct=flw_min_drift, data_source=ds
+            )
             flw_preview = {
                 "side": side,  # None אם אין history → fallback ל-side_preference
                 "lookback": flw_lookback,

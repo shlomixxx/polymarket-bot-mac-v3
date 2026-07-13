@@ -4474,6 +4474,14 @@ export default function App() {
                   {botWins.pct != null ? ` (${botWins.pct}%)` : ""}
                 </span>
               </div>
+              <div style={{ marginBottom: 6 }}>
+                <span
+                  className="badge-mode"
+                  title="מקור התוצאות לפיו מחושב Up/Down בחלונות שלמטה — Binance או ה-Chainlink oracle של Polymarket"
+                >
+                  מקור החלונות: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
+                </span>
+              </div>
               {recentWindows.length > 0 ? (
                 <>
                   <WindowCircles
