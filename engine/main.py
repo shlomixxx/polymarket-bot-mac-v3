@@ -1100,6 +1100,11 @@ def _price_to_beat_note(source: Optional[str], epoch: int) -> str:
             "ייחוס מדויק: הטיק הראשון בפיד Chainlink BTC/USD Data Stream של Polymarket בגבול החלון — "
             "זהה למקור שלפיו השוק נסגר. מחיר ה-BTC החי במסך מגיע מאותו פיד."
         )
+    if source == "binance_1m":
+        return (
+            "מקור-נתונים פעיל: Binance — נר הפתיחה של Binance (1m) בגבול החלון. "
+            "פיד Chainlink של Polymarket אינו בשימוש במצב זה."
+        )
     if source == "chainlink_polygon_window":
         note = (
             "ייחוס משוער (fallback): סיבוב Chainlink BTC/USD על Polygon עד פתיחת החלון — "
@@ -1123,6 +1128,22 @@ def _price_to_beat_note(source: Optional[str], epoch: int) -> str:
     return note
 
 
+def _resolve_ptb_for_source(
+    *, active: str, binance_open: Optional[float], chainlink_ptb: Optional[float]
+) -> tuple[Optional[float], str]:
+    """בוחר את "מחיר לנצח" והמקור שלו לפי מקור-הנתונים הפעיל (טהור, נבדק ביחידה)."""
+    if active == "binance":
+        if binance_open is not None:
+            return binance_open, "binance_1m"
+        return None, "pending"
+    # polymarket: Chainlink stream מדויק קודם, אחרת Binance 1m כ-fallback
+    if chainlink_ptb is not None:
+        return chainlink_ptb, "chainlink_stream"
+    if binance_open is not None:
+        return binance_open, "binance_1m_fallback"
+    return None, "pending"
+
+
 @app.get("/api/market/current")
 async def market_current():
     # ‎discover_active_btc_window כבר מבצע wait_for פנימי של 8s + stale-on-error fallback.
@@ -1135,6 +1156,9 @@ async def market_current():
         m = None
     if not m:
         raise HTTPException(503, "שוק פעיל לא זמין כרגע — נסה שוב בעוד מספר שניות")
+    import data_source as _data_source
+    _active = _data_source.get_active()
+
     global last_epoch_for_open, cached_open, cached_ptb_source
     if m.epoch != last_epoch_for_open:
         last_epoch_for_open = m.epoch
@@ -1154,13 +1178,14 @@ async def market_current():
                 if (
                     ob is not None
                     and last_epoch_for_open == epoch
-                    and cached_ptb_source not in ("chainlink_stream", "chainlink_polygon_window")
+                    and cached_ptb_source not in ("chainlink_stream", "chainlink_polygon_window", "binance_1m")
                 ):
                     cached_open = ob
                     cached_ptb_source = "binance_1m_fallback"
             except Exception:
                 pass
             # שדרוג לאורקל Polygon (cache פר-epoch ב-_CHAINLINK_AT_WINDOW_CACHE → זול בחזרה).
+            # רלוונטי רק במצב polymarket — במצב binance אין ל-Chainlink מקום ב-PTB בכלל.
             try:
                 ptb = await asyncio.wait_for(
                     fetch_chainlink_btc_usd_polygon_at_window_start(epoch), timeout=10.0
@@ -1171,15 +1196,28 @@ async def market_current():
                 ptb is not None
                 and last_epoch_for_open == epoch
                 and cached_ptb_source != "chainlink_stream"
+                and _data_source.get_active() != "binance"
             ):
                 cached_open = ptb
                 cached_ptb_source = "chainlink_polygon_window"
 
         asyncio.create_task(_populate_price_to_beat_fallback(m.epoch))
 
-    # המקור המדויק: הטיק הראשון בפיד Chainlink Data Stream של Polymarket בגבול החלון.
-    # קריאה סינכרונית זולה (סריקת חוצץ + cache immutable); מרגע שנלכד הערך ננעל ולא נדרס.
-    if cached_ptb_source != "chainlink_stream":
+    # מקור "מחיר לנצח" לפי מקור-הנתונים הפעיל: במצב binance — נר פתיחת Binance 1m בלבד
+    # (בלוק Chainlink לא נקרא כלל); במצב polymarket — הטיק המדויק בפיד Chainlink Data
+    # Stream בגבול החלון (קריאה סינכרונית זולה: סריקת חוצץ + cache immutable), אחרת
+    # Binance 1m כ-fallback.
+    if _active == "binance":
+        try:
+            b_open = await asyncio.wait_for(
+                fetch_open_price_at_window_start(m.epoch), timeout=3.0
+            )
+        except Exception:
+            b_open = None
+        cached_open, cached_ptb_source = _resolve_ptb_for_source(
+            active="binance", binance_open=b_open, chainlink_ptb=None,
+        )
+    elif cached_ptb_source != "chainlink_stream":
         try:
             ptb_cl = chainlink_stream.get_price_to_beat(m.epoch)
             if ptb_cl is not None:

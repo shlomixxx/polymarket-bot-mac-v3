@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import data_source
 from demo_engine import DemoEngine, DemoState, FEE_RATE, Position
 
 
@@ -56,6 +57,55 @@ async def test_expire_all_outside_tokens_creates_expire_trade_and_removes_positi
     assert t.get("execution") == "live"
     # leg_cost נחתם על עסקת הסגירה (מזין realized_pct ב-audit finalize)
     assert float(t["leg_cost"]) == pytest.approx(0.4 * 10.0 * (1 + FEE_RATE))
+    # Task 5: כל עסקה שהתחשבנה מתויגת במקור-הנתונים הפעיל (ברירת מחדל polymarket).
+    assert t.get("data_source") == "polymarket"
+
+
+@pytest.mark.asyncio
+async def test_expire_all_outside_tokens_tags_active_data_source_binance(tmp_path: Path):
+    # Task 5: כשמקור-הנתונים הפעיל הוא binance, עסקת ההתחשבנות מתויגת בהתאם — לצורך
+    # ייחוס סטטיסטיקות/היסטוריה לזירה (venue) הנכונה.
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1000.0)
+    eng.state.positions = [Position(side="Up", contracts=10.0, avg_cost=0.4, token_id="old")]
+
+    async def _px(_ep: int, _ws: int):
+        return {"start": 100.0, "end": 99.0, "source": "binance_1m_proxy"}
+
+    data_source.set_active("binance")
+    try:
+        with patch("btc_price.fetch_window_start_end_btc_usd", AsyncMock(side_effect=_px)):
+            await eng.expire_all_outside_tokens(
+                ("keep",),
+                context={"settled_epoch": 1_700_000_000, "settled_window_sec": 300},
+            )
+    finally:
+        data_source.set_active("polymarket")
+
+    settle_loss = [t for t in eng.state.trades if t.get("type") == "SETTLE_LOSS"]
+    assert len(settle_loss) == 1
+    assert settle_loss[0].get("data_source") == "binance"
+
+
+@pytest.mark.asyncio
+async def test_attach_window_btc_to_tp_trade_tags_active_data_source(tmp_path: Path):
+    # Task 5: מסלול ה-TP/Stop (SELL_TP/SELL_STOP) עובר דרך _attach_window_btc_to_tp_trade —
+    # גם הוא חייב לתייג את מקור-הנתונים הפעיל בזמן ההתחשבנות.
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1000.0)
+    trade: dict = {"epoch": 1_700_000_000, "window_sec": 300, "type": "SELL_TP"}
+
+    async def _px(_ep: int, _ws: int):
+        return {"start": 100.0, "end": 101.0, "source": "binance_1m_proxy"}
+
+    data_source.set_active("binance")
+    try:
+        with patch("btc_price.fetch_window_start_end_btc_usd", AsyncMock(side_effect=_px)):
+            await eng._attach_window_btc_to_tp_trade(trade, side="Up")
+    finally:
+        data_source.set_active("polymarket")
+
+    assert trade.get("data_source") == "binance"
 
 
 @pytest.mark.asyncio
