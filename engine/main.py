@@ -626,8 +626,8 @@ async def _backfill_missing_history_windows(
                 # לעולם לא ימנע את השלמת ה-backfill (שנשען על Binance).
                 side_won_polymarket = None
                 try:
-                    cl_start = await fetch_chainlink_btc_usd_polygon_at_window_start(int(ep))
-                    cl_end = await fetch_chainlink_btc_usd_polygon_at_window_start(int(ep) + int(ws))
+                    cl_start = await asyncio.wait_for(fetch_chainlink_btc_usd_polygon_at_window_start(int(ep)), timeout=10.0)
+                    cl_end = await asyncio.wait_for(fetch_chainlink_btc_usd_polygon_at_window_start(int(ep) + int(ws)), timeout=10.0)
                     if cl_start is not None and cl_end is not None:
                         side_won_polymarket = "Up" if cl_end >= cl_start else "Down"
                 except Exception:
@@ -743,9 +743,11 @@ async def auto_history_recorder_loop(interval_sec: float = 10.0) -> None:
                         # truth for "binance" mode and the fallback for "polymarket" mode).
                         side_won_polymarket = None
                         try:
-                            cl_start = await fetch_chainlink_btc_usd_polygon_at_window_start(prev_epoch)
-                            cl_end = await fetch_chainlink_btc_usd_polygon_at_window_start(
-                                prev_epoch + prev_window_sec
+                            cl_start = await asyncio.wait_for(fetch_chainlink_btc_usd_polygon_at_window_start(prev_epoch), timeout=10.0)
+                            cl_end = await asyncio.wait_for(
+                                fetch_chainlink_btc_usd_polygon_at_window_start(
+                                    prev_epoch + prev_window_sec
+                                ), timeout=10.0
                             )
                             if cl_start is not None and cl_end is not None:
                                 side_won_polymarket = "Up" if cl_end >= cl_start else "Down"
