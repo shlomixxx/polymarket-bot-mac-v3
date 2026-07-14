@@ -596,7 +596,7 @@ class StrategyRunner:
 
     def _live_trading_ok(self) -> bool:
         import data_source
-        ov = getattr(self.rt.config, "order_venue", "polymarket")
+        ov = venues.normalize(getattr(self.rt.config, "order_venue", "polymarket"))
         ds = data_source.get_active()
         # שומר-אי-התאמה (MISMATCH GUARD): לעולם לא להחליט על סמך מקור-נתונים אחד
         # ולבצע פקודה אמיתית על בורסה אחרת — Predict.fun מתבסס על BTC של Binance,

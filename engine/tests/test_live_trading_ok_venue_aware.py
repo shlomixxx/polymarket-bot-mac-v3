@@ -125,3 +125,13 @@ def test_matched_polymarket_venue_with_polymarket_data_source_not_blocked_by_gua
     data_source.set_active("polymarket")
     monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xkey")
     assert r._live_trading_ok() is True
+
+
+# ── NORMALIZATION: garbage order_venue normalizes to polymarket, then MISMATCH GUARD applies ──
+def test_garbage_order_venue_normalizes_to_polymarket_then_mismatch_fails(monkeypatch):
+    r = _runner(order_venue="GARBAGE", live_trading=True)
+    data_source.set_active("binance")  # MISMATCH: normalized venue=polymarket, data=binance
+    monkeypatch.setenv("POLYMARKET_LIVE", "1")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xkey")
+    # garbage normalizes to polymarket; polymarket+binance is a mismatch → blocked
+    assert r._live_trading_ok() is False
