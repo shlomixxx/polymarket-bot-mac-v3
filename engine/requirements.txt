@@ -10,3 +10,7 @@ py-clob-client>=0.34.0
 
 # אחסון קבוע למפתח הפרטי דרך macOS Keychain / Secret Service / Windows Credential Manager
 keyring>=24
+
+# Predict.fun (BNB) order path — M2b (venue = predict_fun)
+predict-sdk==0.0.20
+web3==7.16.0

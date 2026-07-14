@@ -1,5 +1,9 @@
 # engine/tests/test_predict_fun_venue.py
-"""PredictFunVenue — M2a read-only (discover + book + best_bid_ask). Orders raise until M2b.
+"""PredictFunVenue — M2a read-only (discover + book + best_bid_ask). M2b-Step-2 replaced the old
+"orders raise NotImplementedError" placeholder with the real, gated order path — see
+test_predict_fun_order_path.py for the auth/gating/build-sign-POST/portfolio coverage; this file
+keeps only the no-wallet-key gate smoke test for the order methods (deliberately not going through
+the full flow again here).
 
 NOTE ON THE MOCK SHAPE: the task brief's sketch used bare floats for outcomes[].bestBid/bestAsk
 (e.g. 0.12). A live testnet capture (see m2-research-market-map.md §1.3) shows the REAL shape is
@@ -100,16 +104,27 @@ async def test_get_book_unknown_token_returns_empty_book():
 
 
 @pytest.mark.asyncio
-async def test_order_methods_raise_notimplemented_in_m2a():
+async def test_order_methods_are_gated_no_wallet_key_in_m2b(monkeypatch):
+    # M2b: order placement no longer raises — it's gated (fail-closed) by predict_secrets. With
+    # no PREDICT_WALLET_KEY configured, both entry and exit refuse before touching the network or
+    # the SDK. See test_predict_fun_order_path.py for the full auth/build/sign/POST coverage.
+    for var in ("PREDICT_LIVE", "PREDICT_WALLET_KEY", "PREDICT_TESTNET"):
+        monkeypatch.delenv(var, raising=False)
     v = PredictFunVenue()
-    with pytest.raises(NotImplementedError):
-        await v.place_entry_order("T", 10, 0.5, "Up")
-    with pytest.raises(NotImplementedError):
-        await v.place_exit_order("T", 10, 0.5)
+    r1 = await v.place_entry_order("T", 10, 0.5, "Up")
+    assert r1 == {
+        "ok": False,
+        "error": "Predict.fun wallet key not configured (PREDICT_WALLET_KEY)",
+        "error_code": "no_wallet_key",
+    }
+    r2 = await v.place_exit_order("T", 10, 0.5)
+    assert r2["ok"] is False and r2["error_code"] == "no_wallet_key"
 
 
 @pytest.mark.asyncio
-async def test_portfolio_and_account_return_benign_m2b_placeholder_not_real_data():
+async def test_portfolio_and_account_return_benign_m2b_placeholder_without_a_wallet_key(monkeypatch):
+    for var in ("PREDICT_LIVE", "PREDICT_WALLET_KEY", "PREDICT_TESTNET"):
+        monkeypatch.delenv(var, raising=False)
     v = PredictFunVenue()
     portfolio = await v.fetch_portfolio()
     assert portfolio["ok"] is False
