@@ -198,11 +198,6 @@ def _classify_order_error(payload: Any, status_code: Optional[int]) -> tuple[str
     return message, "order_rejected"
 
 
-def _is_testnet() -> bool:
-    # Default-safe: only an explicit opt-out points at mainnet.
-    return os.environ.get("PREDICT_MAINNET", "").strip() != "1"
-
-
 def _price_of(value: Any) -> Optional[float]:
     """Normalize outcomes[].bestBid/bestAsk: null | {"price":.., "size":..} | (defensively) a bare
     number, all -> float|None. See module docstring point (1)."""
@@ -223,7 +218,12 @@ class PredictFunVenue(Venue):
     collateral = "USDT"
 
     def __init__(self) -> None:
-        self._testnet = _is_testnet()
+        # Single source of truth for testnet-vs-mainnet: predict_secrets.is_testnet() (env
+        # PREDICT_TESTNET), the SAME flag the real-money gate (_gate() below, via
+        # predict_secrets.is_live_enabled()/live_disabled_reason()) uses. Do NOT re-derive this
+        # from a separate env var here — a second flag can disagree with the gate and let a
+        # mainnet order slip through while the gate still believes it's exempt as "testnet".
+        self._testnet = predict_secrets.is_testnet()
         self._jwt: Optional[str] = None
         self._jwt_exp: float = 0.0
 

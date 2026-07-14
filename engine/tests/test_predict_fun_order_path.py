@@ -83,7 +83,7 @@ def _auth_handler(calls: list, *, token: str = "jwt-token-1", message: str = _AU
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for v in ("PREDICT_LIVE", "PREDICT_WALLET_KEY", "PREDICT_TESTNET", "PREDICT_MAINNET"):
+    for v in ("PREDICT_LIVE", "PREDICT_WALLET_KEY", "PREDICT_TESTNET"):
         monkeypatch.delenv(v, raising=False)
 
 
