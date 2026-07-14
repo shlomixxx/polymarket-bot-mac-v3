@@ -39,6 +39,43 @@ def test_partial_config_save_keeps_order_venue(client):
     assert main.runner.rt.config.order_venue == "predict_fun"   # NOT reverted
 
 
+def test_min_contracts_floor_reads_active_venue_not_hardcoded_polymarket(client, monkeypatch):
+    """M2b: _clamp_min_contracts_to_market_floor() must read the market floor from the
+    ACTIVE venue (runner.venue.discover_active_window), not the hardcoded module-level
+    (Polymarket-only) discover_active_btc_window — else a switch to Predict.fun would be
+    clamped against Polymarket's floor instead of Predict.fun's real 1 USDT minimum."""
+
+    class _PolymarketMarket:
+        order_min_size = 999.0  # a wildly-wrong floor if this were consulted for predict_fun
+
+    async def _fake_polymarket_discover(_window):
+        return _PolymarketMarket()
+
+    # Hardcoded Polymarket-specific module function reports a bogus HIGH floor.
+    monkeypatch.setattr(main, "discover_active_btc_window", _fake_polymarket_discover)
+
+    r = client.post("/api/order-venue", json={"order_venue": "predict_fun"})
+    assert r.status_code == 200
+
+    class _PredictFunMarket:
+        order_min_size = 1.0  # Predict.fun's real flat 1 USDT minimum
+
+    async def _fake_predict_fun_discover(_window):
+        return _PredictFunMarket()
+
+    monkeypatch.setattr(main.runner.venue, "discover_active_window", _fake_predict_fun_discover)
+
+    # NOTE: model_dump() bakes in every field including order_venue's default
+    # ("polymarket"); pop it so this partial save can't silently switch the venue back
+    # (same pattern as test_partial_config_save_keeps_order_venue above).
+    body = main.ConfigBody(min_contracts=1).model_dump()
+    body.pop("order_venue", None)
+    r = client.post("/api/strategy/config", json=body)
+    assert r.status_code == 200
+    # Must reflect the ACTIVE venue's floor (1) — NOT the hardcoded polymarket 999.
+    assert main.runner.rt.config.min_contracts == 1
+
+
 def test_cannot_select_predict_fun_while_live(client):
     main.runner.rt.live_trading = True
     try:

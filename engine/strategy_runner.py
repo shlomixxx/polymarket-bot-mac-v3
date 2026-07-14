@@ -595,6 +595,20 @@ class StrategyRunner:
         return base * m
 
     def _live_trading_ok(self) -> bool:
+        import data_source
+        ov = getattr(self.rt.config, "order_venue", "polymarket")
+        ds = data_source.get_active()
+        # שומר-אי-התאמה (MISMATCH GUARD): לעולם לא להחליט על סמך מקור-נתונים אחד
+        # ולבצע פקודה אמיתית על בורסה אחרת — Predict.fun מתבסס על BTC של Binance,
+        # Polymarket על ה-Chainlink stream שלו. חוסם לחלוטין אם אלה לא תואמים.
+        if ov == "predict_fun" and ds != "binance":
+            return False
+        if ov == "polymarket" and ds != "polymarket":
+            return False
+        if ov == "predict_fun":
+            import predict_secrets
+            return predict_secrets.is_live_enabled()
+        # polymarket: הלוגיקה הקיימת — ללא שינוי (byte-identical) ──────────────
         # kill-switch לשרת/פריסה בלבד — POLYMARKET_LIVE=0 חוסם לחלוטין שליחת לייב
         if os.environ.get("POLYMARKET_LIVE", "").strip().lower() in ("0", "false", "no", "off"):
             return False

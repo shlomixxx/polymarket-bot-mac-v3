@@ -27,6 +27,8 @@ from typing import Any, Optional
 
 import httpx
 
+import predict_secrets
+
 from .base import ActiveMarket, Venue
 
 _TESTNET_BASE = "https://api-testnet.predict.fun"
@@ -216,8 +218,7 @@ class PredictFunVenue(Venue):
         return None
 
     def live_disabled_reason(self) -> Optional[str]:
-        if os.environ.get("PREDICT_LIVE", "").strip() != "1":
-            return "PREDICT_LIVE != '1' (testnet only)"
-        if not os.environ.get("PREDICT_PRIVATE_KEY", "").strip():
-            return "PREDICT_PRIVATE_KEY not set"
-        return None
+        # M2b: delegate to the dedicated triple-lock helper (PREDICT_LIVE + wallet key +
+        # not-testnet) instead of an inline, partial check — single source of truth also
+        # used by strategy_runner._live_trading_ok().
+        return predict_secrets.live_disabled_reason()

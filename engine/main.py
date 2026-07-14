@@ -387,9 +387,13 @@ def _load_persisted_config() -> None:
 
 
 async def _clamp_min_contracts_to_market_floor() -> None:
-    """מגדיל את min_contracts לפחות למינימום השוק הפעיל (מ־discover + CLOB) לפני שמירה לדיסק."""
+    """מגדיל את min_contracts לפחות למינימום השוק הפעיל (מ־discover + CLOB) לפני שמירה לדיסק.
+
+    M2b: קורא מה-venue הפעיל (runner.venue), לא מ-discover_active_btc_window הגלובלי
+    (שהוא Polymarket-בלבד) — אחרת מעבר ל-Predict.fun היה נחסם למינימום של Polymarket
+    במקום למינימום ה-1 USDT האמיתי של Predict.fun."""
     try:
-        m = await discover_active_btc_window(runner.rt.config.btc_window)
+        m = await runner.venue.discover_active_window(runner.rt.config.btc_window)
         if not m:
             return
         floor = int(math.ceil(float(m.order_min_size)))

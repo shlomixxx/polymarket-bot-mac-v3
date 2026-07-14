@@ -120,14 +120,21 @@ async def test_portfolio_and_account_return_benign_m2b_placeholder_not_real_data
     assert v.reset_caches() is None
 
 
-def test_live_disabled_reason_reads_predict_env(monkeypatch):
+def test_live_disabled_reason_delegates_to_predict_secrets_triple_lock(monkeypatch):
+    # M2b: live_disabled_reason() now delegates to predict_secrets.live_disabled_reason()
+    # (PREDICT_LIVE + PREDICT_WALLET_KEY + not PREDICT_TESTNET) instead of an inline,
+    # partial (PREDICT_LIVE + PREDICT_PRIVATE_KEY) check — see test_predict_secrets.py
+    # for the full truth table; this just proves the delegation is wired.
     v = PredictFunVenue()
-    monkeypatch.delenv("PREDICT_LIVE", raising=False)
-    monkeypatch.delenv("PREDICT_PRIVATE_KEY", raising=False)
-    assert v.live_disabled_reason() is not None            # no PREDICT_LIVE => disabled
+    for var in ("PREDICT_LIVE", "PREDICT_WALLET_KEY", "PREDICT_TESTNET"):
+        monkeypatch.delenv(var, raising=False)
+    assert v.live_disabled_reason() == "PREDICT_LIVE != '1'"  # no PREDICT_LIVE => disabled
 
     monkeypatch.setenv("PREDICT_LIVE", "1")
-    assert v.live_disabled_reason() is not None             # PREDICT_LIVE=1 but no key => still disabled
+    assert v.live_disabled_reason() == "אין מפתח ארנק Predict.fun"  # PREDICT_LIVE=1 but no key
 
-    monkeypatch.setenv("PREDICT_PRIVATE_KEY", "0xabc")
-    assert v.live_disabled_reason() is None                  # both set => real trading enabled (M2b will add more gates)
+    monkeypatch.setenv("PREDICT_WALLET_KEY", "0xabc")
+    assert v.live_disabled_reason() == "מצב טסטנט (PREDICT_TESTNET)"  # key set, still testnet by default
+
+    monkeypatch.setenv("PREDICT_TESTNET", "0")
+    assert v.live_disabled_reason() is None  # all three satisfied => real trading enabled

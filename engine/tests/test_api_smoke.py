@@ -119,14 +119,19 @@ def test_decision_mode_config_default_settable_persisted(client: TestClient, tmp
 
 
 def test_strategy_config_clamps_min_contracts_to_market_floor(client: TestClient, monkeypatch):
-    """אחרי שמירה — min_contracts לא נשאר מתחת למינימום השוק (מ־discover)."""
+    """אחרי שמירה — min_contracts לא נשאר מתחת למינימום השוק (מ־discover של ה-venue הפעיל).
+
+    M2b: _clamp_min_contracts_to_market_floor() קורא מ-runner.venue.discover_active_window
+    (לא מ-discover_active_btc_window הגלובלי) כדי לכבד את המינימום של הבורסה הפעילה
+    (Polymarket כברירת מחדל כאן) — ר' test_order_venue_config.py לבדיקת predict_fun.
+    """
     import main as engine_main
     from types import SimpleNamespace
 
     async def fake_discover(window="5m"):
         return SimpleNamespace(order_min_size=7.0)
 
-    monkeypatch.setattr(engine_main, "discover_active_btc_window", fake_discover)
+    monkeypatch.setattr(engine_main.runner.venue, "discover_active_window", fake_discover)
 
     body = {
         "investment_usd": 5.0,

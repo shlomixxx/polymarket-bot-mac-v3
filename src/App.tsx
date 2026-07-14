@@ -1679,6 +1679,8 @@ export default function App() {
   const [liveMode, setLiveMode] = useState(false);
   /** מקור נתוני BTC הפעיל (לוח, סטטיסטיקה ודמו) — Polymarket (Chainlink) או Binance */
   const [dataSource, setDataSource] = useState<"polymarket" | "binance">("polymarket");
+  /** יעד ביצוע הפקודות (order_venue) — Polymarket או Predict.fun (מסחר Binance up/down) */
+  const [orderVenue, setOrderVenue] = useState<"polymarket" | "predict_fun">("polymarket");
   /** מצב "כסף אמיתי" בפועל מצד המנוע (לאחר kill-switch/מפתח) — לצגת חסימה אם יש */
   const [liveModeEffective, setLiveModeEffective] = useState(false);
   const [liveModeBlockedReason, setLiveModeBlockedReason] = useState<string | null>(null);
@@ -2042,6 +2044,7 @@ export default function App() {
       {
         const c = cfg as Record<string, unknown>;
         if (c.data_source === "polymarket" || c.data_source === "binance") setDataSource(c.data_source);
+        if (c.order_venue === "polymarket" || c.order_venue === "predict_fun") setOrderVenue(c.order_venue);
       }
       if (typeof (cfg as any).last_status === "string") setEngineStatus((cfg as any).last_status);
       if (typeof (cfg as any).last_tick_ts === "number") setEngineLastTickTs((cfg as any).last_tick_ts);
@@ -2578,21 +2581,34 @@ export default function App() {
           <button
             type="button"
             className="ui-btn ui-btn--ghost header-mode-btn"
-            data-venue={dataSource}
-            title="מקור נתוני BTC — לוח, סטטיסטיקה ודמו"
+            data-venue={orderVenue === "predict_fun" ? "binance" : "polymarket"}
+            title="בורסה — לאן נשלחות הפקודות ומאיפה מגיעים נתוני ה-BTC (משתנים יחד)"
             onClick={async () => {
-              const next = dataSource === "polymarket" ? "binance" : "polymarket";
-              setDataSource(next); // אופטימי
+              const goingToBinance = orderVenue !== "predict_fun";
+              const nextVenue: "polymarket" | "predict_fun" = goingToBinance ? "predict_fun" : "polymarket";
+              const nextSource: "polymarket" | "binance" = goingToBinance ? "binance" : "polymarket";
+              const prevVenue = orderVenue;
+              const prevSource = dataSource;
+              setOrderVenue(nextVenue); // אופטימי
               try {
-                await api("/api/data-source", { method: "POST", body: JSON.stringify({ data_source: next }) });
+                await api("/api/order-venue", { method: "POST", body: JSON.stringify({ order_venue: nextVenue }) });
+              } catch (e) {
+                // ה-guard של M2a (למשל: אי-אפשר לעבור ל-Predict.fun בזמן מסחר חי) — לא לגעת ב-data_source בכלל
+                setOrderVenue(prevVenue); // rollback
+                alert(e instanceof Error ? e.message : "כשל בעדכון בורסה");
+                return;
+              }
+              setDataSource(nextSource); // אופטימי
+              try {
+                await api("/api/data-source", { method: "POST", body: JSON.stringify({ data_source: nextSource }) });
                 void refresh();
               } catch (e) {
-                setDataSource(dataSource); // rollback
+                setDataSource(prevSource); // rollback מקור הנתונים בלבד — ה-venue כבר הוחלף בשרת
                 alert(e instanceof Error ? e.message : "כשל בעדכון מקור נתונים");
               }
             }}
           >
-            נתונים: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
+            בורסה: {orderVenue === "predict_fun" ? "₿ Binance" : "🟣 Polymarket"}
           </button>
           <Button
             variant="primary"
