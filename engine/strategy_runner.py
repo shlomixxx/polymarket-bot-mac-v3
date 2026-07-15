@@ -617,6 +617,23 @@ class StrategyRunner:
             return False
         return bool(os.environ.get("POLYMARKET_PRIVATE_KEY", "").strip())
 
+    def _testnet_predict_active(self) -> bool:
+        """Route orders to Predict.fun on TESTNET (fake money): predict_fun venue + testnet +
+        wallet key + data_source matches (mismatch guard). NOT real money."""
+        import data_source
+        import predict_secrets
+        ov = venues.normalize(getattr(self.rt.config, "order_venue", "polymarket"))
+        if ov != "predict_fun":
+            return False
+        if data_source.get_active() != "binance":
+            return False
+        return predict_secrets.is_testnet() and predict_secrets.has_wallet_key()
+
+    def _should_route_to_venue(self) -> bool:
+        """Send orders to the active venue (a REAL order) instead of demo-simulating.
+        True for real money (_live_trading_ok) OR testnet-predict (fake money)."""
+        return self._live_trading_ok() or self._testnet_predict_active()
+
     async def _live_close_outside_tokens(
         self,
         valid_tokens: tuple[str, str],
@@ -737,7 +754,7 @@ class StrategyRunner:
         קורה אחרי rollover ובקצב קבוע (כל ~2 דק׳) כסדר־גב נגד drift.
         exclude_token_ids — טוקנים שכבר פורקו ב-expire; לא להחזיר ב-reconcile.
         """
-        if not self._live_trading_ok():
+        if not self._should_route_to_venue():
             return
         now = time.time()
         if not force and (now - float(self.rt._last_live_reconcile_ts or 0) < 120.0):
@@ -795,7 +812,7 @@ class StrategyRunner:
             if not ok_sz:
                 self.rt.log(f"נכשל: {verr}")
                 return {"ok": False, "error": verr or "גודל לא תקין"}
-            use_live = live_request and self._live_trading_ok()
+            use_live = live_request and self._should_route_to_venue()
             if use_live:
                 lim = float(p.get("limit") or 1.0)
                 lo = await self._venue.place_entry_order(
@@ -886,7 +903,7 @@ class StrategyRunner:
             if not ok_sz:
                 self.rt.log(f"גידור נכשל: {verr}")
                 return {"ok": False, "error": verr or "גודל לא תקין"}
-            use_live = live_request and self._live_trading_ok()
+            use_live = live_request and self._should_route_to_venue()
             if use_live:
                 _, ask = await self._venue.best_bid_ask(str(p["token"]))
                 if ask is None:
@@ -1507,12 +1524,14 @@ class StrategyRunner:
                     "slug": m.slug,
                     "reason": "EXPIRE_0 rollover",
                 }
-                # כדי ש־SETTLE_* יופיעו בלשונית «סטטיסטיקה לייב» (מסננים execution=live)
-                if self._live_trading_ok():
+                # כדי ש־SETTLE_* יופיעו בלשונית «סטטיסטיקה לייב» (מסננים execution=live) — כולל
+                # פוזיציות שנפתחו/נסגרות דרך Predict.fun בטסטנט (כסף מזויף אבל נשלח לבורסה
+                # בפועל), כדי להישאר עקבי עם record_live_buy/record_live_sell שמתייגות אותו דבר.
+                if self._should_route_to_venue():
                     rollover_ctx["execution"] = "live"
-                # לייב: לפני שאנחנו מסתמכים על פירוק BTC-פרוקסי, ננסה לסגור אקטיבית
-                # את הפוזיציות האמיתיות ב-CLOB. מה שנכשל נופל לגיבוי של expire_all_outside_tokens.
-                if self._live_trading_ok():
+                # לייב/טסטנט: לפני שאנחנו מסתמכים על פירוק BTC-פרוקסי, ננסה לסגור אקטיבית
+                # את הפוזיציות האמיתיות ב-CLOB/venue. מה שנכשל נופל לגיבוי של expire_all_outside_tokens.
+                if self._should_route_to_venue():
                     try:
                         await self._live_close_outside_tokens(
                             (m.token_up, m.token_down), context=rollover_ctx
@@ -1543,7 +1562,7 @@ class StrategyRunner:
                 self.rt._settled_token_ids.update(settled_tids)
                 if settled_tids:
                     self.rt._settled_token_ids_ts = time.time()
-                if self._live_trading_ok():
+                if self._should_route_to_venue():
                     await self._live_reconcile_if_enabled(
                         context=rollover_ctx,
                         force=True,
@@ -1989,7 +2008,7 @@ class StrategyRunner:
                         f"TP: פוזיציה {pos_contracts:.4f} חוזים — מתחת למינ׳ הזמנה {m.order_min_size} של השוק; "
                         f"מנסה סגירה (SELL) בכל זאת — אם הבורסה תדחה, סגר ידנית או הגדל/י מינ׳ חוזים בכניסה"
                     )
-                if self._live_trading_ok():
+                if self._should_route_to_venue():
                     cd_until = float(self.rt._tp_sell_cooldown_until.get(p.token_id) or 0.0)
                     now_ts = time.time()
                     if cd_until > now_ts:
@@ -2210,7 +2229,7 @@ class StrategyRunner:
                         )
                         return
                     n = n_h
-                    if self._live_trading_ok():
+                    if self._should_route_to_venue():
                         lo = await self._venue.place_entry_order(
                             str(other_token),
                             float(n),
@@ -2650,7 +2669,7 @@ class StrategyRunner:
                 self.rt.log(f"ממתין לאישור: {side} ×{n} @~{ask:.2f}")
             return
 
-        if self._live_trading_ok():
+        if self._should_route_to_venue():
             lo = await self._venue.place_entry_order(
                 str(token),
                 float(n),

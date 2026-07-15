@@ -33,6 +33,10 @@
   --demo-bg: rgba(107, 114, 128, 0.22);
   --live: #b45309;
   --live-bg: rgba(180, 83, 9, 0.2);
+  /* M2b-Step-3: Predict.fun טסטנט (כסף מזויף) — ירוק, נבדל בבירור מ"מסחר חי" (כתום/live-bg
+     למעלה) וגם מ"סימולציה" (אפור/demo-bg) */
+  --testnet: #4a9b7e;
+  --testnet-bg: rgba(74, 155, 126, 0.2);
 
   /* גרפים */
   --chart-axis: #6b7280;
@@ -213,6 +217,12 @@ h3 {
   background: var(--live-bg);
   color: #fdba74;
   border: 1px solid rgba(180, 83, 9, 0.35);
+}
+
+.badge-mode--testnet {
+  background: var(--testnet-bg);
+  color: #6ee7b7;
+  border: 1px solid rgba(74, 155, 126, 0.35);
 }
 
 /* כפתור מצב מסחר — ללא צבע כתום שכונתי */

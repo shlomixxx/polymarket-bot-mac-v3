@@ -2174,6 +2174,18 @@ def _live_mode_state() -> dict[str, Any]:
         except Exception:
             _persisted_key_cache = False
         _persisted_key_cache_ts = now
+    # M2b-Step-3: venue_trading_mode surfaces whether the runner is ACTUALLY routing orders to a
+    # venue right now (real money, testnet fake money, or neither) — independent of the Polymarket-
+    # specific "enabled"/"effective" pair above, which stays untouched for backward-compat.
+    try:
+        if runner._live_trading_ok():
+            venue_trading_mode = "real"
+        elif runner._testnet_predict_active():
+            venue_trading_mode = "testnet_predict"
+        else:
+            venue_trading_mode = "off"
+    except Exception:
+        venue_trading_mode = "off"
     return {
         "enabled": enabled,
         "effective": effective,
@@ -2181,6 +2193,7 @@ def _live_mode_state() -> dict[str, Any]:
         "has_private_key": has_key,
         "persisted_in_keychain": _persisted_key_cache,
         "reason_blocked": reason,
+        "venue_trading_mode": venue_trading_mode,
     }
 
 

@@ -1684,6 +1684,9 @@ export default function App() {
   /** מצב "כסף אמיתי" בפועל מצד המנוע (לאחר kill-switch/מפתח) — לצגת חסימה אם יש */
   const [liveModeEffective, setLiveModeEffective] = useState(false);
   const [liveModeBlockedReason, setLiveModeBlockedReason] = useState<string | null>(null);
+  /** M2b-Step-3: האם המנוע שולח כרגע פקודות אמיתיות לבורסה — "off" (דמו), "testnet_predict"
+   * (Predict.fun טסטנט — כסף מזויף, אבל פקודה אמיתית) או "real" (כסף אמיתי). */
+  const [venueTradingMode, setVenueTradingMode] = useState<"off" | "testnet_predict" | "real">("off");
   /** האם המפתח הנוכחי נשמר ל-Keychain (כלומר נטען אוטומטית בהרצות הבאות) */
   const [pkPersistedInKeychain, setPkPersistedInKeychain] = useState(false);
   /** Checkbox ב-UI: האם לשמור את המפתח לצמיתות כשלוחצים "שמור" */
@@ -1984,7 +1987,13 @@ export default function App() {
         api<Record<string, unknown>>("/api/strategy/config"),
         api<OrderbookSummary>("/api/market/orderbook-summary", { timeoutMs: TIMEOUT_MS_ORDERBOOK_SUMMARY }),
         api<{ entries: { ts: number; msg: string; type: string; session_id?: string }[] }>("/api/strategy/log-entries").catch(() => ({ entries: [] })),
-        api<{ enabled: boolean; effective: boolean; reason_blocked: string | null; persisted_in_keychain?: boolean }>("/api/live/mode").catch(() => null),
+        api<{
+          enabled: boolean;
+          effective: boolean;
+          reason_blocked: string | null;
+          persisted_in_keychain?: boolean;
+          venue_trading_mode?: "off" | "testnet_predict" | "real";
+        }>("/api/live/mode").catch(() => null),
         api<{
           ok?: boolean;
           error?: string;
@@ -2006,6 +2015,7 @@ export default function App() {
         setLiveModeEffective(Boolean(lm.effective));
         setLiveModeBlockedReason(lm.reason_blocked ?? null);
         setPkPersistedInKeychain(Boolean(lm.persisted_in_keychain));
+        setVenueTradingMode(lm.venue_trading_mode ?? "off");
       }
       {
         const p = pmClobRaw as Record<string, unknown>;
@@ -2575,8 +2585,22 @@ export default function App() {
       <header className="app-header">
         <h1 className="app-title">Polymarket BTC — מסחר Up/Down · גרסה 3</h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <span className={`badge-mode ${liveMode ? "badge-mode--live" : "badge-mode--demo"}`}>
-            {liveMode ? (liveModeEffective ? "מסחר חי" : "מסחר חי (חסום)") : "סימולציה"}
+          <span
+            className={`badge-mode ${
+              liveMode
+                ? "badge-mode--live"
+                : venueTradingMode === "testnet_predict"
+                ? "badge-mode--testnet"
+                : "badge-mode--demo"
+            }`}
+          >
+            {liveMode
+              ? liveModeEffective
+                ? "מסחר חי"
+                : "מסחר חי (חסום)"
+              : venueTradingMode === "testnet_predict"
+              ? "₿ Predict.fun · טסטנט (כסף מזויף)"
+              : "סימולציה"}
           </span>
           <button
             type="button"
