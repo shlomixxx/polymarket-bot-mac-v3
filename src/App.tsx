@@ -2587,19 +2587,21 @@ export default function App() {
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <span
             className={`badge-mode ${
-              liveMode
-                ? "badge-mode--live"
-                : venueTradingMode === "testnet_predict"
+              venueTradingMode === "testnet_predict"
                 ? "badge-mode--testnet"
+                : liveMode
+                ? "badge-mode--live"
                 : "badge-mode--demo"
             }`}
           >
-            {liveMode
+            {/* טסטנט Predict.fun (כסף מזויף) גובר על תגית "מסחר חי (חסום)" — משתמש בטסטנט
+                לא אמור לראות אזהרת חסימה של מסחר חי אמיתי שלא רלוונטית אליו. */}
+            {venueTradingMode === "testnet_predict"
+              ? "₿ Predict.fun · טסטנט (כסף מזויף)"
+              : liveMode
               ? liveModeEffective
                 ? "מסחר חי"
                 : "מסחר חי (חסום)"
-              : venueTradingMode === "testnet_predict"
-              ? "₿ Predict.fun · טסטנט (כסף מזויף)"
               : "סימולציה"}
           </span>
           <button

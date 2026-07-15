@@ -634,6 +634,14 @@ class StrategyRunner:
         True for real money (_live_trading_ok) OR testnet-predict (fake money)."""
         return self._live_trading_ok() or self._testnet_predict_active()
 
+    def _execution_tag(self) -> str:
+        """Tag to stamp on record_live_buy/record_live_sell/reconcile_live_state trades.
+
+        'testnet' when the order actually went to Predict.fun TESTNET (fake money — must be
+        kept OUT of the real 'live statistics' view, which filters execution=="live"); 'live'
+        otherwise (real Polymarket/Predict.fun money — unchanged behavior)."""
+        return "testnet" if self._testnet_predict_active() else "live"
+
     async def _live_close_outside_tokens(
         self,
         valid_tokens: tuple[str, str],
@@ -672,7 +680,7 @@ class StrategyRunner:
             fill_sell = float(lo.get("fill_price") or lo.get("price") or bid)
             close_ctx = dict(context)
             close_ctx["reason"] = "EXPIRE_ACTIVE_CLOSE"
-            close_ctx["execution"] = "live"
+            close_ctx["execution"] = self._execution_tag()
             sold_sz = float(lo.get("size") or p.contracts)
             try:
                 rs = await self.demo.record_live_sell(
@@ -771,11 +779,14 @@ class StrategyRunner:
         self.rt._reconcile_fail_streak = 0  # F8: fetch הצליח — מאפסים רצף כשלים
         ctx = dict(context or {})
         ctx.setdefault("reason", "LIVE_RECONCILE")
+        # M2b fix-3: tag the synthetic RECONCILE row the same way as buy/sell — testnet-predict
+        # (fake money) must never masquerade as a real-money reconcile in live statistics.
         tr = self.demo.reconcile_live_state(
             portfolio.get("balance_usd"),
             list(portfolio.get("positions") or []),
             context=ctx,
             exclude_token_ids=exclude_token_ids,
+            execution=self._execution_tag(),
         )
         self.rt._last_live_reconcile_ts = now
         if tr is not None:
@@ -794,12 +805,22 @@ class StrategyRunner:
         מצב "כסף אמיתי" נקבע לפי `self.rt.live_trading` (מופעל מהממשק).
         הפרמטר `live` נשמר לתאימות אחורה: אם הועבר במפורש כ-False מהצד שני,
         הוא עדיין יוביל לסימולציה (ניתן לכפות סימולציה לבקשה בודדת).
+
+        M2b fix-3 (semi-mode routing): כשלא הועבר `live` במפורש, ברירת המחדל כוללת גם
+        testnet-predict (`_testnet_predict_active()`) — כך שאישור עסקה בחצי־אוטומטי/ידני
+        עם Predict.fun בטסטנט (כסף מזויף) יישלח בפועל לבורסה במקום ליפול לדמו, בדיוק כמו
+        הכניסה האוטומטית. אינו משנה את הנתיב של Polymarket (שם `_testnet_predict_active()`
+        תמיד False).
         """
         p = self.rt.pending_approval
         if not p:
             return {"ok": False, "error": "אין המתנה לאישור"}
-        # אם הצד השני לא העביר במפורש, קוראים את מצב הזמן־אמת מהמנוע.
-        live_request = bool(self.rt.live_trading) if live is None else bool(live)
+        # אם הצד השני לא העביר במפורש, קוראים את מצב הזמן־אמת מהמנוע (+ testnet-predict).
+        live_request = (
+            (bool(self.rt.live_trading) or self._testnet_predict_active())
+            if live is None
+            else bool(live)
+        )
         if p["action"] == "buy":
             ctx = dict(p.get("context") or {})
             cfg0 = self.rt.config
@@ -840,6 +861,7 @@ class StrategyRunner:
                     n_adj,
                     fill,
                     context=ctx,
+                    execution=self._execution_tag(),
                 )
             else:
                 r = await self.demo.simulate_market_buy(
@@ -925,7 +947,8 @@ class StrategyRunner:
                     return {"ok": False, "error": err}
                 fill = float(lo.get("fill_price") or lo.get("price") or ask_f)
                 r = self.demo.record_live_buy(
-                    p["side"], str(p["token"]), n_adj, fill, context=ctx
+                    p["side"], str(p["token"]), n_adj, fill, context=ctx,
+                    execution=self._execution_tag(),
                 )
             else:
                 r = await self.demo.simulate_market_buy(
@@ -1524,11 +1547,12 @@ class StrategyRunner:
                     "slug": m.slug,
                     "reason": "EXPIRE_0 rollover",
                 }
-                # כדי ש־SETTLE_* יופיעו בלשונית «סטטיסטיקה לייב» (מסננים execution=live) — כולל
-                # פוזיציות שנפתחו/נסגרות דרך Predict.fun בטסטנט (כסף מזויף אבל נשלח לבורסה
-                # בפועל), כדי להישאר עקבי עם record_live_buy/record_live_sell שמתייגות אותו דבר.
+                # M2b fix-3: SETTLE_* של פוזיציה שנפתחה/נסגרה דרך הבורסה (Polymarket לייב אמיתי
+                # או Predict.fun בטסטנט) מתויגות execution="live"/"testnet" בהתאמה — עקבי עם
+                # record_live_buy/record_live_sell. כך «סטטיסטיקה לייב» (מסננת execution=="live"
+                # בלבד) לעולם לא תכלול עסקאות טסטנט בכסף מזויף.
                 if self._should_route_to_venue():
-                    rollover_ctx["execution"] = "live"
+                    rollover_ctx["execution"] = self._execution_tag()
                 # לייב/טסטנט: לפני שאנחנו מסתמכים על פירוק BTC-פרוקסי, ננסה לסגור אקטיבית
                 # את הפוזיציות האמיתיות ב-CLOB/venue. מה שנכשל נופל לגיבוי של expire_all_outside_tokens.
                 if self._should_route_to_venue():
@@ -2104,6 +2128,7 @@ class StrategyRunner:
                         fill_sell,
                         context=tp_ctx,
                         contracts_sold=sold_sz,
+                        execution=self._execution_tag(),
                     )
                 else:
                     r = await self.demo.simulate_sell_all(p.token_id, context=tp_ctx)
@@ -2248,6 +2273,7 @@ class StrategyRunner:
                             float(n),
                             fill_h,
                             context=hedge_ctx,
+                            execution=self._execution_tag(),
                         )
                     else:
                         r = await self.demo.simulate_market_buy(
@@ -2737,7 +2763,10 @@ class StrategyRunner:
                 )
                 return
             fill_a = float(lo.get("fill_price") or lo.get("price") or lim)
-            r = self.demo.record_live_buy(side, str(token), float(n), fill_a, context=entry_ctx)
+            r = self.demo.record_live_buy(
+                side, str(token), float(n), fill_a, context=entry_ctx,
+                execution=self._execution_tag(),
+            )
         else:
             r = await self.demo.simulate_market_buy(
                 side, token, float(n), limit_price=lim, context=entry_ctx

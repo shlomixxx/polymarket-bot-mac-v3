@@ -265,3 +265,118 @@ async def test_polymarket_non_live_auto_entry_routes_to_demo_not_venue(tmp_path,
     simulate_market_buy.assert_awaited_once()
     place_entry_order.assert_not_awaited()
     assert len(r.demo.state.positions) == 1
+
+
+# ── M2b fix-3: testnet-predict trades must be tagged execution="testnet" (fake money) — NOT
+# execution="live" — so they never mix into the real "live statistics" view. ───────────────────
+
+def test_execution_tag_truth_table(monkeypatch):
+    """_execution_tag() mirrors _testnet_predict_active(): 'testnet' only for the fake-money
+    Predict.fun testnet path, 'live' for everything else (including real Polymarket money)."""
+    r = _runner(order_venue="predict_fun", live_trading=False)
+    data_source.set_active("binance")
+    monkeypatch.setenv("PREDICT_WALLET_KEY", "0xabc")
+    assert r._testnet_predict_active() is True
+    assert r._execution_tag() == "testnet"
+
+    r2 = _runner(order_venue="polymarket", live_trading=True)
+    data_source.set_active("polymarket")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0xkey")
+    assert r2._testnet_predict_active() is False
+    assert r2._execution_tag() == "live"
+
+
+@pytest.mark.asyncio
+async def test_testnet_predict_auto_entry_tags_trade_execution_testnet(tmp_path, monkeypatch):
+    """The trade record_live_buy writes for a testnet-predict auto-entry must carry
+    execution='testnet' (fake money) — never 'live', which would leak into real live stats."""
+    cfg = _base_cfg(order_venue="predict_fun")
+    r = _make_runner(tmp_path, cfg)
+    r.select_venue("predict_fun")
+    data_source.set_active("binance")
+    monkeypatch.setenv("PREDICT_WALLET_KEY", "0xabc")
+    assert r._testnet_predict_active() is True
+
+    place_entry_order = AsyncMock(return_value={"ok": True, "fill_price": 0.40, "price": 0.40})
+    with patch.object(r._venue, "place_entry_order", place_entry_order):
+        await _drive_tick(r, ask_up=0.40, ask_down=0.30)
+
+    assert len(r.demo.state.trades) == 1
+    trade = r.demo.state.trades[-1]
+    assert trade["execution"] == "testnet"
+    # and it must NOT show up in the real live-stats CSV export
+    assert str(trade["token_id"]) not in r.demo.export_csv(live_only=True)
+
+
+# ── M2b fix-4 (semi-mode routing): approve_pending's default live_request must broaden to
+# include testnet-predict, so an approved semi/manual-mode entry actually reaches the venue. ──
+
+@pytest.mark.asyncio
+async def test_approve_pending_buy_routes_testnet_predict_to_venue(tmp_path, monkeypatch):
+    """Semi-mode: rt.live_trading is OFF (user never flipped the real-money toggle) but the
+    venue is testnet-predict — approve_pending() must still route the approved buy to the
+    venue (place_entry_order), not silently demo-simulate it, and must tag the resulting
+    trade execution='testnet'."""
+    cfg = _base_cfg(order_venue="predict_fun")
+    r = _make_runner(tmp_path, cfg)
+    r.select_venue("predict_fun")
+    data_source.set_active("binance")
+    monkeypatch.setenv("PREDICT_WALLET_KEY", "0xabc")
+    r.rt.live_trading = False  # semi/manual mode: real-money toggle OFF
+    assert r._testnet_predict_active() is True
+    assert r._live_trading_ok() is False
+
+    r.rt.pending_approval = {
+        "action": "buy",
+        "side": "Up",
+        "contracts": 10.0,
+        "token": TOKEN_UP,
+        "limit": 0.40,
+        "ask": 0.40,
+        "context": {},
+    }
+
+    place_entry_order = AsyncMock(return_value={"ok": True, "fill_price": 0.40, "price": 0.40})
+    simulate_market_buy = AsyncMock(wraps=r.demo.simulate_market_buy)
+    with patch.object(r._venue, "place_entry_order", place_entry_order), \
+         patch.object(r.demo, "simulate_market_buy", simulate_market_buy):
+        result = await r.approve_pending()
+
+    assert result.get("ok") is True
+    place_entry_order.assert_awaited_once()
+    simulate_market_buy.assert_not_awaited()
+    assert r.demo.state.trades[-1]["execution"] == "testnet"
+
+
+@pytest.mark.asyncio
+async def test_approve_pending_buy_polymarket_non_live_still_routes_to_demo(tmp_path, monkeypatch):
+    """Unchanged behavior: order_venue=polymarket + rt.live_trading=False still demo-simulates
+    the approved buy — the broadened default must never affect the real-money path."""
+    cfg = _base_cfg(order_venue="polymarket")
+    r = _make_runner(tmp_path, cfg)
+    data_source.set_active("polymarket")
+    r.rt.live_trading = False
+    assert r._testnet_predict_active() is False
+
+    r.rt.pending_approval = {
+        "action": "buy",
+        "side": "Up",
+        "contracts": 10.0,
+        "token": TOKEN_UP,
+        "limit": 0.40,
+        "ask": 0.40,
+        "context": {},
+    }
+
+    place_entry_order = AsyncMock(return_value={"ok": True, "fill_price": 0.40, "price": 0.40})
+    simulate_market_buy = AsyncMock(wraps=r.demo.simulate_market_buy)
+    with patch.object(r._venue, "place_entry_order", place_entry_order), \
+         patch.object(r.demo, "simulate_market_buy", simulate_market_buy), \
+         patch.object(r.demo, "best_ask", AsyncMock(return_value=0.40)):
+        result = await r.approve_pending()
+
+    assert result.get("ok") is True
+    simulate_market_buy.assert_awaited_once()
+    place_entry_order.assert_not_awaited()
+    # demo-simulated trades never carry an "execution" tag at all (unaffected by this change)
+    assert r.demo.state.trades[-1].get("execution") is None

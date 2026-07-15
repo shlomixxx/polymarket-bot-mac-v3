@@ -856,6 +856,7 @@ class DemoEngine:
         *,
         context: Optional[dict[str, Any]] = None,
         exclude_token_ids: Optional[set[str]] = None,
+        execution: str = "live",
     ) -> Optional[dict[str, Any]]:
         """מסנכרן את הספר הפנימי (ששימש כ-shadow ledger במצב לייב) ליתרה
         ולפוזיציות האמיתיות של Polymarket. נקרא אחרי epoch rollover ובקצב קבוע.
@@ -882,7 +883,7 @@ class DemoEngine:
                     "price": 0.0,
                     "fee_est": 0.0,
                     "contracts": 0,
-                    "execution": "live",
+                    "execution": execution,
                 }
                 tr.update(ctx)
                 self.state.trades.append(tr)
@@ -1189,6 +1190,8 @@ class DemoEngine:
         contracts: float,
         fill_price: float,
         context: Optional[dict[str, Any]] = None,
+        *,
+        execution: str = "live",
     ) -> dict[str, Any]:
         """שיקוף קנייה לייב — בלי קריאה לספר; מחיר מילוי ידוע מה-CLOB."""
         fill = float(fill_price)
@@ -1237,7 +1240,7 @@ class DemoEngine:
             "type": "BUY",
             "token_id": token_id,
             "session_id": sid,
-            "execution": "live",
+            "execution": execution,
         }
         if context:
             # audit_inputs is consumed out-of-band by the audit hook below; it must NOT
@@ -1409,6 +1412,7 @@ class DemoEngine:
         context: Optional[dict[str, Any]] = None,
         *,
         contracts_sold: Optional[float] = None,
+        execution: str = "live",
     ) -> dict[str, Any]:
         """שיקוף מכירה לייב — בלי קריאה לספר."""
         idx = self._position_idx(token_id)
@@ -1439,7 +1443,7 @@ class DemoEngine:
             "token_id": token_id,
             "realized_pnl": realized,
             "leg_cost": leg_cost,
-            "execution": "live",
+            "execution": execution,
         }
         if full_exit:
             sid = self._session_by_token.pop(token_id, None)

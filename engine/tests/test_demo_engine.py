@@ -332,3 +332,79 @@ async def test_settle_finalize_records_pnl_if_held(tmp_path: Path, monkeypatch):
     # winning Down side held to resolution -> 10*(1-FEE) payoff (fee netted) minus stake
     assert row["cf_exit_variants"]["pnl_if_held_to_resolution"] == pytest.approx(round(10.0 * (1 - FEE_RATE) - leg, 4))
 
+
+# ── M2b fix-3: testnet-predict trades must be tagged execution="testnet" (fake money) and MUST
+# NOT be counted in the real "live statistics" view (export_csv(live_only=True) / execution=="live"
+# filters) — only a genuine execution="live" (real Polymarket money) trade may appear there. ──────
+
+def test_record_live_buy_defaults_to_execution_live(tmp_path: Path):
+    """Byte-identical default: callers that don't pass execution= still get 'live' (the
+    real-money path is untouched)."""
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1_000.0)
+    eng.record_live_buy("Up", "tok-live-default", 10.0, 0.5, context={"gate": "test"})
+    assert eng.state.trades[-1]["execution"] == "live"
+
+
+def test_record_live_buy_execution_testnet_is_tagged_and_excluded_from_live_only_csv(tmp_path: Path):
+    """A testnet-predict BUY (fake money, real venue order) must be tagged execution='testnet' —
+    and must NOT show up in the live-only CSV export, which is the real 'live statistics' view."""
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1_000.0)
+    eng.record_live_buy("Up", "tok-testnet", 10.0, 0.5, context={"gate": "test"}, execution="testnet")
+    trade = eng.state.trades[-1]
+    assert trade["execution"] == "testnet"
+
+    csv_text = eng.export_csv(live_only=True)
+    assert "tok-testnet" not in csv_text
+
+
+def test_record_live_buy_execution_live_appears_in_live_only_csv(tmp_path: Path):
+    """A real (polymarket-live) BUY still tags 'live' and DOES appear in the live-only export —
+    the real-money path must keep working exactly as before."""
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1_000.0)
+    eng.record_live_buy("Up", "tok-real-live", 10.0, 0.5, context={"gate": "test"}, execution="live")
+    trade = eng.state.trades[-1]
+    assert trade["execution"] == "live"
+
+    csv_text = eng.export_csv(live_only=True)
+    assert "tok-real-live" in csv_text
+
+
+@pytest.mark.asyncio
+async def test_record_live_sell_execution_testnet_excluded_real_live_included(tmp_path: Path):
+    """Same invariant on the exit side: record_live_sell(execution='testnet') keeps fake-money
+    testnet exits out of the real live-stats CSV; execution='live' (default) still appears."""
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1_000.0)
+    eng.state.positions = [
+        Position(side="Up", contracts=10.0, avg_cost=0.4, token_id="tok-testnet-sell"),
+        Position(side="Up", contracts=10.0, avg_cost=0.4, token_id="tok-live-sell"),
+    ]
+
+    await eng.record_live_sell("tok-testnet-sell", 0.5, context={"gate": "test"}, execution="testnet")
+    await eng.record_live_sell("tok-live-sell", 0.5, context={"gate": "test"})  # default = live
+
+    trades_by_tok = {t["token_id"]: t for t in eng.state.trades}
+    assert trades_by_tok["tok-testnet-sell"]["execution"] == "testnet"
+    assert trades_by_tok["tok-live-sell"]["execution"] == "live"
+
+    csv_text = eng.export_csv(live_only=True)
+    assert "tok-testnet-sell" not in csv_text
+    assert "tok-live-sell" in csv_text
+
+
+def test_reconcile_live_state_execution_testnet_excluded_from_live_only_csv(tmp_path: Path):
+    """The synthetic RECONCILE ledger row must follow the same rule: testnet reconciles stay
+    out of the real live-stats view; the default (no execution=) stays 'live' as before."""
+    eng = DemoEngine(state_path=tmp_path / "state.json")
+    eng.state = DemoState(balance_usd=1_000.0)
+
+    tr = eng.reconcile_live_state(1_050.0, [], execution="testnet")
+    assert tr is not None
+    assert tr["execution"] == "testnet"
+
+    csv_text = eng.export_csv(live_only=True)
+    assert "RECONCILE" not in csv_text
+
