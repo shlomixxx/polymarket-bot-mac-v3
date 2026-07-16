@@ -22,8 +22,18 @@ non-neg-risk, non-yield-bearing) -> `sign_typed_data_order`. None of this touche
 makes no request until a chain-touching method is called — we never call one here, so order
 build+sign is safe to exercise for real in unit tests (only the REST leg is mocked).
 
-fetch_chain_shares_for_token stays a stub (None) — on-chain approvals/redeem need gas + collateral
-and are a later step (M2b-Step-2 explicitly excludes them; see the task's "Do NOT" list).
+M2b on-chain completion (this step) adds `ensure_approvals()`, `redeem_positions()`, and a real
+`fetch_chain_shares_for_token()` (ERC-1155 `balanceOf` on CONDITIONAL_TOKENS), all via the SAME
+`predict-sdk` `OrderBuilder` used for order build/sign above. Unlike order build/sign, these DO
+touch the chain (approval reads/writes, a redemption send, a balance read) and therefore need
+tBNB gas — they are gated by the same `_gate()` triple lock as orders, and are unit-tested here
+with a mocked `OrderBuilder`/web3 (no live network/gas). BTC up/down markets are always plain
+(non-neg-risk, non-yield-bearing — see above), so `redeem_positions()` hardcodes that; `ensure_approvals()`
+still runs the neg-risk track too (`OrderBuilder.get_all_approval_steps(is_yield_bearing=False)`)
+so the wallet is pre-approved even if a future market type needs it, without ever touching the
+unused yield-bearing track. Outcome tokens (ERC-1155) share the collateral's 18-decimal precision
+(same `OrderBuilder(precision=18)` convention used for order quantities elsewhere in this file), so
+`fetch_chain_shares_for_token` divides the raw `balanceOf` by 1e18 same as `_get_usdt_balance`.
 
 Testnet base (`https://api-testnet.predict.fun`) needs no API key for reads; respect the documented
 240 req/min.
@@ -56,6 +66,7 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 from predict_sdk import (
     ADDRESSES_BY_CHAIN_ID,
+    CONDITIONAL_TOKENS_ABI,
     ERC20_ABI,
     RPC_URLS_BY_CHAIN_ID,
     BuildOrderInput,
@@ -637,6 +648,92 @@ class PredictFunVenue(Venue):
         message, code = _classify_order_error(payload, status)
         return {"ok": False, "error": message, "error_code": code}
 
+    # --- on-chain approvals + redeem (M2b on-chain completion) ---
+    async def ensure_approvals(self) -> dict:
+        """One-time (idempotent) on-chain approval flow: lets the CTF exchange + neg-risk
+        exchange/adapter move the wallet's USDT (ERC20 allowance) and outcome tokens (ERC1155
+        `setApprovalForAll` on CONDITIONAL_TOKENS). Needs the wallet key + tBNB gas — gated the
+        same as orders (see `_gate()`). Safe to call repeatedly: `run_approvals_async` checks each
+        step on-chain first and skips anything already granted, so a re-run only sends the steps
+        that are still missing (typically zero, after the first successful run)."""
+        gate_err = self._gate()
+        if gate_err:
+            return {**gate_err, "steps_run": 0}
+        key = self._get_wallet_key()
+        if key is None:
+            # Defensive only — _gate() already checked has_wallet_key() before this was called.
+            return {
+                "ok": False, "steps_run": 0,
+                "error": "Predict.fun wallet key not configured (PREDICT_WALLET_KEY)",
+                "error_code": "no_wallet_key",
+            }
+        try:
+            builder = OrderBuilder.make(self._sdk_chain_id, key)
+            # is_yield_bearing=False: BTC up/down never uses the yield-bearing track (see module
+            # docstring), so skip approving it — this still covers both the standard and neg-risk
+            # exchanges/adapter for the track we actually trade.
+            steps = builder.get_all_approval_steps(is_yield_bearing=False)
+            report = await builder.run_approvals_async(steps)
+        except Exception as e:
+            return {"ok": False, "steps_run": 0, "error": f"predict_fun: ensure_approvals failed: {e}"}
+
+        steps_run = sum(1 for s in report.steps if getattr(s, "status", None) != "skipped")
+        if not report.success:
+            failed = next((s for s in report.steps if getattr(s, "status", None) == "failed"), None)
+            cause = getattr(getattr(failed, "transaction", None), "cause", None) if failed else None
+            return {
+                "ok": False, "steps_run": steps_run,
+                "error": f"predict_fun: approval step failed: {cause or 'unknown error'}",
+            }
+        return {"ok": True, "steps_run": steps_run}
+
+    async def redeem_positions(self, condition_id: str, index_sets: list[int]) -> dict:
+        """Redeem resolved WINNING outcome shares for USDT. BTC up/down markets are always plain
+        (non-neg-risk, non-yield-bearing — see module docstring), so this always goes through the
+        SDK's standard `redeem_positions_async` path. `index_sets` mirrors the real
+        ConditionalTokens contract's `indexSets: uint256[]` parameter (a binary market's winning
+        side is a single index set — 1 or 2, per the outcome's `indexSet` field from market data);
+        redeeming more than one at a time isn't a real scenario for this venue, so it's refused
+        rather than guessed at."""
+        gate_err = self._gate()
+        if gate_err:
+            return gate_err
+        key = self._get_wallet_key()
+        if key is None:
+            # Defensive only — _gate() already checked has_wallet_key() before this was called.
+            return {
+                "ok": False,
+                "error": "Predict.fun wallet key not configured (PREDICT_WALLET_KEY)",
+                "error_code": "no_wallet_key",
+            }
+        if not index_sets:
+            return {"ok": False, "error": "predict_fun: redeem_positions requires at least one index set"}
+        if len(index_sets) > 1:
+            return {
+                "ok": False,
+                "error": (
+                    "predict_fun: redeem_positions only supports a single index set per call "
+                    "(BTC up/down is winner-take-all — redeem the winning side once)"
+                ),
+            }
+        try:
+            builder = OrderBuilder.make(self._sdk_chain_id, key)
+            result = await builder.redeem_positions_async(
+                condition_id, index_sets[0], is_neg_risk=False, is_yield_bearing=False,
+            )
+        except Exception as e:
+            return {"ok": False, "error": f"predict_fun: redeem_positions failed: {e}"}
+
+        if not result.success:
+            cause = getattr(result, "cause", None)
+            return {"ok": False, "error": f"predict_fun: redeem failed: {cause or 'transaction reverted'}"}
+        tx_hash = None
+        receipt = getattr(result, "receipt", None)
+        if receipt is not None:
+            raw_hash = receipt.get("transactionHash") if hasattr(receipt, "get") else None
+            tx_hash = raw_hash.hex() if hasattr(raw_hash, "hex") else raw_hash
+        return {"ok": True, "tx_hash": tx_hash}
+
     async def fetch_portfolio(self, *, force: bool = False) -> dict:
         if not predict_secrets.has_wallet_key():
             return {
@@ -675,8 +772,28 @@ class PredictFunVenue(Venue):
         }
 
     async def fetch_chain_shares_for_token(self, token_id: str) -> Optional[float]:
-        # On-chain approvals/redeem need gas + collateral — a later step (see module docstring).
-        return None
+        """Real ERC-1155 `balanceOf(wallet, token_id)` read on CONDITIONAL_TOKENS. Read-only (no
+        gas needed) but still touches the RPC, so any failure (bad token_id, RPC hiccup, no wallet
+        key) degrades to None rather than raising — same graceful-contract as the rest of this
+        module's chain reads (e.g. `_get_usdt_balance`'s caller)."""
+        account = self._get_wallet_account()
+        if account is None:
+            return None
+        try:
+            addresses = ADDRESSES_BY_CHAIN_ID[self._sdk_chain_id]
+            rpc_url = RPC_URLS_BY_CHAIN_ID[self._sdk_chain_id]
+            w3 = Web3(Web3.HTTPProvider(rpc_url))
+            contract = w3.eth.contract(
+                address=Web3.to_checksum_address(addresses.CONDITIONAL_TOKENS),
+                abi=CONDITIONAL_TOKENS_ABI,
+            )
+            raw = contract.functions.balanceOf(
+                Web3.to_checksum_address(account.address), int(token_id),
+            ).call()
+            # Outcome tokens share the collateral's 18-decimal precision (see module docstring).
+            return float(raw) / 1e18
+        except Exception:
+            return None
 
     def fetch_account(self) -> dict:
         return {"ok": False, "error": "predict_fun account is M2b"}
