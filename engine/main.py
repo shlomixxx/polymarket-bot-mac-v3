@@ -137,7 +137,9 @@ _autoload_private_key_from_store()
 demo = DemoEngine()
 runner = StrategyRunner(demo)
 trigger = TriggerEngine()
-trigger.inject(demo)
+# inject the runner too so Trigger entries reuse the strategy runner's post-crash risk guards
+# (circuit-breaker + 25%-of-balance notional cap) instead of bypassing them.
+trigger.inject(demo, runner=runner)
 
 
 def _live_trades_for_tips_v2() -> list[dict[str, Any]]:

@@ -126,6 +126,7 @@ class TriggerEngine:
         self.current_signal_rec: str = "neutral"
         self.current_contract_ask: Optional[float] = None   # ask נוכחי לצד שבוחנים
         self._demo: Any = None
+        self._runner: Any = None  # StrategyRunner — shared post-crash risk guards (set via inject)
         self._dca_running: bool = False
         self._last_tp_exit_check_ts: float = 0.0  # throttling לבדיקות TP בזמן dca_pulse
         self._dca_completed_epoch: int = 0  # epoch של החלון האחרון שבו DCA רץ
@@ -152,8 +153,13 @@ class TriggerEngine:
         self.status_log.append({"ts": now, "msg": value})
         self.status_log = self.status_log[-50:]  # שמור 50 אחרונות
 
-    def inject(self, demo: Any) -> None:
+    def inject(self, demo: Any, runner: Any = None) -> None:
         self._demo = demo
+        # Reference to the StrategyRunner so Trigger entries can reuse its post-crash risk guards
+        # (circuit-breaker + 25%-of-balance notional cap) instead of bypassing them. Optional so
+        # isolated unit tests can still inject just a demo (guards fail-open when no runner wired).
+        if runner is not None:
+            self._runner = runner
 
     # ── Persistence for trigger_positions ─────────────────────────────────────
 
@@ -806,34 +812,94 @@ class TriggerEngine:
         fault_severity: str = "medium",
         fault_category: str = "entry",
         event_type: str = "skipped",
+        record_fault: bool = True,
     ) -> None:
         """כניסה נכשלה/דולגה — אנטי-ספאם בלבד (בלי לשנות אילו טריידים מוצלחים קורים):
           (b) מקדם את last_attempt_ts → שער ה-cooldown חוסם את הטיקים הבאים באותו חלון זמן.
           (c) רושם תקלה אחת מנוכת-כפילויות (dedup_key) במקום מאות אירועי error per-tick.
         שומר _log_event יחיד לפיד — לא per-tick, כי ה-backoff חוסם ניסיון נוסף עד תום ה-cooldown.
+        record_fault=False כשמנוע האסטרטגיה כבר רשם את התקלה המנוכת-כפילויות (חסמי-סיכון משותפים)
+        — מקדמים backoff ורושמים אירוע-פיד יחיד בלבד, בלי תקלה כפולה.
         """
         self.last_attempt_ts = time.time()
+        if record_fault:
+            try:
+                from fault_tracker import record_fault as _record_fault
+                _record_fault(
+                    category=fault_category,
+                    severity=fault_severity,
+                    title=fault_title,
+                    detail=reason,
+                    source="trigger_engine",
+                    dedup_key=dedup_key,
+                    context={
+                        "mode": self.config.mode,
+                        "side": side,
+                        "cap": cap,
+                        "contract_ask": contract_ask,
+                        "contracts": contracts,
+                        "btc_window": self.config.btc_window,
+                    },
+                )
+            except Exception:
+                pass
+        self._log_event(event_type, side, cap, contract_ask, contracts, reason)
+
+    def _risk_guard_blocks(
+        self,
+        side: Optional[str],
+        cap: Optional[float],
+        contract_ask: Optional[float],
+        contracts: Optional[int],
+        planned_cost: float,
+    ) -> bool:
+        """מפעיל על כניסת טריגר את אותם חסמי-סיכון שמנוע האסטרטגיה מפעיל (post-crash):
+          (1) Circuit-breaker  — strategy_runner._circuit_breaker_blocks
+          (2) תקרת 25% מהיתרה  — strategy_runner._entry_fraction_blocks
+        משתמש-מחדש בלוגיקה ובמצב המשותפים (אותו demo, אותו config של האסטרטגיה) — כך שהמסחר-המהיר
+        לא יכול לעקוף את ההגנות. מחזיר True אם צריך לדלג. בחסימה: מקדם backoff + רושם אירוע-פיד יחיד
+        (התקלה המנוכת-כפילויות כבר נרשמת ע"י מנוע האסטרטגיה — record_fault=False, בלי כפילות).
+        """
+        runner = self._runner
+        if runner is None:
+            # אין runner מחובר (למשל טסט-יחידה מבודד) — לא ניתן להעריך; fail-open (לא חוסמים).
+            return False
+        # (1) Circuit-breaker — משתף את מצב ה-rt.circuit_breaker_* ואת הגדרות ה-CB של האסטרטגיה
         try:
-            from fault_tracker import record_fault
-            record_fault(
-                category=fault_category,
-                severity=fault_severity,
-                title=fault_title,
-                detail=reason,
-                source="trigger_engine",
-                dedup_key=dedup_key,
-                context={
-                    "mode": self.config.mode,
-                    "side": side,
-                    "cap": cap,
-                    "contract_ask": contract_ask,
-                    "contracts": contracts,
-                    "btc_window": self.config.btc_window,
-                },
-            )
+            cfg = runner.rt.config
+            if runner._circuit_breaker_blocks(cfg=cfg):
+                reason = (
+                    getattr(runner.rt, "circuit_breaker_reason", "") or
+                    "Circuit-breaker פעיל — כניסות חדשות מושהות"
+                )
+                self._register_entry_backoff(
+                    side, cap, contract_ask, contracts,
+                    reason=reason,
+                    dedup_key="trigger_circuit_breaker_block",
+                    fault_title="Trigger: Circuit-breaker חסם כניסה",
+                    fault_severity="high", fault_category="risk",
+                    record_fault=False,  # האסטרטגיה כבר רשמה את התקלה המנוכת-כפילויות
+                )
+                self.status = "🛑 Circuit-breaker פעיל — כניסת טריגר נחסמה"
+                return True
+        except Exception:
+            pass  # fail-open — חסם CB לעולם לא יפיל את מנוע הטריגר
+        # (2) בלם 25%-מהיתרה — משתף את יתרת ה-demo
+        try:
+            if runner._entry_fraction_blocks(planned_cost_usd=planned_cost):
+                self._register_entry_backoff(
+                    side, cap, contract_ask, contracts,
+                    reason=f"notional ~{planned_cost:.2f}$ חורג מ-25% מהיתרה — נחסם להגנה",
+                    dedup_key="trigger_entry_fraction_block",
+                    fault_title="Trigger: notional גדול מדי ביחס ליתרה",
+                    fault_severity="high", fault_category="risk",
+                    record_fault=False,  # האסטרטגיה כבר רשמה את התקלה המנוכת-כפילויות
+                )
+                self.status = f"⛔ כניסה (~{planned_cost:.2f}$) חורגת מ-25% מהיתרה — נחסם"
+                return True
         except Exception:
             pass
-        self._log_event(event_type, side, cap, contract_ask, contracts, reason)
+        return False
 
     async def _execute_trade(
         self,
@@ -898,6 +964,11 @@ class TriggerEngine:
                 f"⛔ אין יתרה מספקת (נדרש ~{planned_cost:.2f}$, יתרה {balance:.2f}$) — "
                 f"המתנה {int(self.config.cooldown_sec)}ש׳"
             )
+            return False
+
+        # (d) חסמי-סיכון משותפים עם מנוע האסטרטגיה (post-crash): circuit-breaker + תקרת 25% מהיתרה.
+        # המסחר-המהיר עבר עד כה ישירות דרך simulate_market_buy ועקף אותם — עכשיו לא. חסימה = דילוג נקי.
+        if self._risk_guard_blocks(side, cap, contract_ask, contracts, planned_cost):
             return False
 
         # context מלא — ממלא את עמודות Gate / סיבה / epoch בטבלת העסקאות

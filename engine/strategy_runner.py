@@ -506,6 +506,10 @@ class StrategyRunner:
         # M2a: seam לבחירת venue (Polymarket / Predict.fun) — ברירת מחדל Polymarket,
         # התנהגות זהה byte-for-byte (pure delegation ל-live_clob/market_discovery הקיימים).
         self._venue = venues.get_venue("polymarket")
+        # Market-DATA reads (book/price) are decoupled from the order-EXECUTION venue: in plain
+        # demo we read the liquid Polymarket book even when order_venue=predict_fun (whose testnet
+        # book is empty). Cached singleton — reuse one instance, never construct per-tick.
+        self._polymarket_data_venue = venues.get_venue("polymarket")
         # FIX #22: שחזור DCA counters מ-state אם השרת קם אחרי קריסה באמצע DCA
         self._restore_dca_counters_from_state()
 
@@ -530,6 +534,19 @@ class StrategyRunner:
 
     def select_venue(self, name: str) -> None:
         self._venue = venues.get_venue(name)
+
+    def _book_venue(self):
+        """Venue used ONLY for market-DATA reads (book/price), decoupled from the
+        order-EXECUTION venue (`self._venue`).
+
+        When an order WOULD actually route (`_should_route_to_venue()`: real money OR
+        testnet-predict), read the book from that SAME venue — honest: if its book is
+        empty, no fabricated fill. In plain DEMO (orders simulated, not routed), read from
+        the liquid Polymarket book so the strategy can still form entries even when
+        `order_venue=predict_fun` (whose testnet book is empty). Mirrors what the Trigger
+        engine already does (it reads the Polymarket CLOB directly). Does NOT affect order
+        execution or live gating — those stay on `self._venue` / `_should_route_to_venue()`."""
+        return self._venue if self._should_route_to_venue() else self._polymarket_data_venue
 
     def _persist_dca_counters(self) -> None:
         """שומר את ה-DCA counters ל-DemoState ולדיסק. נקרא אחרי כל מוטציה."""
@@ -999,13 +1016,16 @@ class StrategyRunner:
         cutoff = now - 3600.0
         self.rt.trade_timestamps = [t for t in self.rt.trade_timestamps if t >= cutoff]
 
-    def _entry_limits_ok(self, *, now: float, cfg: StrategyConfig, planned_cost_usd: float) -> bool:
-        """בדיקות מגבלות בטיחות (ללא SL). מחזיר True אם מותר להיכנס."""
-        self._prune_trade_timestamps(now)
-        # ── Circuit-breaker: SELF-RECOVERING. On a trip it pauses NEW entries for a cooldown,
-        # records ONE fault, then auto-resumes (resetting the consecutive-loss streak) — so it
-        # can never deadlock (the old bug: blocking entries meant no win could ever reset it).
-        # Only the entry gate; never affects exits. Fail-OPEN. ──
+    def _circuit_breaker_blocks(self, *, cfg: StrategyConfig) -> bool:
+        """Circuit-breaker entry gate — SELF-RECOVERING. Returns True if NEW entries must be
+        blocked right now (a trip pauses new entries for a cooldown, records ONE fault, then
+        auto-resumes by resetting the consecutive-loss streak — so it can never deadlock).
+        Only the entry gate; never affects exits. Fail-OPEN.
+
+        Extracted verbatim from _entry_limits_ok so BOTH the strategy runner AND the Trigger
+        ("quick-trade") engine gate on the SAME breaker state (self.rt.circuit_breaker_*) —
+        quick-trade can no longer bypass the post-crash protection.
+        """
         try:
             import circuit_breaker, time as _cbt
             _now = _cbt.time()
@@ -1023,7 +1043,7 @@ class StrategyRunner:
                     self.rt.circuit_breaker_tripped = True
                     _left = int(float(self.rt.circuit_breaker_cooldown_until) - _now)
                     self.rt.status(f"🛑 Circuit-breaker: בקירור (עוד ~{_left//60+1} דק׳)", key="circuit_breaker")
-                    return False
+                    return True
                 # cooldown over (or never tripped): if we WERE tripped, clear it and give a CLEAN SLATE
                 # so the consecutive-loss condition can't immediately re-trip (this breaks the deadlock).
                 if getattr(self.rt, "circuit_breaker_tripped", False):
@@ -1063,12 +1083,59 @@ class StrategyRunner:
                     except Exception:
                         pass
                     self.rt.status(f"🛑 Circuit-breaker: {_cb_reason} — קירור ~{int(_CB_COOLDOWN_SEC//60)} דק׳", key="circuit_breaker")
-                    return False
+                    return True
                 self.rt.circuit_breaker_tripped = False
                 self.rt.circuit_breaker_reason = ""
         except Exception as _e:
             print(f"[circuit_breaker] eval failed (non-fatal, fail-open): {_e!r}", flush=True)
-        # ── end circuit-breaker ──
+        return False
+
+    def _entry_fraction_blocks(self, *, planned_cost_usd: float) -> bool:
+        """בלם יחסי-ליתרה (incident 2026-06-15). Returns True if the entry must be blocked
+        because its notional exceeds MAX_ENTRY_FRACTION_OF_BALANCE of the demo balance — a
+        hard brake against the "try $30k on $7k every tick" insufficient-balance loop. Records
+        ONE deduped fault. Extracted verbatim from _entry_limits_ok so the Trigger engine reuses
+        the SAME cap (shared demo balance), not a duplicate.
+        """
+        try:
+            _bal = float(self.demo.state.balance_usd)
+        except Exception:
+            _bal = 0.0
+        if (
+            _bal > 0
+            and planned_cost_usd > 0
+            and planned_cost_usd > _bal * MAX_ENTRY_FRACTION_OF_BALANCE
+        ):
+            self.rt.status(
+                f"סטטוס: כניסה (~${planned_cost_usd:.2f}) חורגת מ-{MAX_ENTRY_FRACTION_OF_BALANCE * 100:.0f}% מהיתרה "
+                f"(${_bal:.2f}) — נחסם להגנה",
+                key="limit_entry_fraction_of_balance",
+            )
+            try:
+                from fault_tracker import record_fault
+                record_fault(
+                    category="risk", severity="high",
+                    title="כניסה נחסמה: notional גדול מדי ביחס ליתרה",
+                    detail=(
+                        f"notional ~${planned_cost_usd:.2f} > {MAX_ENTRY_FRACTION_OF_BALANCE * 100:.0f}% "
+                        f"מיתרה ${_bal:.2f} — נחסם (הגנה מפני לולאת insufficient-balance)"
+                    ),
+                    source="strategy_runner._entry_limits_ok",
+                    context={"planned_cost_usd": round(planned_cost_usd, 2),
+                             "balance_usd": round(_bal, 2),
+                             "max_fraction": MAX_ENTRY_FRACTION_OF_BALANCE},
+                    dedup_key="entry_notional_exceeds_balance_fraction",
+                )
+            except Exception:
+                pass
+            return True
+        return False
+
+    def _entry_limits_ok(self, *, now: float, cfg: StrategyConfig, planned_cost_usd: float) -> bool:
+        """בדיקות מגבלות בטיחות (ללא SL). מחזיר True אם מותר להיכנס."""
+        self._prune_trade_timestamps(now)
+        if self._circuit_breaker_blocks(cfg=cfg):
+            return False
         # ── Chop-Armed FLW gate: only allow entries once a chop has armed a campaign ──
         if not self._check_chop_gate(cfg=cfg):
             return False
@@ -1103,41 +1170,8 @@ class StrategyRunner:
                 key="limit_notional_per_window",
             )
             return False
-        # ── בלם יחסי-ליתרה (incident 2026-06-15) ──
-        # גם אם משהו אחר השתבש (config מסוכן, מכפיל מנופח), לעולם לא ננסה כניסה שה-notional
-        # שלה עולה על MAX_ENTRY_FRACTION_OF_BALANCE מהיתרה — מונע את הלולאה "לנסות $30k על $7k
-        # בכל טיק" ("insufficient balance" שוב ושוב). תקלה אחת מדודדפת בלבד, לא אחת לכל טיק.
-        try:
-            _bal = float(self.demo.state.balance_usd)
-        except Exception:
-            _bal = 0.0
-        if (
-            _bal > 0
-            and planned_cost_usd > 0
-            and planned_cost_usd > _bal * MAX_ENTRY_FRACTION_OF_BALANCE
-        ):
-            self.rt.status(
-                f"סטטוס: כניסה (~${planned_cost_usd:.2f}) חורגת מ-{MAX_ENTRY_FRACTION_OF_BALANCE * 100:.0f}% מהיתרה "
-                f"(${_bal:.2f}) — נחסם להגנה",
-                key="limit_entry_fraction_of_balance",
-            )
-            try:
-                from fault_tracker import record_fault
-                record_fault(
-                    category="risk", severity="high",
-                    title="כניסה נחסמה: notional גדול מדי ביחס ליתרה",
-                    detail=(
-                        f"notional ~${planned_cost_usd:.2f} > {MAX_ENTRY_FRACTION_OF_BALANCE * 100:.0f}% "
-                        f"מיתרה ${_bal:.2f} — נחסם (הגנה מפני לולאת insufficient-balance)"
-                    ),
-                    source="strategy_runner._entry_limits_ok",
-                    context={"planned_cost_usd": round(planned_cost_usd, 2),
-                             "balance_usd": round(_bal, 2),
-                             "max_fraction": MAX_ENTRY_FRACTION_OF_BALANCE},
-                    dedup_key="entry_notional_exceeds_balance_fraction",
-                )
-            except Exception:
-                pass
+        # ── בלם יחסי-ליתרה (incident 2026-06-15) — עכשיו במתודה משותפת עם מנוע הטריגר ──
+        if self._entry_fraction_blocks(planned_cost_usd=planned_cost_usd):
             return False
         return True
 
@@ -1473,7 +1507,12 @@ class StrategyRunner:
             )
         except Exception:
             pass
-        m = await self._venue.discover_active_window(self.rt.config.btc_window)
+        # Book/price READS use book_venue (decoupled from the order-EXECUTION venue): in plain
+        # demo, read the liquid Polymarket book so the strategy can form entries even when
+        # order_venue=predict_fun (empty testnet book). Snapshot once per tick — order execution
+        # stays on self._venue, still gated by _should_route_to_venue().
+        book_venue = self._book_venue()
+        m = await book_venue.discover_active_window(self.rt.config.btc_window)
         if not m:
             self.rt.log(f"לא נמצא שוק BTC Up/Down חלון {self.rt.config.btc_window} פעיל")
             # F5: גילוי נכשל לגמרי (גם ה-stale-cache נעלם). רושמים תקלה רק אם זה נמשך >60s,
@@ -1721,8 +1760,8 @@ class StrategyRunner:
         min_left = sec_left / 60.0
         cfg = self.rt.config
         token_up, token_down = m.token_up, m.token_down
-        bid_u, ask_u = await self._venue.best_bid_ask(token_up)
-        bid_d, ask_d = await self._venue.best_bid_ask(token_down)
+        bid_u, ask_u = await book_venue.best_bid_ask(token_up)
+        bid_d, ask_d = await book_venue.best_bid_ask(token_down)
         missing: list[str] = []
         if ask_u is None:
             missing.append("Up")
@@ -2452,7 +2491,7 @@ class StrategyRunner:
                 return
 
         # Ask מעודכן מיד לפני חישוב כמות — Ask בתחילת הטיק עלול להיות ישן; בדמו/לייב המילוי משתמש ב-best ask מחדש
-        _, ask_entry = await self._venue.best_bid_ask(str(token))
+        _, ask_entry = await book_venue.best_bid_ask(str(token))
         if ask_entry is not None:
             try:
                 ae = float(ask_entry)
