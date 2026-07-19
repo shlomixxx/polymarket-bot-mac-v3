@@ -18,6 +18,11 @@ tips_v2_cache.json
 # מסד הביקורת (audit.db) — runtime store, נוצר ע"י audit_tracker/בדיקות; לא לקומיט
 engine/audit.db
 
+# מסד התקלות (faults.db) — runtime store שמגיש המנוע החי (לשונית "תקלות"); נוצר ע"י
+# fault_tracker/בדיקות ומשוחזר בזמן-ריצה; לא לקומיט. וגם כל sidecar faults.db של בדיקות.
+engine/faults.db
+**/faults.db
+
 # Binance cockpit — sidecar audit ledger (runtime) ומאגר המפתחות fallback.
 # המפתחות לעולם לא נכנסים ל-git: גם keyring וגם קובץ fallback בהרשאות 600.
 **/binance_audit.db
@@ -27,3 +32,8 @@ engine/audit.db
 
 # גיבויי-נתונים מקומיים (off-Railway) — לא לקומיט (גדול/פרטי)
 backups/
+
+# playwright MCP screenshot/snapshot artifacts
+.playwright-mcp/
+/history.db
+.claude/scheduled_tasks.lock

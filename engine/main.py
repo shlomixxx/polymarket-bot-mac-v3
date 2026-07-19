@@ -10,8 +10,13 @@ import math
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+# תצוגת שעה בשעון ישראל (השרת רץ ב-UTC; מחרוזות שמוצגות ב-UI/חבילת-שיתוף).
+_IL = ZoneInfo("Asia/Jerusalem")
 
 
 def _load_dotenv_from_project_root() -> None:
@@ -232,14 +237,87 @@ _REAL_FEE_PNL_CACHE = TTLCache(ttl_sec=45.0)
 _ACCURACY_CACHE = TTLCache(ttl_sec=60.0)
 
 
+def _engine_source_from_gate(gate: Any) -> str:
+    """מסווג את מקור-המנוע של עסקה לפי ה-gate שלה: gate שמתחיל ב-'trigger:' -> מנוע
+    הטריגר (מסחר-מהיר); כל השאר (כולל None/ריק ו-gate של האסטרטגיה) -> אסטרטגיה."""
+    return "trigger" if str(gate or "").startswith("trigger:") else "strategy"
+
+
+def _empty_engine_stats() -> dict[str, Any]:
+    """צורת per-engine ריקה (אין יציאות) — זהה בשדות ל-breakdown המלא."""
+    return {
+        "bot_run_win_rate_pct": None,
+        "bot_run_exit_trades_n": 0,
+        "bot_run_wins_n": 0,
+        "bot_run_losses_n": 0,
+        "bot_run_realized_pnl_usd": 0.0,
+    }
+
+
+def _empty_by_engine() -> dict[str, Any]:
+    return {"strategy": _empty_engine_stats(), "trigger": _empty_engine_stats()}
+
+
+def _by_engine_breakdown(exits: list[dict[str, Any]]) -> dict[str, Any]:
+    """מפצל רשימת יציאות ממומשות לפי מנוע המקור (אסטרטגיה/טריגר) ומחזיר per-engine
+    זהה-צורה ל-``_empty_engine_stats``. ייחוס יציאה נעשה קודם כל דרך ה-BUY שפתח את
+    הפוזיציה (מיפוי session_id -> gate של ה-BUY), ורק כ-fallback לפי ה-gate של היציאה
+    עצמה — כי SELL/SETTLE לא נושאות את ה-gate של ה-BUY."""
+    # session_id -> engine, לפי ה-BUY הפותח (על פני כל העסקאות, גם BUY שלפני t0).
+    session_engine: dict[str, str] = {}
+    for t in demo.state.trades or []:
+        if t.get("type") == "BUY":
+            sid = t.get("session_id")
+            if sid is not None:
+                session_engine.setdefault(str(sid), _engine_source_from_gate(t.get("gate")))
+
+    def _engine_of_exit(t: dict[str, Any]) -> str:
+        sid = t.get("session_id")
+        if sid is not None:
+            eng = session_engine.get(str(sid))
+            if eng is not None:
+                return eng
+        return _engine_source_from_gate(t.get("gate"))
+
+    acc = {
+        "strategy": {"n": 0, "wins": 0, "pnl": 0.0},
+        "trigger": {"n": 0, "wins": 0, "pnl": 0.0},
+    }
+    for x in exits:
+        a = acc[_engine_of_exit(x)]
+        rp = float(x.get("realized_pnl") or 0)
+        a["n"] += 1
+        if rp > 0:
+            a["wins"] += 1
+        a["pnl"] += rp
+
+    def _stats(a: dict[str, Any]) -> dict[str, Any]:
+        n, wins = a["n"], a["wins"]
+        return {
+            "bot_run_win_rate_pct": round(100.0 * wins / n, 2) if n else None,
+            "bot_run_exit_trades_n": n,
+            "bot_run_wins_n": wins,
+            "bot_run_losses_n": n - wins,
+            "bot_run_realized_pnl_usd": round(a["pnl"], 6),
+        }
+
+    return {"strategy": _stats(acc["strategy"]), "trigger": _stats(acc["trigger"])}
+
+
 def _bot_run_win_rate_stats() -> dict[str, Any]:
-    """אחוז ניצחונות ביציאות ממומשות מתחילת סשן הבוט (כמו חישוב win rate בלשונית סטטיסטיקה)."""
+    """אחוז ניצחונות ביציאות ממומשות מתחילת סשן הבוט (כמו חישוב win rate בלשונית סטטיסטיקה).
+
+    בנוסף למאוחד (bot_run_*), מוסיף ``by_engine`` — פיצול זהה-צורה לפי מנוע המקור
+    (אסטרטגיה מול טריגר/מסחר-מהיר). ייחוס יציאה למנוע נעשה דרך ה-BUY שפתח את הפוזיציה
+    (session_id), כי עסקאות SELL/SETTLE לא מעתיקות את ה-gate של ה-BUY — ייחוס לפי ה-gate
+    של היציאה עצמה היה סופר בטעות יציאות-טריגר כ"אסטרטגיה"."""
     t0 = _bot_run_started_ts
     if t0 is None:
         return {
             "bot_run_win_rate_pct": None,
             "bot_run_exit_trades_n": 0,
             "bot_run_wins_n": 0,
+            "by_engine": _empty_by_engine(),
         }
     cache_key = (float(t0), len(demo.state.trades or []))
     if _WIN_RATE_CACHE["key"] == cache_key and _WIN_RATE_CACHE["val"] is not None:
@@ -269,11 +347,13 @@ def _bot_run_win_rate_stats() -> dict[str, Any]:
         ):
             exits.append(t)
     n = len(exits)
+    by_engine = _by_engine_breakdown(exits)
     if n == 0:
         result = {
             "bot_run_win_rate_pct": None,
             "bot_run_exit_trades_n": 0,
             "bot_run_wins_n": 0,
+            "by_engine": by_engine,
         }
         _WIN_RATE_CACHE["key"] = cache_key
         _WIN_RATE_CACHE["val"] = result
@@ -284,6 +364,7 @@ def _bot_run_win_rate_stats() -> dict[str, Any]:
         "bot_run_win_rate_pct": round(wr, 2),
         "bot_run_exit_trades_n": n,
         "bot_run_wins_n": wins,
+        "by_engine": by_engine,
     }
     _WIN_RATE_CACHE["key"] = cache_key
     _WIN_RATE_CACHE["val"] = result
@@ -488,7 +569,7 @@ async def _loop_watchdog(interval_sec: float = 15.0) -> None:
     זהו בדיוק סוג ה-outage שקרה (event loop חנוק). קל ולא חוסם: sleep + השוואות + UPSERT זעיר
     ל-faults.db. לעולם לא מפעיל מחדש את הלולאה / לא כופה tick (סיכון re-entry ל-settlement)."""
     LAG_THRESHOLD = 5.0
-    STALE_THRESHOLD = 30.0
+    STALE_THRESHOLD = 60.0  # סובלנות ל-tick איטי-אך-חי (היה 30)
     while True:
         t0 = time.monotonic()
         await asyncio.sleep(interval_sec)
@@ -504,15 +585,20 @@ async def _loop_watchdog(interval_sec: float = 15.0) -> None:
                     dedup_key="event_loop_lag",
                 )
             mode = runner.rt.mode
-            last = float(runner.rt.last_tick_ts or 0)
+            # heartbeat מונוטוני: נעצר בזמן שינת/hibernate של המערכת, כך שהתעוררות לא
+            # מנפחת את הגיל. wall-clock (last_tick_ts) גרם ל-false-positive אחרי שינה בלילה
+            # (52× בעוד event_loop_lag המונוטוני נורה 3× בלבד — הלולאה מעולם לא נחנקה).
+            hb = float(getattr(runner.rt, "last_tick_monotonic", 0) or 0)
             # שומר מפני false-positive: לא בודקים תקיעות כשהמנוע כבוי או שעוד לא היה tick ראשון.
-            if mode != "off" and last > 0:
-                age = time.time() - last
+            if mode != "off" and hb > 0:
+                age = time.monotonic() - hb
                 if age > STALE_THRESHOLD:
+                    # wall-clock רק לטקסט קריא-לאדם (הזמן בפועל של ה-tick האחרון).
+                    wall_age = time.time() - float(runner.rt.last_tick_ts or 0)
                     record_fault(
                         category="watchdog", severity="high",
                         title="לולאת האסטרטגיה תקועה — אין tick",
-                        detail=f"last_tick age={age:.0f}s mode={mode}",
+                        detail=f"last_tick age={age:.0f}s (wall≈{wall_age:.0f}s) mode={mode}",
                         source="main._loop_watchdog",
                         context={"age_sec": round(age, 1), "mode": mode},
                         dedup_key="strategy_tick_stalled",
@@ -1525,6 +1611,8 @@ async def demo_snapshot(request: Request):
         "bot_run_win_rate_pct": win_rate.get("bot_run_win_rate_pct"),
         "bot_run_exit_trades_n": win_rate.get("bot_run_exit_trades_n"),
         "bot_run_wins_n": win_rate.get("bot_run_wins_n"),
+        # פיצול per-engine (אסטרטגיה מול טריגר) — המאוחד לעיל נשמר כמות שהוא.
+        "by_engine": win_rate.get("by_engine") or _empty_by_engine(),
         "market_timing": market_timing,
     }
     return etag_json_response(payload, request.headers.get("if-none-match"))
@@ -3304,7 +3392,7 @@ async def trigger_share_bundle():
         time_str = ""
         if ts:
             try:
-                time_str = datetime.fromtimestamp(float(ts)).strftime("%H:%M:%S")
+                time_str = datetime.fromtimestamp(float(ts), _IL).strftime("%H:%M:%S")
             except Exception:
                 time_str = ""
         return (
@@ -3353,7 +3441,7 @@ async def trigger_share_bundle():
     activated_ts_line = ""
     if activated_ts:
         try:
-            activated_ts_line = datetime.fromtimestamp(float(activated_ts)).isoformat()
+            activated_ts_line = datetime.fromtimestamp(float(activated_ts), _IL).isoformat()
         except Exception:
             activated_ts_line = str(activated_ts)
 

@@ -7,10 +7,15 @@ import asyncio
 import math
 import os
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional
+from zoneinfo import ZoneInfo
 
 import venues
+
+# תצוגת שעה בשעון ישראל (השרת רץ ב-UTC; שורות הלוג מוצגות ב-UI).
+_IL = ZoneInfo("Asia/Jerusalem")
 from demo_engine import DemoEngine, FEE_RATE
 from market_discovery import seconds_until_window_end
 from order_validation import validate_contracts_for_market
@@ -199,6 +204,9 @@ class StrategyRuntime:
     _last_status_ts: float = 0.0
     _last_status_key: str = ""
     last_tick_ts: float = 0.0
+    # heartbeat מונוטוני לזיהוי תקיעות: time.monotonic() נעצר בזמן שינת/hibernate של
+    # המערכת, כך שהתעוררות לא מנפחת את הגיל (בניגוד ל-last_tick_ts שהוא wall-clock).
+    last_tick_monotonic: float = 0.0
     _last_book_log_ts: float = 0.0
     # לשידור/סטטיסטיקה: מתחילים למדוד זמן מהכניסה הראשונה של לולאת האסטרטגיה (לא טריגר/גידור רגל 2).
     strategy_first_buy_ts: Optional[float] = None
@@ -242,7 +250,7 @@ class StrategyRuntime:
     _last_signal_book_down: Optional[dict] = None
 
     def log(self, msg: str) -> None:
-        ts = time.strftime("%H:%M:%S")
+        ts = datetime.now(_IL).strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         self.log_lines.append(line)
         self.log_lines = self.log_lines[-300:]
@@ -260,7 +268,7 @@ class StrategyRuntime:
 
     def log_event(self, msg: str, session_id: Optional[str] = None) -> None:
         """אירוע בפועל: כניסה, יציאה, DCA — לא סטטוס."""
-        ts = time.strftime("%H:%M:%S")
+        ts = datetime.now(_IL).strftime("%H:%M:%S")
         line = f"[{ts}] ▶ אירוע: {msg}"
         self.log_lines.append(line)
         self.log_lines = self.log_lines[-300:]
@@ -340,7 +348,7 @@ class StrategyRuntime:
         if k != prev_key:
             self._last_status_key = k
             self._last_status_ts = now
-            self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+            self.log_lines.append(f"[{datetime.now(_IL).strftime('%H:%M:%S')}] {msg}")
             self.log_lines = self.log_lines[-300:]
             self.log_entries.append({
                 "ts": now,
@@ -357,7 +365,7 @@ class StrategyRuntime:
             return
         if now - self._last_status_ts >= max(min_interval_sec, repeat_interval_sec):
             self._last_status_ts = now
-            self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+            self.log_lines.append(f"[{datetime.now(_IL).strftime('%H:%M:%S')}] {msg}")
             self.log_lines = self.log_lines[-300:]
             self.log_entries.append({
                 "ts": now,
@@ -1448,6 +1456,9 @@ class StrategyRunner:
 
         # Heartbeat שמראה שהמנוע ממשיך לרוץ גם אם בינתיים אין status מפורש.
         self.rt.last_tick_ts = time.time()
+        # heartbeat מונוטוני נפרד לזיהוי-תקיעות (ה-watchdog) — לא מושפע מקפיצות wall-clock
+        # אחרי שינת מערכת. last_tick_ts נשאר wall-clock לצורכי תצוגה/דיאגנוסטיקה.
+        self.rt.last_tick_monotonic = time.monotonic()
         # Reconcile קבוע (לא יותר מ-1 ל-120 שניות) כדי לתפוס drift בין הספר הפנימי
         # ליתרה/פוזיציות האמיתיות של Polymarket — רץ רק במצב לייב.
         # ניקוי settled_token_ids אחרי שעה (Data API כבר מפסיק להחזיר אותם).
@@ -1851,8 +1862,15 @@ class StrategyRunner:
             except Exception:
                 _spot_vs_open_pct = None
 
+            # Venue provenance (recording-only): the active order venue + BTC data source, read
+            # from the SAME state the runner routes on (self.rt.config.order_venue / data_source).
+            # Lets the audit ledger tell Predict.fun/Binance trades apart from Polymarket ones.
+            import data_source as _data_source
+            _order_venue = venues.normalize(getattr(cfg, "order_venue", "polymarket"))
+            _active_data_source = _data_source.get_active()
             base_ctx["audit_inputs"] = {
                 "mode": ("live" if getattr(self.rt, "live_trading", False) else "demo"),
+                "data_source": _active_data_source, "order_venue": _order_venue,
                 "slug": m.slug, "epoch": int(m.epoch), "window_sec": int(m.window_sec),
                 "code_version": (audit_snapshot.get_git_sha() or "")[:12],
                 "signal_result": _sig_result,

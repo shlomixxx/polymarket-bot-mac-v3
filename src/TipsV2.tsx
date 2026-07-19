@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api";
+import { israelDateTime } from "./timeFormat";
 
 type TipsV2Metrics = {
   expectancy: number;
@@ -447,7 +448,7 @@ function TipsV2RunsPanel({ onRunsChanged }: { onRunsChanged: () => void }) {
                     </td>
                     <td style={{ padding: 6, borderBottom: "1px solid #1e293b" }}>{fmtMaybe(row.trade_rows)}</td>
                     <td style={{ padding: 6, borderBottom: "1px solid #1e293b", whiteSpace: "nowrap" }}>
-                      {new Date(row.mtime * 1000).toLocaleString("he-IL")}
+                      {israelDateTime(row.mtime)}
                     </td>
                     <td style={{ padding: 6, borderBottom: "1px solid #1e293b", maxWidth: 280 }} onClick={(e) => e.stopPropagation()}>
                       <details style={{ fontSize: 11 }}>

@@ -4,6 +4,7 @@ import { Card } from "./ui/Card";
 import { SectionTitle } from "./ui/SectionTitle";
 import { Button } from "./ui/Button";
 import { Collapsible } from "./ui/Collapsible";
+import { israelDateHM } from "./timeFormat";
 
 /**
  * BtcCockpitTab — "קוקפיט מסחר ידני" for the owner's REAL Binance USDⓈ-M Futures account.
@@ -131,14 +132,8 @@ function fmtNum(v: number | null | undefined, digits = 4): string {
 }
 function fmtTime(ts: number | null | undefined): string {
   if (!ts || !Number.isFinite(ts)) return "—";
-  try {
-    // sidecar ledger ts is in SECONDS (time.time())
-    return new Date(ts * 1000).toLocaleString("he-IL", {
-      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
-    });
-  } catch {
-    return String(ts);
-  }
+  // sidecar ledger ts is in SECONDS (time.time()) — render in Israel time (DD/MM HH:MM)
+  return israelDateHM(ts);
 }
 function pnlColor(v: number | null | undefined): string {
   if (v == null || !Number.isFinite(v)) return "var(--muted)";

@@ -18,8 +18,12 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-_DB_PATH = Path(os.environ.get("DATA_ROOT", str(Path(__file__).resolve().parent))) / "faults.db"
+# דריסת-נתיב מפורשת (בעיקר לבדיקות). None = לפתור מ-DATA_ROOT *בזמן-קריאה* — לא לקבע ב-import.
+# הבאג המקורי קיבע כאן את הנתיב ב-import וקישר את ה-conn המטמון לנתיב מקובע, כך ש-override של
+# DATA_ROOT אחרי ה-import (למשל בבדיקות) נבלע וכתיבות דלפו ל-engine/faults.db החי.
+_DB_PATH: Optional[Path] = None
 _conn: Optional[sqlite3.Connection] = None
+_conn_path: Optional[str] = None  # הנתיב שכנגדו נפתח ה-conn המטמון — לזיהוי שינוי-נתיב בזמן-קריאה
 # מנעול לחיבור ה-sqlite המשותף (check_same_thread=False). היום כל הכותבים על אותו event-loop
 # thread, אבל ה-watchdog וכותבים עתידיים עלולים לבוא מ-thread אחר — המנעול מונע מרוץ כתיבה.
 _LOCK = threading.Lock()
@@ -27,10 +31,46 @@ _LOCK = threading.Lock()
 SEVERITIES = ("critical", "high", "medium", "low")
 
 
+def _resolve_db_path() -> Path:
+    """פותר את נתיב ה-DB בזמן-קריאה. דריסת _DB_PATH מפורשת גוברת; אחרת DATA_ROOT/faults.db —
+    כך ש-override של DATA_ROOT *אחרי* ה-import מכובד (התיקון לבאג הקיבוע-ב-import)."""
+    if _DB_PATH is not None:
+        return Path(_DB_PATH)
+    return Path(os.environ.get("DATA_ROOT", str(Path(__file__).resolve().parent))) / "faults.db"
+
+
+def reset() -> None:
+    """משחרר את ה-conn המטמון כך שנתיב DB חדש (DATA_ROOT/_DB_PATH) ייכנס לתוקף בקריאה הבאה.
+    בשימוש בבדיקות לבידוד; בטוח לקריאה בכל עת — לעולם לא זורק."""
+    global _conn, _conn_path
+    try:
+        if _conn is not None:
+            _conn.close()
+    except Exception:
+        pass
+    finally:
+        _conn = None
+        _conn_path = None
+
+
+# שם-חלופי נוח לסגירה מפורשת
+close = reset
+
+
 def _get_conn() -> sqlite3.Connection:
-    global _conn
+    global _conn, _conn_path
+    path = str(_resolve_db_path())
+    # אם הנתיב השתנה מאז שנפתח ה-conn המטמון — משחררים ופותחים מחדש (פתירה בזמן-קריאה)
+    if _conn is not None and _conn_path != path:
+        try:
+            _conn.close()
+        except Exception:
+            pass
+        _conn = None
+        _conn_path = None
     if _conn is None:
-        _conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False, timeout=5.0)
+        _conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
+        _conn_path = path
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA busy_timeout=5000")  # אין WAL — חסר תועלת ב-thread יחיד + סיכון על volume רשת
         _conn.execute(

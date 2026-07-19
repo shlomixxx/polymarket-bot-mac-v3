@@ -15,6 +15,7 @@ import {
   smoothCurveType,
 } from "./chartConstants";
 import { formatPnlAxisTime, formatPctAxisTick } from "./pnlChartFormatters";
+import { israelHM, israelTime } from "./timeFormat";
 import { growLiveTrail } from "./livePnlTrail";
 import {
   computeEffectiveMinContracts,
@@ -37,6 +38,8 @@ import {
   TradeWindowChip,
 } from "./ui/WindowCircles";
 import type { RecentWindow, HourlyBucket } from "./windowStats";
+import { deriveEngineStatsView } from "./engineStats";
+import type { EngineStatsView, RawByEngine } from "./engineStats";
 import TipsV2 from "./TipsV2";
 import SignalsPanel from "./SignalsPanel";
 import TriggerTrader from "./TriggerTrader";
@@ -435,9 +438,7 @@ function formatWindowFromTrade(t: Trade): string {
   const ts = Number(t.ts) || 0;
   const windowStartSec = epoch ?? (ts ? Math.floor(ts / dur) * dur : 0);
   if (!windowStartSec) return "";
-  const start = new Date(windowStartSec * 1000);
-  const end = new Date((windowStartSec + dur) * 1000);
-  return `${start.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" })}–${end.toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" })}`;
+  return `${israelHM(windowStartSec)}–${israelHM(windowStartSec + dur)}`;
 }
 
 /** משך זמן מחזור: מכניסה ראשונה (או עסקה ראשונה) עד יציאה אחרונה */
@@ -666,22 +667,8 @@ function TradesBySession({
             : durationOpenSec != null
               ? `${formatDurationSec(durationOpenSec)} (עד עכשיו)`
               : null;
-        const entryClock =
-          sessStart > 0
-            ? new Date(sessStart * 1000).toLocaleTimeString("he-IL", {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-              })
-            : null;
-        const exitClock =
-          sessEnd != null && sessEnd > 0
-            ? new Date(sessEnd * 1000).toLocaleTimeString("he-IL", {
-                hour: "2-digit",
-                minute: "2-digit",
-                second: "2-digit",
-              })
-            : null;
+        const entryClock = sessStart > 0 ? israelTime(sessStart) : null;
+        const exitClock = sessEnd != null && sessEnd > 0 ? israelTime(sessEnd) : null;
         // trade_num קבוע מהשרת (נשמר לדיסק); אם חסר (היסטוריה ישנה) — idx+1 כגיבוי
         const tradeNum = buys.find(b => b.trade_num != null)?.trade_num ?? (idx + 1);
         const summaryMainBase =
@@ -1420,7 +1407,7 @@ function TradesBySession({
                             {sessionLogs.slice(-20).map((e, i) => (
                               <div key={i} style={{ marginBottom: 2 }}>
                                 <span style={{ color: e.type === "event" ? "var(--up)" : "var(--muted)" }}>
-                                  {new Date(e.ts * 1000).toLocaleTimeString("he-IL")}
+                                  {israelTime(e.ts)}
                                 </span>
                                 {" — "}
                                 {e.msg}
@@ -1487,15 +1474,12 @@ function TradesBySession({
                               const tsNum = Number(t.ts) * 1000;
                               const durMs = windowSecForTrade(t, fallbackWindowSec) * 1000;
                               const winMs = Math.floor(tsNum / durMs) * durMs;
-                              return new Date(winMs).toLocaleTimeString("he-IL", {
-                                hour: "2-digit",
-                                minute: "2-digit",
-                              });
+                              return israelHM(winMs / 1000);
                             })()
                           : "—"}
                       </td>
                       <td style={{ padding: "6px 10px", color: "var(--muted)" }}>
-                        {t.ts ? new Date((t.ts as number) * 1000).toLocaleTimeString("he-IL") : "—"}
+                        {t.ts ? israelTime(t.ts as number) : "—"}
                       </td>
                       <td style={{ padding: "6px 10px" }}>
                         {t.type === "BUY" ? "כניסה" : t.type === "SELL_TP" ? "יציאה (TP)" : t.type || ""}
@@ -1890,6 +1874,8 @@ export default function App() {
   const [selectedWindowEpoch, setSelectedWindowEpoch] = useState<number | null>(null);
   const [hourlyHistory, setHourlyHistory] = useState<HourlyBucket[]>([]);
   const [botWins, setBotWins] = useState<{ wins: number; n: number; pct: number | null }>({ wins: 0, n: 0, pct: null });
+  // פיצול "ניצחונות הבוט" לפי מנוע (אסטרטגיה מול טריגר/מסחר-מהיר) — null עד שהשרת מחזיר by_engine.
+  const [botEngineStats, setBotEngineStats] = useState<EngineStatsView | null>(null);
   /** שוק Polymarket: חלון 5 או 15 דק׳ (לא מספר חוזים) */
   const [btcWindow, setBtcWindow] = useState<"5m" | "15m">("5m");
   /** מינ׳ חוזים — לפחות max(זה, מינ׳ השוק) */
@@ -2074,6 +2060,8 @@ export default function App() {
             n: lr.bot_run_exit_trades_n as number,
             pct: typeof lr.bot_run_win_rate_pct === "number" ? (lr.bot_run_win_rate_pct as number) : null,
           });
+        // פיצול לפי מנוע — additive: השרת מוסיף by_engine ל-strategy/config (**_bot_run_win_rate_stats()).
+        setBotEngineStats(deriveEngineStatsView(lr.by_engine as RawByEngine | undefined));
       }
       // חשוב: יש רענון כל שנייה. לא נדרוס ערכים שהמשתמש עורך לפני "שמור".
       // כשאין עריכה פתוחה — מסנכרנים את כל ההגדרות מהשרת (אחרת אחרי F5 חוזרים לברירות מחדל מקומיות).
@@ -2480,7 +2468,7 @@ export default function App() {
         i,
         pnl: cum,
         ts: tsSec,
-        t: new Date(tsSec * 1000).toLocaleTimeString("he-IL"),
+        t: israelTime(tsSec),
       });
     }
 
@@ -2518,7 +2506,7 @@ export default function App() {
         i,
         pnl: cum,
         ts: tsSec,
-        t: new Date(tsSec * 1000).toLocaleTimeString("he-IL"),
+        t: israelTime(tsSec),
       });
     }
     return out;
@@ -3389,19 +3377,857 @@ export default function App() {
       )}
 
       {tab === "strategy" && (
-        <Card padding="lg">
+        <div className="strat-root" style={{ display: "flex", flexDirection: "column", gap: "var(--s-4)" }}>
           <SectionTitle as="h2">הגדרות אסטרטגיה</SectionTitle>
 
-          {circuitBreakerTripped && (
-            <div
-              className="alert-error"
-              role="alert"
-              style={{ marginBottom: 12, padding: 12, lineHeight: 1.5, fontWeight: 600 }}
-            >
-              🛑 מפסק הבטיחות פעיל — כניסות חדשות חסומות. סיבה: {circuitBreakerReason}
+          {/* ===== A. STATUS HERO ===== */}
+          <Card padding="md" className="strat-hero">
+            <div className="strat-hero-top">
+              <div className="strat-mode-block">
+                <span className="strat-status-dot" aria-hidden />
+                <div>
+                  <div className="strat-big">
+                    {botMode === "off" ? "כבוי" : botMode === "semi" ? "חצי-אוטומטי" : "אוטומטי מלא"}
+                  </div>
+                  <div className="strat-lbl">מצב הבוט</div>
+                </div>
+              </div>
+              <div className="strat-seg" role="group" aria-label="מצב הבוט">
+                {(["off", "semi", "auto"] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setMode(m)}
+                    className={`${botMode === m ? "on" : ""}${m === "off" ? " off" : ""}`.trim()}
+                  >
+                    {m === "off" ? "כבוי" : m === "semi" ? "חצי-אוטומטי" : "אוטומטי מלא"}
+                  </button>
+                ))}
+              </div>
+              <div className="strat-divider-v" />
+              {engineStatus ? (
+                <div className="strat-metric">
+                  <span className="strat-k">סטטוס מנוע</span>
+                  <span className="strat-v">{engineStatus}</span>
+                </div>
+              ) : null}
+              {engineLastTickTs ? (
+                <div className="strat-metric">
+                  <span className="strat-k">עדכון אחרון</span>
+                  <span className="strat-v">
+                    {Math.max(0, Math.floor((Date.now() / 1000 - engineLastTickTs) as number))} שנ׳
+                  </span>
+                </div>
+              ) : null}
+              <div className="strat-metric">
+                <span className="strat-k">ניצחונות אסטרטגיה</span>
+                <span className="strat-v up">
+                  {botEngineStats
+                    ? botEngineStats.strategyEmpty
+                      ? "0 / 0"
+                      : `${botEngineStats.strategy.wins} / ${botEngineStats.strategy.n}`
+                    : `${botWins.wins} / ${botWins.n}`}
+                </span>
+              </div>
+              <div style={{ marginInlineStart: "auto", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                {venueTradingMode === "real" ? (
+                  <span className="strat-badge live">כסף אמיתי</span>
+                ) : venueTradingMode === "testnet_predict" ? (
+                  <span className="strat-badge demo">טסטנט (כסף מזויף)</span>
+                ) : (
+                  <span className="strat-badge demo">דמו</span>
+                )}
+                <span className="strat-badge venue">
+                  {orderVenue === "predict_fun" ? "₿ Binance (Predict.fun)" : "🟣 Polymarket"}
+                </span>
+              </div>
             </div>
-          )}
+            {circuitBreakerTripped && (
+              <div className="strat-hero-cb" role="alert">
+                🛑 מפסק הבטיחות פעיל — כניסות חדשות חסומות. סיבה: {circuitBreakerReason}
+              </div>
+            )}
+          </Card>
 
+          <Card padding="md">
+            {/* חלונות אחרונים (🟢/🔴) + ניצחונות הבוט — כדי שרואים שהמנוע עובד וזוכר */}
+            <div style={{ marginTop: 12, padding: 10, borderRadius: "var(--radius-sm)", background: "var(--bg)" }}>
+              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
+                <span>חלונות אחרונים (ישן ← חדש)</span>
+                <span style={{ color: "var(--muted)", display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  {botEngineStats ? (
+                    botEngineStats.strategyEmpty ? (
+                      <span>אסטרטגיה: <strong style={{ color: "var(--muted)" }}>אין עסקאות עדיין</strong></span>
+                    ) : (
+                      <span>
+                        ניצחונות אסטרטגיה: <strong style={{ color: "var(--up)" }}>{botEngineStats.strategy.wins}</strong>/{botEngineStats.strategy.n}
+                        {botEngineStats.strategy.pct != null ? ` (${botEngineStats.strategy.pct}%)` : ""}
+                      </span>
+                    )
+                  ) : (
+                    <span>
+                      ניצחונות הבוט: <strong style={{ color: "var(--up)" }}>{botWins.wins}</strong>/{botWins.n}
+                      {botWins.pct != null ? ` (${botWins.pct}%)` : ""}
+                    </span>
+                  )}
+                  {botEngineStats ? <span style={{ fontSize: 10, opacity: 0.8 }}>(מופרד לפי מנוע)</span> : null}
+                </span>
+              </div>
+              {botEngineStats && (
+                <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6, lineHeight: 1.6 }}>
+                  {botEngineStats.strategyEmpty && (
+                    <div style={{ marginBottom: 4 }}>
+                      אין עדיין עסקאות אסטרטגיה בדמו — כל הפעילות היא ממנוע המסחר המהיר
+                    </div>
+                  )}
+                  <span>
+                    מסחר מהיר (טריגר): <strong>{botEngineStats.trigger.wins}</strong>/{botEngineStats.trigger.n}
+                    {botEngineStats.trigger.pct != null ? ` (${botEngineStats.trigger.pct}%)` : ""}
+                    {botEngineStats.trigger.n > 0
+                      ? ` · P&L ${botEngineStats.trigger.pnl >= 0 ? "+" : "-"}$${Math.abs(botEngineStats.trigger.pnl).toFixed(2)}`
+                      : ""}
+                  </span>
+                </div>
+              )}
+              <div style={{ marginBottom: 6 }}>
+                <span
+                  className="badge-mode"
+                  title="מקור התוצאות לפיו מחושב Up/Down בחלונות שלמטה — Binance או ה-Chainlink oracle של Polymarket"
+                >
+                  מקור החלונות: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
+                </span>
+              </div>
+              {recentWindows.length > 0 ? (
+                <>
+                  <WindowCircles
+                    windows={recentWindows.slice(-16)}
+                    selectedEpoch={selectedWindowEpoch}
+                    onSelect={setSelectedWindowEpoch}
+                  />
+                  {selectedWindowEpoch != null &&
+                    (() => {
+                      const w = recentWindows.find((x) => x.epoch === selectedWindowEpoch);
+                      return w ? (
+                        <WindowDetailPanel window={w} onClose={() => setSelectedWindowEpoch(null)} />
+                      ) : null;
+                    })()}
+                </>
+              ) : (
+                <div style={{ fontSize: 12, color: "var(--muted)" }}>טוען היסטוריית חלונות…</div>
+              )}
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>
+                🟢 = BTC עלה (Up) · 🔴 = BTC ירד (Down) · מסגרת = החלון האחרון · ⏰ כל השעות בשעון ישראל. הנתונים נשמרים בשרת וממשיכים אחרי הפעלה מחדש.
+              </div>
+            </div>
+          </Card>
+
+          {/* ===== B. הפעלה — אישור + שמירה ===== */}
+          <Card padding="md">
+          <label style={{ display: "flex", alignItems: "center", gap: 8, margin: "0 0 10px" }}>
+            <input
+              type="checkbox"
+              checked={requireApproval}
+              onChange={async (e) => {
+                const v = e.target.checked;
+                setRequireApproval(v);
+                if (botMode !== "off") {
+                  await setMode(v ? "semi" : "auto");
+                }
+              }}
+            />
+            דורש אישור לפני כניסה לעסקה (מסומן = חצי־אוטומטי, לא מסומן = נכנס בלי לשאול)
+          </label>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 4, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className={`strat-btn-save${cfgDirty ? " dirty" : ""}`}
+              onClick={pushConfig}
+            >
+              {saveFeedback === "saved" ? "נשמר בהצלחה" : "שמור הגדרות"}
+            </button>
+            {cfgDirty && (
+              <span style={{ fontSize: 13, color: "var(--muted)" }}>
+                יש שינויים לא שמורים — ישמרו אוטומטית תוך 1.5 שניות (או לחץ שמור עכשיו)
+              </span>
+            )}
+          </div>
+          </Card>
+
+          {/* ===== C. הגדרות מסחר ===== */}
+          <Card padding="md">
+            <SectionTitle as="h3">הגדרות מסחר</SectionTitle>
+          <div className="strat-grid">
+            {/* מצב סכום השקעה */}
+            <div className="strat-field">
+              <label className="strat-field-label">
+                מצב סכום השקעה{" "}
+                <span title="קבוע: סכום ב-$ לכל עסקה. אחוז מתיק: % מה-equity הנוכחי (demo balance + שווי פוזיציות)">?</span>
+              </label>
+              <div className="strat-control">
+                <select
+                  value={investmentMode}
+                  onChange={(e) => {
+                    setInvestmentMode(e.target.value as "fixed" | "percent");
+                    markCfgDirty();
+                  }}
+                >
+                  <option value="fixed">סכום קבוע ($)</option>
+                  <option value="percent">אחוז מגודל התיק (%)</option>
+                </select>
+              </div>
+            </div>
+
+            {/* סכום השקעה / אחוז מהתיק */}
+            {investmentMode === "fixed" ? (
+              <div className="strat-field">
+                <label className="strat-field-label">סכום השקעה ($) <span title="תקציב לעסקה">?</span></label>
+                <div className="strat-control">
+                  <span className="strat-unit">$</span>
+                  <input
+                    type="number"
+                    step="0.5"
+                    value={inv}
+                    onChange={(e) => {
+                      setInv(Number(e.target.value));
+                      markCfgDirty();
+                    }}
+                    dir="ltr"
+                  />
+                </div>
+                {lossRecoveryEnabled && (
+                  <div className="strat-desc">
+                    יעד השקעה אצל המנוע כרגע:{" "}
+                    <strong className="tabular-nums">${(inv * lossRecoveryMultLive).toFixed(2)}</strong> (בסיס × מכפיל{" "}
+                    {lossRecoveryMultLive.toFixed(2)}) · הפסדים רצופים: {lossRecoveryStreak}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="strat-field">
+                <label className="strat-field-label">
+                  אחוז מגודל התיק (%){" "}
+                  <span title="סכום לעסקה = equity × אחוז / 100. loss recovery חל על זה כמו על סכום קבוע.">?</span>
+                </label>
+                <div className="strat-control">
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step="0.5"
+                    value={investmentPctOfPortfolio}
+                    onChange={(e) => {
+                      setInvestmentPctOfPortfolio(Number(e.target.value));
+                      markCfgDirty();
+                    }}
+                    dir="ltr"
+                  />
+                  <span className="strat-unit">%</span>
+                </div>
+                <div className="strat-desc">
+                  {equityNow > 0 ? (
+                    <>
+                      יעד השקעה אצל המנוע כרגע:{" "}
+                      <strong className="tabular-nums">${effectiveInvUsd.toFixed(2)}</strong>{" "}
+                      ({investmentPctOfPortfolio}% מתוך שווי תיק ${equityNow.toFixed(2)}
+                      {lossRecoveryEnabled ? ` × מכפיל ${lossRecoveryMultLive.toFixed(2)}` : ""})
+                      {lossRecoveryEnabled ? ` · הפסדים רצופים: ${lossRecoveryStreak}` : ""}
+                    </>
+                  ) : (
+                    <>מחושב דינמית כל כניסה מול שווי התיק (equity snapshot) — ממתין לטעינת שווי התיק…</>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* כניסה במחיר */}
+            <div className="strat-field">
+              <label className="strat-field-label">
+                כניסה במחיר (¢){" "}
+                <span title="Polymarket: בדרך כלל 1¢–99¢ לחוזה (0.01$–0.99$)">?</span>
+              </label>
+              <div className="strat-control">
+                <input
+                  type="number"
+                  min={1}
+                  max={99}
+                  value={entryCents}
+                  onChange={(e) => {
+                    const n = Number(e.target.value);
+                    if (Number.isFinite(n)) {
+                      setEntryCents(Math.min(99, Math.max(1, Math.round(n))));
+                      markCfgDirty();
+                    }
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">¢</span>
+              </div>
+              <div className="strat-desc">טווח מומלץ: 1–99 (סנטים) = 0.01$–0.99$ לחוזה</div>
+            </div>
+
+            {/* אורך חלון */}
+            <div className="strat-field">
+              <label className="strat-field-label">שוק BTC Up/Down (אורך חלון)</label>
+              <div className="strat-control">
+                <select
+                  value={btcWindow}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === "5m" || v === "15m") {
+                      setBtcWindow(v);
+                      markCfgDirty();
+                    }
+                  }}
+                >
+                  <option value="5m">5 דק׳ — btc-updown-5m (ברירת מחדל)</option>
+                  <option value="15m">15 דק׳ — btc-updown-15m</option>
+                </select>
+              </div>
+              <div className="strat-desc">
+                אחרי שינוי — לחץ &quot;שמור&quot;. הלוח והבוט יטענו את השוק המתאים (slug נפרד ב-Polymarket).
+              </div>
+            </div>
+
+            {/* מינ׳ חוזים */}
+            <div className="strat-field">
+              <label className="strat-field-label">מינ׳ חוזים (רצפה — לא פחות ממינ׳ Polymarket)</label>
+              <div className="strat-control">
+                <input
+                  type="number"
+                  min={exchangeMinContractsCeil ?? 1}
+                  step={1}
+                  value={minContracts}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    const floor = exchangeMinContractsCeil ?? 1;
+                    setMinContracts(Number.isFinite(v) ? Math.max(v, floor) : floor);
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">חוזים</span>
+              </div>
+              <div className="strat-desc">
+                מינ׳ בורסה לשוק הנוכחי:{" "}
+                {market != null ? (
+                  <>
+                    <strong>{Math.ceil(market.order_min_size)}</strong> חוזים
+                    {market.order_min_size_source === "clob"
+                      ? " (מספר CLOB — סמכותי)"
+                      : " (Gamma — עד עדכון מ־CLOB)"}
+                  </>
+                ) : (
+                  "טוען…"
+                )}
+                . בפועל הבוט סוחר בלפחות <strong>{effectiveMinContracts}</strong> חוזים.
+              </div>
+              <div className="strat-readout" style={{ color: contracts ? "var(--up)" : "var(--down)" }}>
+                ≈ {contracts || `לא מספיק למינ׳ ${effectiveMinContracts}`} חוזים
+                {contracts
+                  ? ` (מינ׳ ${effectiveMinContracts} — עומד · $${effectiveInvUsd.toFixed(2)} ב-${entryCents}¢)`
+                  : investmentMode === "percent" && equityNow <= 0
+                    ? ` — ממתין לטעינת שווי התיק…`
+                    : ` — צריך לפחות ${((effectiveMinContracts * entryCents) / 100).toFixed(2)}$ ב-${entryCents}¢${
+                        investmentMode === "percent"
+                          ? ` (${investmentPctOfPortfolio}% מ-$${equityNow.toFixed(2)} = $${effectiveInvUsd.toFixed(2)} — העלה את האחוז)`
+                          : ""
+                      }`}
+              </div>
+            </div>
+
+            {/* יעד רווח */}
+            <div className="strat-field">
+              <label className="strat-field-label">יעד רווח % (נטו משוער)</label>
+              <div className="strat-control">
+                <input
+                  type="number"
+                  value={tp}
+                  onChange={(e) => {
+                    setTp(Number(e.target.value));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">%</span>
+              </div>
+            </div>
+
+            {/* דק׳ מינימום לכניסה */}
+            <div className="strat-field">
+              <label className="strat-field-label">דק׳ מינימום לכניסה (נשאר בחלון)</label>
+              <div className="strat-control">
+                <input
+                  type="number"
+                  step="0.5"
+                  value={minMin}
+                  onChange={(e) => {
+                    setMinMin(Number(e.target.value));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">דק׳</span>
+              </div>
+            </div>
+
+            {/* קפיאה */}
+            <div className="strat-field">
+              <label className="strat-field-label">קפיאה בדקה(ות) אחרונה(ות)</label>
+              <div className="strat-control">
+                <input
+                  type="number"
+                  step="0.5"
+                  value={freezeMin}
+                  onChange={(e) => {
+                    setFreezeMin(Number(e.target.value));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">דק׳</span>
+              </div>
+            </div>
+          </div>
+
+          <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 14 }}>
+            <input
+              type="checkbox"
+              checked={interBlock}
+              onChange={(e) => {
+                setInterBlock(e.target.checked);
+                markCfgDirty();
+              }}
+            />
+            אזור ביניים: בלי כניסות חדשות בין {freezeMin} ל-{minMin} דק׳ לסיום
+          </label>
+          </Card>
+
+          {/* ===== D. כיוון ===== */}
+          <Card padding="md">
+            <SectionTitle as="h3">כיוון</SectionTitle>
+          <div style={{ marginBottom: 6, fontSize: 12.5, fontWeight: 600, color: "var(--text-secondary)" }}>צד</div>
+          <div className="strat-chips" style={{ marginBottom: 16 }}>
+            {([
+              { value: "Up", label: "Up ↑" },
+              { value: "Down", label: "Down ↓" },
+              { value: "signal", label: "אוטו (הצד הזול מ-Ask)" },
+            ] as const).map((opt) => (
+              <button
+                key={opt.value}
+                type="button"
+                className={`strat-chip${side === opt.value ? " on" : ""}`}
+                onClick={() => {
+                  setSide(opt.value as "Up" | "Down" | "signal");
+                  markCfgDirty();
+                }}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          {/* Follow Last Winner — כיוון לפי תוצאת חלון/ות קודמים */}
+          <div
+            style={{
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-sm)",
+              padding: 12,
+              marginBottom: 16,
+              background: "var(--bg-elevated)",
+            }}
+          >
+            <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}>
+              <input
+                type="checkbox"
+                checked={flwEnabled}
+                onChange={(e) => {
+                  setFlwEnabled(e.target.checked);
+                  markCfgDirty();
+                }}
+              />
+              כניסה לפי החלון המנצח (Follow Last Winner)
+            </label>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, lineHeight: 1.55 }}>
+              כשמסומן: כיוון הכניסה נגזר מתוצאת החלון/ות הקודמים, ועוקף את "צד" למעלה.
+              כל שאר ההגדרות (DCA, TP, slippage, גידור) נשארות זהות. אם אין מספיק היסטוריה או יש תיקו — חוזרים לבחירה ב"צד".
+            </div>
+
+            {flwEnabled && (
+              <div style={{ marginTop: 10, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
+                <label style={{ fontSize: 13 }}>
+                  מספר חלונות לבדוק{" "}
+                  <span title="1 = רק האחרון; 3 = רוב של 3 אחרונים; וכו'">?</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={5}
+                    step={1}
+                    value={flwLookback}
+                    onChange={(e) => {
+                      setFlwLookback(Math.max(1, Math.min(5, Math.floor(Number(e.target.value) || 1))));
+                      markCfgDirty();
+                    }}
+                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
+                  />
+                </label>
+
+                <label style={{ fontSize: 13 }}>
+                  כיוון{" "}
+                  <span title="forward = הצד שניצח חוזר; reverse = הימור הפוך (mean reversion)">?</span>
+                  <select
+                    value={flwMode}
+                    onChange={(e) => {
+                      setFlwMode(e.target.value as "forward" | "reverse");
+                      markCfgDirty();
+                    }}
+                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
+                  >
+                    <option value="forward">בכיוון המנצח (forward)</option>
+                    <option value="reverse">בכיוון הפוך (reverse)</option>
+                  </select>
+                </label>
+
+                <label style={{ fontSize: 13 }}>
+                  מינ׳ תזוזת BTC (%) {" "}
+                  <span title="חלון שתזוזת BTC בו קטנה מהסף נחשב 'רעש' ולא נחשב בבחירה. 0 = ללא סינון">?</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={10}
+                    step={0.01}
+                    value={flwMinDrift}
+                    onChange={(e) => {
+                      setFlwMinDrift(Math.max(0, Math.min(10, Number(e.target.value) || 0)));
+                      markCfgDirty();
+                    }}
+                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
+                  />
+                </label>
+              </div>
+            )}
+
+            {flwEnabled && lastWindowOutcome?.flw_preview && (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: 10,
+                  borderRadius: "var(--radius-sm)",
+                  background: "var(--bg)",
+                  fontSize: 12,
+                  lineHeight: 1.6,
+                }}
+              >
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                  תצוגה מקדימה (לפי המצב הנוכחי):
+                </div>
+                {lastWindowOutcome.flw_preview.side ? (
+                  <div>
+                    הכניסה הבאה תהיה{" "}
+                    <strong
+                      style={{
+                        color: lastWindowOutcome.flw_preview.side === "Up" ? "var(--up)" : "var(--down)",
+                      }}
+                    >
+                      {lastWindowOutcome.flw_preview.side}
+                    </strong>{" "}
+                    (lookback={lastWindowOutcome.flw_preview.lookback}, mode={lastWindowOutcome.flw_preview.mode})
+                  </div>
+                ) : (
+                  <div style={{ color: "var(--muted)" }}>
+                    אין מספיק היסטוריה / תיקו → fallback ל"צד"=<strong>{lastWindowOutcome.flw_preview.fallback_side_preference || side}</strong>
+                  </div>
+                )}
+                {lastWindowOutcome.flw_preview.samples && lastWindowOutcome.flw_preview.samples.length > 0 && (
+                  <div style={{ marginTop: 6, color: "var(--muted)" }}>
+                    דגימות:{" "}
+                    {lastWindowOutcome.flw_preview.samples
+                      .map((s) => `${s.side_won === "Up" ? "↑" : "↓"} ${s.side_won}`)
+                      .join(" · ")}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <div
+            style={{
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-sm)",
+              padding: 12,
+              marginBottom: 16,
+              background: "var(--bg-elevated)",
+              boxShadow: chopArmedFlwEnabled ? "inset 0 0 0 1px var(--accent-bright)" : undefined,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}>
+                <input
+                  type="checkbox"
+                  checked={chopArmedFlwEnabled}
+                  onChange={(e) => { setChopArmedFlwEnabled(e.target.checked); markCfgDirty(); }}
+                />
+                🎯 כניסה אחרי דשדוש + מעקב מנצח (Chop-Armed FLW)
+              </label>
+              {chopArmedFlwEnabled && (() => {
+                const st = chopCampaignState;
+                const bg = st === "active" ? "var(--up)" : st === "armed" ? "#f59e0b" : "var(--muted)";
+                const label =
+                  st === "active" ? `🔥 קמפיין פעיל ×${lossRecoveryMultLive.toFixed(2)}`
+                  : st === "armed" ? "🎯 דשדוש זוהה — נכנס"
+                  : "⏳ ממתין לדשדוש";
+                return (
+                  <span style={{ fontSize: 12, fontWeight: 700, color: "#0b0b0b", background: bg, padding: "3px 10px", borderRadius: 999 }}>
+                    {label}{chopCampaignDirection ? ` · ${chopCampaignDirection === "Up" ? "🟢 Up" : "🔴 Down"}` : ""}
+                  </span>
+                );
+              })()}
+            </div>
+
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 8, lineHeight: 1.6 }}>
+              הבוט <strong>מחכה</strong> עד שיהיו N נרות מתחלפים ברצף (דשדוש, למשל 4 = 🔴🟢🔴🟢), ואז נכנס{" "}
+              <strong>לפי המנצח האחרון</strong> ומכפיל על כל הפסד עד שמנצח. <strong>ברגע שהגיע לרווח (ניצחון) —
+              הקמפיין נגמר וחוזרים לחכות לדשדוש הבא</strong> (וכך גם אם הפסיד בתקרת ההכפלה). בין דשדוש לדשדוש
+              הבוט לא נכנס. כך מצמצמים את רצף ההפסדים שמנפח את ההכפלה.
+            </div>
+
+            {chopArmedFlwEnabled && (
+              <>
+                <div style={{ marginTop: 10, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
+                  <label style={{ fontSize: 13 }}>
+                    כמה נרות מתחלפים (דשדוש) לפני כניסה{" "}
+                    <span title="4 = 🔴🟢🔴🟢 · 5 = 🔴🟢🔴🟢🔴">?</span>
+                    <input
+                      type="number" min={2} max={10} step={1} value={chopLengthN}
+                      onChange={(e) => { setChopLengthN(Math.max(2, Math.min(10, Math.floor(Number(e.target.value) || 4)))); markCfgDirty(); }}
+                      style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
+                    />
+                  </label>
+                </div>
+
+                {!lossRecoveryEnabled ? (
+                  <div style={{ marginTop: 10, fontSize: 12, color: "#f59e0b", lineHeight: 1.6 }}>
+                    ⚠ «שחזור אחרי הפסד» כבוי — בלי הכפלה, כל הפסד מסיים מיד את הקמפיין.{" "}
+                    <button
+                      type="button"
+                      onClick={() => { setLossRecoveryEnabled(true); setLossRecoveryStepPct(100); setLossRecoveryEveryN(1); markCfgDirty(); }}
+                      style={{ padding: "3px 10px", fontSize: 12, borderRadius: 6, cursor: "pointer", marginInlineStart: 4 }}
+                    >
+                      הפעל הכפלה ×2 מהיר
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 8, fontSize: 12, color: "var(--muted)" }}>
+                    ההכפלה נשלטת בקטע «שחזור אחרי הפסד» למטה (התקרה = מה שתגדיר, בלי מגבלת ×3). כרגע: מקס ×{lossRecoveryMaxMult}, צעד {lossRecoveryStepPct}%.
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+          </Card>
+
+          {/* ===== E. בטיחות ===== */}
+          <Card padding="md" className="strat-safety">
+            <SectionTitle as="h3">🛡️ בטיחות</SectionTitle>
+            <div className="strat-stripe">
+              אלה המגנים שמפסיקים את הבוט לפני הפסד גדול. מומלץ להשאיר אותם דלוקים.
+            </div>
+            <div
+              style={{
+                marginTop: 14,
+                paddingTop: 14,
+                borderTop: "1px dashed var(--border-strong)",
+                marginBottom: 12,
+              }}
+            >
+              <div className="strat-toggle-row" style={{ borderBottom: 0, paddingTop: 0 }}>
+                <div>
+                  <div className="strat-t">🛑 מפסק בטיחות (Circuit-breaker)</div>
+                  <div className="strat-d">
+                    אופציונלי, כבוי כברירת-מחדל. חוסם כניסות חדשות כשמצב סיכון מתקיים; פוזיציות פתוחות עדיין יוצאות רגיל.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={circuitBreakerEnabled}
+                  aria-label="מפסק בטיחות (Circuit-breaker)"
+                  className={`strat-switch${circuitBreakerEnabled ? "" : " off"}`}
+                  onClick={() => {
+                    setCircuitBreakerEnabled(!circuitBreakerEnabled);
+                    markCfgDirty();
+                  }}
+                />
+              </div>
+              <label>
+                עצור אחרי N הפסדים רצופים (0=כבוי)
+                <div className="strat-control" style={{ maxWidth: 200, marginTop: 6, marginBottom: 10 }}>
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  value={circuitBreakerMaxConsecutiveLosses}
+                  onChange={(e) => {
+                    setCircuitBreakerMaxConsecutiveLosses(Math.max(0, Math.floor(Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">הפסדים</span>
+                </div>
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                <input
+                  type="checkbox"
+                  checked={circuitBreakerHaltAtCap}
+                  onChange={(e) => {
+                    setCircuitBreakerHaltAtCap(e.target.checked);
+                    markCfgDirty();
+                  }}
+                />
+                עצור כשהמכפיל מגיע לתקרה
+              </label>
+              <label>
+                עצור אם ההון יורד מתחת ל-% מהבסיס (0=כבוי)
+                <div className="strat-control" style={{ maxWidth: 200, marginTop: 6, marginBottom: 8 }}>
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  max={100}
+                  value={circuitBreakerEquityFloorPct}
+                  onChange={(e) => {
+                    setCircuitBreakerEquityFloorPct(Math.max(0, Math.min(100, Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">%</span>
+                </div>
+              </label>
+              <label>
+                רצפת-הגנה (stop-loss): צא אם מפסידים מעל X% (0=כבוי)
+                <div className="strat-control" style={{ maxWidth: 200, marginTop: 6, marginBottom: 8 }}>
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  max={100}
+                  value={floorStopPct}
+                  onChange={(e) => {
+                    setFloorStopPct(Math.max(0, Math.min(100, Number(e.target.value) || 0)));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">%</span>
+                </div>
+              </label>
+            </div>
+            <div
+              style={{
+                marginTop: 14,
+                paddingTop: 14,
+                borderTop: "1px dashed var(--border-strong)",
+                marginBottom: 12,
+              }}
+            >
+              <div className="strat-toggle-row" style={{ borderBottom: 0, paddingTop: 0 }}>
+                <div>
+                  <div className="strat-t">שחזור אחרי הפסד (מכפיל כניסה)</div>
+                  <div className="strat-d">
+                    רלוונטי כשהחלון נסגר והפוזיציה נפרקת בהפסד (הזמן נגמר / Up או Down הפסיד לפי מחיר הסגירה). לא מפעילים
+                    הכפלה על TP — אחרי TP מנצח המכפיל מתאפס. הפעלה: סכום היעד לכניסה × מכפיל; אחרי פירוק מופסד המכפיל עולה;
+                    איפוס אחרי TP או פירוק מנצח.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={lossRecoveryEnabled}
+                  aria-label="שחזור אחרי הפסד (מכפיל כניסה)"
+                  className={`strat-switch${lossRecoveryEnabled ? "" : " off"}`}
+                  onClick={() => {
+                    setLossRecoveryEnabled(!lossRecoveryEnabled);
+                    markCfgDirty();
+                  }}
+                />
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 12 }}>
+                <button
+                  type="button"
+                  className="strat-btn"
+                  disabled={!lossRecoveryEnabled}
+                  onClick={() => {
+                    setLossRecoveryStepPct(100);
+                    setLossRecoveryEveryN(1);
+                    markCfgDirty();
+                  }}
+                  style={{ fontSize: 12 }}
+                >
+                  הגדר הכפלה ×2 (צעד 100%, כל הפסד בפירוק)
+                </button>
+                <span style={{ fontSize: 11, color: "var(--muted)" }}>
+                  מכפיל ×2 אחרי כל פירוק מופסד, עד התקרה למטה
+                </span>
+              </div>
+              <label>
+                צעד הגדלה (% — מכפיל חדש = ישן × (1 + %/100); 100% = הכפלה)
+                <div className="strat-control" style={{ maxWidth: 200, marginTop: 6, marginBottom: 10 }}>
+                <input
+                  type="number"
+                  step="1"
+                  min={0}
+                  value={lossRecoveryStepPct}
+                  onChange={(e) => {
+                    setLossRecoveryStepPct(Math.max(0, Number(e.target.value) || 0));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">%</span>
+                </div>
+              </label>
+              <label>
+                כל כמה הפסדים רצופים (פירוק) להחיל צעד (1 = אחרי כל הפסד)
+                <div className="strat-control" style={{ maxWidth: 200, marginTop: 6, marginBottom: 10 }}>
+                <input
+                  type="number"
+                  step="1"
+                  min={1}
+                  value={lossRecoveryEveryN}
+                  onChange={(e) => {
+                    setLossRecoveryEveryN(Math.max(1, Math.floor(Number(e.target.value) || 1)));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                <span className="strat-unit">הפסדים</span>
+                </div>
+              </label>
+              <label>
+                תקרת מכפיל מול בסיס ההשקעה
+                <div className="strat-control" style={{ maxWidth: 200, marginTop: 6, marginBottom: 8 }}>
+                <span className="strat-unit">×</span>
+                <input
+                  type="number"
+                  step="0.5"
+                  min={1}
+                  value={lossRecoveryMaxMult}
+                  onChange={(e) => {
+                    setLossRecoveryMaxMult(Math.max(1, Number(e.target.value) || 1));
+                    markCfgDirty();
+                  }}
+                  dir="ltr"
+                />
+                </div>
+              </label>
+              <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.55 }}>
+                חל על לולאת האסטרטגיה הראשית בלבד (לא Trigger Trader). <strong>אין יותר תקרת ×3 קבועה — התקרה שתגדיר כאן היא הגבול.</strong>{" "}
+                הגנה יחידה שנשארת: כניסה בודדת לעולם לא תעבור 25% מהיתרה. סיכון מוגבר ליתרה — בחר תקרה ויתרה מתאימה.
+              </div>
+            </div>
+          </Card>
+
+          {/* ===== F. מתקדם (מקופל) ===== */}
+          <Collapsible title="פריסטים" subtitle="טעינת הגדרות מוכנות">
           <div style={{ marginBottom: 16 }}>
             <strong>פריסטים:</strong>
             {Object.entries(PRESETS).map(([k, v]) => (
@@ -3428,207 +4254,9 @@ export default function App() {
               </button>
             ))}
           </div>
+          </Collapsible>
 
-          <label style={{ display: "block", marginBottom: 8 }}>
-            מצב סכום השקעה{" "}
-            <span title="קבוע: סכום ב-$ לכל עסקה. אחוז מתיק: % מה-equity הנוכחי (demo balance + שווי פוזיציות)">?</span>
-            <select
-              value={investmentMode}
-              onChange={(e) => {
-                setInvestmentMode(e.target.value as "fixed" | "percent");
-                markCfgDirty();
-              }}
-              style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 4, padding: 8 }}
-            >
-              <option value="fixed">סכום קבוע ($)</option>
-              <option value="percent">אחוז מגודל התיק (%)</option>
-            </select>
-          </label>
-          {investmentMode === "fixed" ? (
-            <label>
-              סכום השקעה ($) <span title="תקציב לעסקה">?</span>
-              <input
-                type="number"
-                step="0.5"
-                value={inv}
-                onChange={(e) => {
-                  setInv(Number(e.target.value));
-                  markCfgDirty();
-                }}
-                style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
-              />
-              {lossRecoveryEnabled && (
-                <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
-                  יעד השקעה אצל המנוע כרגע:{" "}
-                  <strong className="tabular-nums">${(inv * lossRecoveryMultLive).toFixed(2)}</strong> (בסיס × מכפיל{" "}
-                  {lossRecoveryMultLive.toFixed(2)}) · הפסדים רצופים: {lossRecoveryStreak}
-                </div>
-              )}
-            </label>
-          ) : (
-            <label>
-              אחוז מגודל התיק (%){" "}
-              <span title="סכום לעסקה = equity × אחוז / 100. loss recovery חל על זה כמו על סכום קבוע.">?</span>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step="0.5"
-                value={investmentPctOfPortfolio}
-                onChange={(e) => {
-                  setInvestmentPctOfPortfolio(Number(e.target.value));
-                  markCfgDirty();
-                }}
-                style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
-              />
-              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.5 }}>
-                {equityNow > 0 ? (
-                  <>
-                    יעד השקעה אצל המנוע כרגע:{" "}
-                    <strong className="tabular-nums">${effectiveInvUsd.toFixed(2)}</strong>{" "}
-                    ({investmentPctOfPortfolio}% מתוך שווי תיק ${equityNow.toFixed(2)}
-                    {lossRecoveryEnabled ? ` × מכפיל ${lossRecoveryMultLive.toFixed(2)}` : ""})
-                    {lossRecoveryEnabled ? ` · הפסדים רצופים: ${lossRecoveryStreak}` : ""}
-                  </>
-                ) : (
-                  <>מחושב דינמית כל כניסה מול שווי התיק (equity snapshot) — ממתין לטעינת שווי התיק…</>
-                )}
-              </div>
-            </label>
-          )}
-          <label>
-            כניסה במחיר (¢){" "}
-            <span title="Polymarket: בדרך כלל 1¢–99¢ לחוזה (0.01$–0.99$)">?</span>
-            <input
-              type="number"
-              min={1}
-              max={99}
-              value={entryCents}
-              onChange={(e) => {
-                const n = Number(e.target.value);
-                if (Number.isFinite(n)) {
-                  setEntryCents(Math.min(99, Math.max(1, Math.round(n))));
-                  markCfgDirty();
-                }
-              }}
-              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
-            />
-            <span style={{ fontSize: 12, color: "var(--muted)", display: "block", marginTop: 4 }}>
-              טווח מומלץ: 1–99 (סנטים) = 0.01$–0.99$ לחוזה
-            </span>
-          </label>
-          <label style={{ display: "block", marginBottom: 12 }}>
-            שוק BTC Up/Down (אורך חלון)
-            <select
-              value={btcWindow}
-              onChange={(e) => {
-                const v = e.target.value;
-                if (v === "5m" || v === "15m") {
-                  setBtcWindow(v);
-                  markCfgDirty();
-                }
-              }}
-              style={{ display: "block", width: "100%", maxWidth: 320, marginTop: 6, padding: 8 }}
-            >
-              <option value="5m">5 דק׳ — btc-updown-5m (ברירת מחדל)</option>
-              <option value="15m">15 דק׳ — btc-updown-15m</option>
-            </select>
-            <span style={{ fontSize: 12, color: "var(--muted)", display: "block", marginTop: 6 }}>
-              אחרי שינוי — לחץ &quot;שמור&quot;. הלוח והבוט יטענו את השוק המתאים (slug נפרד ב-Polymarket).
-            </span>
-          </label>
-          <label>
-            מינ׳ חוזים (רצפה — לא פחות ממינ׳ Polymarket)
-            <input
-              type="number"
-              min={exchangeMinContractsCeil ?? 1}
-              step={1}
-              value={minContracts}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                const floor = exchangeMinContractsCeil ?? 1;
-                setMinContracts(Number.isFinite(v) ? Math.max(v, floor) : floor);
-                markCfgDirty();
-              }}
-              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, marginTop: 6, padding: 8 }}
-            />
-            <span style={{ fontSize: 12, color: "var(--muted)" }}>
-              מינ׳ בורסה לשוק הנוכחי:{" "}
-              {market != null ? (
-                <>
-                  <strong>{Math.ceil(market.order_min_size)}</strong> חוזים
-                  {market.order_min_size_source === "clob"
-                    ? " (מספר CLOB — סמכותי)"
-                    : " (Gamma — עד עדכון מ־CLOB)"}
-                </>
-              ) : (
-                "טוען…"
-              )}
-              . בפועל הבוט סוחר בלפחות <strong>{effectiveMinContracts}</strong> חוזים.
-            </span>
-          </label>
-          <div style={{ marginBottom: 12, color: contracts ? "var(--up)" : "#f87171" }}>
-            ≈ {contracts || `לא מספיק למינ׳ ${effectiveMinContracts}`} חוזים
-            {contracts
-              ? ` (מינ׳ ${effectiveMinContracts} — עומד · $${effectiveInvUsd.toFixed(2)} ב-${entryCents}¢)`
-              : investmentMode === "percent" && equityNow <= 0
-                ? ` — ממתין לטעינת שווי התיק…`
-                : ` — צריך לפחות ${((effectiveMinContracts * entryCents) / 100).toFixed(2)}$ ב-${entryCents}¢${
-                    investmentMode === "percent"
-                      ? ` (${investmentPctOfPortfolio}% מ-$${equityNow.toFixed(2)} = $${effectiveInvUsd.toFixed(2)} — העלה את האחוז)`
-                      : ""
-                  }`}
-          </div>
-
-          <label>
-            יעד רווח % (נטו משוער)
-            <input
-              type="number"
-              value={tp}
-              onChange={(e) => {
-                setTp(Number(e.target.value));
-                markCfgDirty();
-              }}
-              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
-            />
-          </label>
-          <label>
-            דק׳ מינימום לכניסה (נשאר בחלון)
-            <input
-              type="number"
-              step="0.5"
-              value={minMin}
-              onChange={(e) => {
-                setMinMin(Number(e.target.value));
-                markCfgDirty();
-              }}
-              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
-            />
-          </label>
-          <label>
-            קפיאה בדקה(ות) אחרונה(ות)
-            <input
-              type="number"
-              step="0.5"
-              value={freezeMin}
-              onChange={(e) => {
-                setFreezeMin(Number(e.target.value));
-                markCfgDirty();
-              }}
-              style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
-            />
-          </label>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-            <input
-              type="checkbox"
-              checked={interBlock}
-              onChange={(e) => {
-                setInterBlock(e.target.checked);
-                markCfgDirty();
-              }}
-            />
-            אזור ביניים: בלי כניסות חדשות בין {freezeMin} ל-{minMin} דק׳ לסיום
-          </label>
+          <Collapsible title="DCA (פריסה)" subtitle="כניסה מדורגת">
           <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
             <input
               type="checkbox"
@@ -3666,7 +4294,7 @@ export default function App() {
                   style={{ display: "block", marginBottom: 12, padding: 8 }}
                 />
               </label>
-              <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed #263244" }}>
+              <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed var(--border-strong)" }}>
                 <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
                   <input
                     type="checkbox"
@@ -3705,6 +4333,9 @@ export default function App() {
               </div>
             </>
           )}
+          </Collapsible>
+
+          <Collapsible title="גידור (Hedge)" subtitle="רגל שנייה כש-Ask משולב נמוך">
           <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
             <input
               type="checkbox"
@@ -3726,7 +4357,9 @@ export default function App() {
               style={{ width: 72, marginRight: 8 }}
             />
           </label>
-          <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid #263244" }}>
+          </Collapsible>
+
+          <Collapsible title="רווח אוטומטי (TP) + מגבלות בטיחות" subtitle="re-enter · cooldown · תקרות · יומן שוק">
             <h3 style={{ marginTop: 0 }}>רווח אוטומטי (TP) + מגבלות בטיחות</h3>
             <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
               <input
@@ -3791,7 +4424,7 @@ export default function App() {
                 style={{ display: "block", width: "100%", maxWidth: 200, marginBottom: 12, padding: 8 }}
               />
             </label>
-            <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed #263244" }}>
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed var(--border-strong)" }}>
               <div style={{ fontWeight: 700, marginBottom: 8 }}>סטטוס “קרוב ל…” (באחוזים)</div>
               <label>
                 קרוב לכניסה: עד כמה % מעל היעד עדיין נחשב “קרוב”
@@ -3878,11 +4511,17 @@ export default function App() {
                 למשל 3–5 — לעקוב אחרי תנועת מחירים בלי להציף; 0 ללא שורות &quot;שוק CLOB&quot;.
               </span>
             </label>
+            <div style={{ color: "var(--muted)", fontSize: 12 }}>
+              ההגבלות כאן לא מחליפות Stop Loss — הן רק מונעות מהבוט לרוץ בצורה לא מבוקרת.
+            </div>
+          </Collapsible>
+
+          <Collapsible title="ביצוע מובטח (Market / FOK+FAK)" subtitle="slippage · retry · peak watchdog · החזק עד סוף החלון">
             <div
               style={{
                 marginTop: 14,
                 paddingTop: 14,
-                borderTop: "1px dashed #263244",
+                borderTop: "1px dashed var(--border-strong)",
                 marginBottom: 12,
               }}
             >
@@ -4053,187 +4692,15 @@ export default function App() {
                 stop-loss דינמי — מכירה מידית אם bid יורד מתחת לממוצע הכניסה המשוקלל
               </label>
             </div>
-            <div
-              style={{
-                marginTop: 14,
-                paddingTop: 14,
-                borderTop: "1px dashed #263244",
-                marginBottom: 12,
-              }}
-            >
-              <div style={{ fontWeight: 700, marginBottom: 8 }}>שחזור אחרי הפסד (מכפיל כניסה)</div>
-              <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 10px", lineHeight: 1.55 }}>
-                רלוונטי כשהחלון נסגר והפוזיציה נפרקת בהפסד (הזמן נגמר / Up או Down הפסיד לפי מחיר הסגירה). לא מפעילים
-                הכפלה על TP — אחרי TP מנצח המכפיל מתאפס.
-              </p>
-              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                <input
-                  type="checkbox"
-                  checked={lossRecoveryEnabled}
-                  onChange={(e) => {
-                    setLossRecoveryEnabled(e.target.checked);
-                    markCfgDirty();
-                  }}
-                />
-                הפעל — סכום היעד לכניסה × מכפיל; אחרי פירוק מופסד המכפיל עולה; איפוס אחרי TP או פירוק מנצח
-              </label>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 12 }}>
-                <button
-                  type="button"
-                  disabled={!lossRecoveryEnabled}
-                  onClick={() => {
-                    setLossRecoveryStepPct(100);
-                    setLossRecoveryEveryN(1);
-                    markCfgDirty();
-                  }}
-                  style={{
-                    padding: "8px 12px",
-                    fontSize: 12,
-                    borderRadius: 8,
-                    border: "1px solid #475569",
-                    background: lossRecoveryEnabled ? "#1e293b" : "#0f172a",
-                    color: "#e2e8f0",
-                    cursor: lossRecoveryEnabled ? "pointer" : "not-allowed",
-                  }}
-                >
-                  הגדר הכפלה ×2 (צעד 100%, כל הפסד בפירוק)
-                </button>
-                <span style={{ fontSize: 11, color: "var(--muted)" }}>
-                  מכפיל ×2 אחרי כל פירוק מופסד, עד התקרה למטה
-                </span>
-              </div>
-              <label>
-                צעד הגדלה (% — מכפיל חדש = ישן × (1 + %/100); 100% = הכפלה)
-                <input
-                  type="number"
-                  step="1"
-                  min={0}
-                  value={lossRecoveryStepPct}
-                  onChange={(e) => {
-                    setLossRecoveryStepPct(Math.max(0, Number(e.target.value) || 0));
-                    markCfgDirty();
-                  }}
-                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
-                />
-              </label>
-              <label>
-                כל כמה הפסדים רצופים (פירוק) להחיל צעד (1 = אחרי כל הפסד)
-                <input
-                  type="number"
-                  step="1"
-                  min={1}
-                  value={lossRecoveryEveryN}
-                  onChange={(e) => {
-                    setLossRecoveryEveryN(Math.max(1, Math.floor(Number(e.target.value) || 1)));
-                    markCfgDirty();
-                  }}
-                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
-                />
-              </label>
-              <label>
-                תקרת מכפיל מול בסיס ההשקעה
-                <input
-                  type="number"
-                  step="0.5"
-                  min={1}
-                  value={lossRecoveryMaxMult}
-                  onChange={(e) => {
-                    setLossRecoveryMaxMult(Math.max(1, Number(e.target.value) || 1));
-                    markCfgDirty();
-                  }}
-                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}
-                />
-              </label>
-              <div style={{ color: "var(--muted)", fontSize: 12, lineHeight: 1.55 }}>
-                חל על לולאת האסטרטגיה הראשית בלבד (לא Trigger Trader). <strong>אין יותר תקרת ×3 קבועה — התקרה שתגדיר כאן היא הגבול.</strong>{" "}
-                הגנה יחידה שנשארת: כניסה בודדת לעולם לא תעבור 25% מהיתרה. סיכון מוגבר ליתרה — בחר תקרה ויתרה מתאימה.
-              </div>
-            </div>
-            <div
-              style={{
-                marginTop: 14,
-                paddingTop: 14,
-                borderTop: "1px dashed #263244",
-                marginBottom: 12,
-              }}
-            >
-              <div style={{ fontWeight: 700, marginBottom: 8 }}>🛑 מפסק בטיחות (Circuit-breaker)</div>
-              <p style={{ fontSize: 12, color: "var(--muted)", margin: "0 0 10px", lineHeight: 1.55 }}>
-                אופציונלי, כבוי כברירת-מחדל. חוסם כניסות חדשות כשמצב סיכון מתקיים; פוזיציות פתוחות עדיין יוצאות רגיל.
-              </p>
-              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                <input
-                  type="checkbox"
-                  checked={circuitBreakerEnabled}
-                  onChange={(e) => {
-                    setCircuitBreakerEnabled(e.target.checked);
-                    markCfgDirty();
-                  }}
-                />
-                🛑 מפסק בטיחות (Circuit-breaker)
-              </label>
-              <label>
-                עצור אחרי N הפסדים רצופים (0=כבוי)
-                <input
-                  type="number"
-                  step="1"
-                  min={0}
-                  value={circuitBreakerMaxConsecutiveLosses}
-                  onChange={(e) => {
-                    setCircuitBreakerMaxConsecutiveLosses(Math.max(0, Math.floor(Number(e.target.value) || 0)));
-                    markCfgDirty();
-                  }}
-                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 10, padding: 8 }}
-                />
-              </label>
-              <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                <input
-                  type="checkbox"
-                  checked={circuitBreakerHaltAtCap}
-                  onChange={(e) => {
-                    setCircuitBreakerHaltAtCap(e.target.checked);
-                    markCfgDirty();
-                  }}
-                />
-                עצור כשהמכפיל מגיע לתקרה
-              </label>
-              <label>
-                עצור אם ההון יורד מתחת ל-% מהבסיס (0=כבוי)
-                <input
-                  type="number"
-                  step="1"
-                  min={0}
-                  max={100}
-                  value={circuitBreakerEquityFloorPct}
-                  onChange={(e) => {
-                    setCircuitBreakerEquityFloorPct(Math.max(0, Math.min(100, Number(e.target.value) || 0)));
-                    markCfgDirty();
-                  }}
-                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}
-                />
-              </label>
-              <label>
-                רצפת-הגנה (stop-loss): צא אם מפסידים מעל X% (0=כבוי)
-                <input
-                  type="number"
-                  step="1"
-                  min={0}
-                  max={100}
-                  value={floorStopPct}
-                  onChange={(e) => {
-                    setFloorStopPct(Math.max(0, Math.min(100, Number(e.target.value) || 0)));
-                    markCfgDirty();
-                  }}
-                  style={{ display: "block", width: "100%", maxWidth: 200, marginTop: 6, marginBottom: 8, padding: 8 }}
-                />
-              </label>
-            </div>
+          </Collapsible>
+
+          <Collapsible title="מצב החלטה — מי בוחר את הצד" subtitle="ידני / הצעה / אוטונומי">
             <div
               id="decision-mode-block"
               style={{
                 marginTop: 14,
                 paddingTop: 14,
-                borderTop: "1px dashed #263244",
+                borderTop: "1px dashed var(--border-strong)",
                 marginBottom: 12,
                 scrollMarginTop: 80,
               }}
@@ -4289,347 +4756,33 @@ export default function App() {
                 </div>
               )}
             </div>
-            <div style={{ color: "var(--muted)", fontSize: 12 }}>
-              ההגבלות כאן לא מחליפות Stop Loss — הן רק מונעות מהבוט לרוץ בצורה לא מבוקרת.
-            </div>
-          </div>
-          <label>
-            צד
-            <select
-              value={side}
-              onChange={(e) => {
-                setSide(e.target.value as "Up" | "Down" | "signal");
-                markCfgDirty();
-              }}
-              style={{ display: "block", marginBottom: 16, padding: 8 }}
-            >
-              <option value="Up">Up</option>
-              <option value="Down">Down</option>
-              <option value="signal">אוטו (הצד הזול מ-Ask)</option>
-            </select>
-          </label>
+          </Collapsible>
 
-          {/* Follow Last Winner — כיוון לפי תוצאת חלון/ות קודמים */}
-          <div
-            style={{
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius-sm)",
-              padding: 12,
-              marginBottom: 16,
-              background: "var(--bg-elevated)",
-            }}
-          >
-            <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}>
-              <input
-                type="checkbox"
-                checked={flwEnabled}
-                onChange={(e) => {
-                  setFlwEnabled(e.target.checked);
-                  markCfgDirty();
-                }}
-              />
-              כניסה לפי החלון המנצח (Follow Last Winner)
-            </label>
-            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, lineHeight: 1.55 }}>
-              כשמסומן: כיוון הכניסה נגזר מתוצאת החלון/ות הקודמים, ועוקף את "צד" למעלה.
-              כל שאר ההגדרות (DCA, TP, slippage, גידור) נשארות זהות. אם אין מספיק היסטוריה או יש תיקו — חוזרים לבחירה ב"צד".
-            </div>
-
-            {flwEnabled && (
-              <div style={{ marginTop: 10, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))" }}>
-                <label style={{ fontSize: 13 }}>
-                  מספר חלונות לבדוק{" "}
-                  <span title="1 = רק האחרון; 3 = רוב של 3 אחרונים; וכו'">?</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={5}
-                    step={1}
-                    value={flwLookback}
-                    onChange={(e) => {
-                      setFlwLookback(Math.max(1, Math.min(5, Math.floor(Number(e.target.value) || 1))));
-                      markCfgDirty();
-                    }}
-                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
-                  />
-                </label>
-
-                <label style={{ fontSize: 13 }}>
-                  כיוון{" "}
-                  <span title="forward = הצד שניצח חוזר; reverse = הימור הפוך (mean reversion)">?</span>
-                  <select
-                    value={flwMode}
-                    onChange={(e) => {
-                      setFlwMode(e.target.value as "forward" | "reverse");
-                      markCfgDirty();
-                    }}
-                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
-                  >
-                    <option value="forward">בכיוון המנצח (forward)</option>
-                    <option value="reverse">בכיוון הפוך (reverse)</option>
-                  </select>
-                </label>
-
-                <label style={{ fontSize: 13 }}>
-                  מינ׳ תזוזת BTC (%) {" "}
-                  <span title="חלון שתזוזת BTC בו קטנה מהסף נחשב 'רעש' ולא נחשב בבחירה. 0 = ללא סינון">?</span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={10}
-                    step={0.01}
-                    value={flwMinDrift}
-                    onChange={(e) => {
-                      setFlwMinDrift(Math.max(0, Math.min(10, Number(e.target.value) || 0)));
-                      markCfgDirty();
-                    }}
-                    style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
-                  />
-                </label>
-              </div>
-            )}
-
-            {flwEnabled && lastWindowOutcome?.flw_preview && (
-              <div
-                style={{
-                  marginTop: 12,
-                  padding: 10,
-                  borderRadius: "var(--radius-sm)",
-                  background: "var(--bg)",
-                  fontSize: 12,
-                  lineHeight: 1.6,
-                }}
-              >
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                  תצוגה מקדימה (לפי המצב הנוכחי):
-                </div>
-                {lastWindowOutcome.flw_preview.side ? (
+          {/* ===== G. ממתין לאישור ===== */}
+          {pending && (() => {
+            const p = pending as { action?: string; side?: string; contracts?: number; limit?: number; ask?: number };
+            const sideRaw = typeof p.side === "string" ? p.side : "";
+            const priceNum = typeof p.ask === "number" ? p.ask : typeof p.limit === "number" ? p.limit : null;
+            const actionLabel = p.action === "hedge" ? "גידור (רגל 2)" : p.action === "buy" ? "קנייה" : p.action || "פעולה";
+            return (
+              <Card padding="md" style={{ border: "1px solid var(--accent)" }}>
+                <SectionTitle as="h3">ממתין לאישור</SectionTitle>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--s-4)", alignItems: "center", marginBottom: "var(--s-3)" }}>
+                  <div>פעולה: <strong>{actionLabel}</strong></div>
                   <div>
-                    הכניסה הבאה תהיה{" "}
-                    <strong
-                      style={{
-                        color: lastWindowOutcome.flw_preview.side === "Up" ? "var(--up)" : "var(--down)",
-                      }}
-                    >
-                      {lastWindowOutcome.flw_preview.side}
-                    </strong>{" "}
-                    (lookback={lastWindowOutcome.flw_preview.lookback}, mode={lastWindowOutcome.flw_preview.mode})
+                    צד:{" "}
+                    <strong style={{ color: sideRaw === "Up" ? "var(--up)" : sideRaw === "Down" ? "var(--down)" : "var(--text)" }}>
+                      {sideRaw || "—"}
+                    </strong>
                   </div>
-                ) : (
-                  <div style={{ color: "var(--muted)" }}>
-                    אין מספיק היסטוריה / תיקו → fallback ל"צד"=<strong>{lastWindowOutcome.flw_preview.fallback_side_preference || side}</strong>
-                  </div>
-                )}
-                {lastWindowOutcome.flw_preview.samples && lastWindowOutcome.flw_preview.samples.length > 0 && (
-                  <div style={{ marginTop: 6, color: "var(--muted)" }}>
-                    דגימות:{" "}
-                    {lastWindowOutcome.flw_preview.samples
-                      .map((s) => `${s.side_won === "Up" ? "↑" : "↓"} ${s.side_won}`)
-                      .join(" · ")}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Chop-Armed Follow-the-Winner — נכנס רק אחרי דשדוש, עוקב אחרי המנצח עם הכפלה מוגבלת */}
-          <div
-            style={{
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius-sm)",
-              padding: 12,
-              marginBottom: 16,
-              background: "var(--bg-elevated)",
-              boxShadow: chopArmedFlwEnabled ? "inset 0 0 0 1px var(--accent-bright)" : undefined,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 600 }}>
-                <input
-                  type="checkbox"
-                  checked={chopArmedFlwEnabled}
-                  onChange={(e) => { setChopArmedFlwEnabled(e.target.checked); markCfgDirty(); }}
-                />
-                🎯 כניסה אחרי דשדוש + מעקב מנצח (Chop-Armed FLW)
-              </label>
-              {chopArmedFlwEnabled && (() => {
-                const st = chopCampaignState;
-                const bg = st === "active" ? "var(--up)" : st === "armed" ? "#f59e0b" : "var(--muted)";
-                const label =
-                  st === "active" ? `🔥 קמפיין פעיל ×${lossRecoveryMultLive.toFixed(2)}`
-                  : st === "armed" ? "🎯 דשדוש זוהה — נכנס"
-                  : "⏳ ממתין לדשדוש";
-                return (
-                  <span style={{ fontSize: 12, fontWeight: 700, color: "#0b0b0b", background: bg, padding: "3px 10px", borderRadius: 999 }}>
-                    {label}{chopCampaignDirection ? ` · ${chopCampaignDirection === "Up" ? "🟢 Up" : "🔴 Down"}` : ""}
-                  </span>
-                );
-              })()}
-            </div>
-
-            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 8, lineHeight: 1.6 }}>
-              הבוט <strong>מחכה</strong> עד שיהיו N נרות מתחלפים ברצף (דשדוש, למשל 4 = 🔴🟢🔴🟢), ואז נכנס{" "}
-              <strong>לפי המנצח האחרון</strong> ומכפיל על כל הפסד עד שמנצח. <strong>ברגע שהגיע לרווח (ניצחון) —
-              הקמפיין נגמר וחוזרים לחכות לדשדוש הבא</strong> (וכך גם אם הפסיד בתקרת ההכפלה). בין דשדוש לדשדוש
-              הבוט לא נכנס. כך מצמצמים את רצף ההפסדים שמנפח את ההכפלה.
-            </div>
-
-            {chopArmedFlwEnabled && (
-              <>
-                <div style={{ marginTop: 10, display: "grid", gap: 10, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
-                  <label style={{ fontSize: 13 }}>
-                    כמה נרות מתחלפים (דשדוש) לפני כניסה{" "}
-                    <span title="4 = 🔴🟢🔴🟢 · 5 = 🔴🟢🔴🟢🔴">?</span>
-                    <input
-                      type="number" min={2} max={10} step={1} value={chopLengthN}
-                      onChange={(e) => { setChopLengthN(Math.max(2, Math.min(10, Math.floor(Number(e.target.value) || 4)))); markCfgDirty(); }}
-                      style={{ display: "block", width: "100%", padding: 6, marginTop: 4 }}
-                    />
-                  </label>
+                  <div>חוזים: <strong className="tabular-nums">{typeof p.contracts === "number" ? p.contracts : "—"}</strong></div>
+                  <div>מחיר: <strong className="tabular-nums">{priceNum != null ? `~${priceNum.toFixed(2)}` : "—"}</strong></div>
                 </div>
-
-                {!lossRecoveryEnabled ? (
-                  <div style={{ marginTop: 10, fontSize: 12, color: "#f59e0b", lineHeight: 1.6 }}>
-                    ⚠ «שחזור אחרי הפסד» כבוי — בלי הכפלה, כל הפסד מסיים מיד את הקמפיין.{" "}
-                    <button
-                      type="button"
-                      onClick={() => { setLossRecoveryEnabled(true); setLossRecoveryStepPct(100); setLossRecoveryEveryN(1); markCfgDirty(); }}
-                      style={{ padding: "3px 10px", fontSize: 12, borderRadius: 6, cursor: "pointer", marginInlineStart: 4 }}
-                    >
-                      הפעל הכפלה ×2 מהיר
-                    </button>
-                  </div>
-                ) : (
-                  <div style={{ marginTop: 8, fontSize: 12, color: "var(--muted)" }}>
-                    ההכפלה נשלטת בקטע «שחזור אחרי הפסד» למטה (התקרה = מה שתגדיר, בלי מגבלת ×3). כרגע: מקס ×{lossRecoveryMaxMult}, צעד {lossRecoveryStepPct}%.
-                  </div>
-                )}
-              </>
-            )}
-
-            {/* חלונות אחרונים (🟢/🔴) + ניצחונות הבוט — כדי שרואים שהמנוע עובד וזוכר */}
-            <div style={{ marginTop: 12, padding: 10, borderRadius: "var(--radius-sm)", background: "var(--bg)" }}>
-              <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
-                <span>חלונות אחרונים (ישן ← חדש)</span>
-                <span style={{ color: "var(--muted)" }}>
-                  ניצחונות הבוט: <strong style={{ color: "var(--up)" }}>{botWins.wins}</strong>/{botWins.n}
-                  {botWins.pct != null ? ` (${botWins.pct}%)` : ""}
-                </span>
-              </div>
-              <div style={{ marginBottom: 6 }}>
-                <span
-                  className="badge-mode"
-                  title="מקור התוצאות לפיו מחושב Up/Down בחלונות שלמטה — Binance או ה-Chainlink oracle של Polymarket"
-                >
-                  מקור החלונות: {dataSource === "binance" ? "₿ Binance" : "🟣 Polymarket"}
-                </span>
-              </div>
-              {recentWindows.length > 0 ? (
-                <>
-                  <WindowCircles
-                    windows={recentWindows.slice(-16)}
-                    selectedEpoch={selectedWindowEpoch}
-                    onSelect={setSelectedWindowEpoch}
-                  />
-                  {selectedWindowEpoch != null &&
-                    (() => {
-                      const w = recentWindows.find((x) => x.epoch === selectedWindowEpoch);
-                      return w ? (
-                        <WindowDetailPanel window={w} onClose={() => setSelectedWindowEpoch(null)} />
-                      ) : null;
-                    })()}
-                </>
-              ) : (
-                <div style={{ fontSize: 12, color: "var(--muted)" }}>טוען היסטוריית חלונות…</div>
-              )}
-              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>
-                🟢 = BTC עלה (Up) · 🔴 = BTC ירד (Down) · מסגרת = החלון האחרון. הנתונים נשמרים בשרת וממשיכים אחרי הפעלה מחדש.
-              </div>
-            </div>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              style={{
-                padding: "10px 20px",
-                background: cfgDirty ? "var(--accent)" : "#334155",
-                border: cfgDirty ? "2px solid #f59e0b" : "none",
-                color: "#fff",
-                borderRadius: 8,
-              }}
-              onClick={pushConfig}
-            >
-              {saveFeedback === "saved" ? "נשמר בהצלחה" : "שמור הגדרות"}
-            </button>
-            {cfgDirty && (
-              <span style={{ fontSize: 13, color: "var(--muted)" }}>
-                יש שינויים לא שמורים — ישמרו אוטומטית תוך 1.5 שניות (או לחץ שמור עכשיו)
-              </span>
-            )}
-          </div>
-
-          <h3>מצב בוט</h3>
-          <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-            <input
-              type="checkbox"
-              checked={requireApproval}
-              onChange={async (e) => {
-                const v = e.target.checked;
-                setRequireApproval(v);
-                if (botMode !== "off") {
-                  await setMode(v ? "semi" : "auto");
-                }
-              }}
-            />
-            דורש אישור לפני כניסה לעסקה (מסומן = חצי־אוטומטי, לא מסומן = נכנס בלי לשאול)
-          </label>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {(["off", "semi", "auto"] as const).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setMode(m)}
-                style={{
-                  padding: "10px 18px",
-                  background: botMode === m ? "var(--accent)" : "#333",
-                  color: "#fff",
-                  border: "none",
-                  borderRadius: 8,
-                }}
-              >
-                {m === "off" ? "כבוי" : m === "semi" ? "חצי-אוטומטי" : "אוטומטי מלא"}
-              </button>
-            ))}
-          </div>
-
-          <div style={{ marginTop: 10, color: "var(--muted)", fontSize: 13 }}>
-            סטטוס מנוע: <strong style={{ color: "#fff" }}>{engineStatus || "—"}</strong>
-            {engineLastTickTs ? (
-              <div style={{ marginTop: 4 }}>
-                עדכון אחרון:{" "}
-                <strong style={{ color: "#fff" }}>
-                  {Math.max(0, Math.floor((Date.now() / 1000 - engineLastTickTs) as number))} שנ׳
-                </strong>
-              </div>
-            ) : null}
-          </div>
-
-          {pending && (
-            <div
-              style={{
-                marginTop: 20,
-                padding: 16,
-                background: "#2d3748",
-                borderRadius: 8,
-              }}
-            >
-              <strong>ממתין לאישור:</strong>
-              <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(pending, null, 2)}</pre>
+                <div style={{ display: "flex", gap: "var(--s-2)", flexWrap: "wrap", marginBottom: "var(--s-3)" }}>
               <button
                 type="button"
+                className="strat-btn ok"
                 disabled={actionLoading === "approve"}
-                style={{ marginLeft: 8, padding: "8px 16px", background: actionLoading === "approve" ? "#374151" : "var(--up)", border: "none", color: "#fff", borderRadius: 6, opacity: actionLoading === "approve" ? 0.7 : 1, cursor: actionLoading === "approve" ? "not-allowed" : "pointer" }}
                 onClick={async () => {
                   setActionLoading("approve");
                   try {
@@ -4653,8 +4806,8 @@ export default function App() {
               </button>
               <button
                 type="button"
+                className="strat-btn no"
                 disabled={actionLoading === "reject"}
-                style={{ opacity: actionLoading === "reject" ? 0.7 : 1, cursor: actionLoading === "reject" ? "not-allowed" : "pointer" }}
                 onClick={async () => {
                   setActionLoading("reject");
                   try {
@@ -4667,9 +4820,16 @@ export default function App() {
               >
                 {actionLoading === "reject" ? "מבטל…" : "בטל"}
               </button>
-            </div>
-          )}
+                </div>
+                <Collapsible title="פרטים (JSON גולמי)">
+                  <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{JSON.stringify(pending, null, 2)}</pre>
+                </Collapsible>
+              </Card>
+            );
+          })()}
 
+          {/* ===== H. יומן (מקופל) ===== */}
+          <Collapsible title="יומן">
           <div
             style={{
               marginTop: 24,
@@ -4722,19 +4882,11 @@ export default function App() {
               {logJournalCopied ? "הועתק ללוח" : "העתק את כל היומן"}
             </button>
           </div>
-          <pre
-            style={{
-              maxHeight: 200,
-              overflow: "auto",
-              background: "#111",
-              padding: 12,
-              fontSize: 12,
-              borderRadius: 8,
-            }}
-          >
+          <pre className="strat-log">
             {logs.join("\n")}
           </pre>
-        </Card>
+          </Collapsible>
+        </div>
       )}
 
       {(tab === "stats" || tab === "stats_live") && (
@@ -4997,6 +5149,7 @@ export default function App() {
                       selectedEpoch={selectedWindowEpoch}
                       onSelect={setSelectedWindowEpoch}
                       botWins={botWins}
+                      byEngine={botEngineStats}
                     />
                   </Card>
                 )}

@@ -296,12 +296,16 @@ def diagnostics_dict(runner: StrategyRunner) -> dict[str, Any]:
     """נתונים לזיהוי תקיעות, בעיות ובריאות המערכת."""
     rt = runner.rt
     now = time.time()
-    sec_since_tick = now - rt.last_tick_ts if rt.last_tick_ts else None
+    sec_since_tick = now - rt.last_tick_ts if rt.last_tick_ts else None  # wall-clock — לתצוגה
+    # תקיעה נמדדת מול שעון monotonic (נעצר בזמן שינת/hibernate של המערכת) כדי לא לזהות
+    # false-positive אחרי שינת-לילה, בדיוק כמו ב-watchdog (main._loop_watchdog).
+    hb = float(getattr(rt, "last_tick_monotonic", 0) or 0)
+    mono_age = time.monotonic() - hb if hb > 0 else None
     potentially_stuck = (
         rt.mode == "auto"
-        and rt.last_tick_ts > 0
-        and sec_since_tick is not None
-        and sec_since_tick > 90
+        and hb > 0
+        and mono_age is not None
+        and mono_age > 90
     )
     return {
         "seconds_since_last_tick": round(sec_since_tick, 1) if sec_since_tick is not None else None,

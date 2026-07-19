@@ -12,9 +12,14 @@ import time
 import uuid
 import csv
 import io
+from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Literal, Optional
+from zoneinfo import ZoneInfo
+
+# תצוגת שעה בשעון ישראל (השרת רץ ב-UTC; עמודת הזמן בייצוא ה-CSV).
+_IL = ZoneInfo("Asia/Jerusalem")
 
 import httpx
 
@@ -990,7 +995,7 @@ class DemoEngine:
             w.writerow(
                 [
                     f"{ts:.3f}",
-                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "",
+                    datetime.fromtimestamp(ts, _IL).strftime("%Y-%m-%d %H:%M:%S") if ts else "",
                     t.get("type", ""),
                     t.get("side", ""),
                     t.get("contracts", ""),

@@ -110,6 +110,10 @@ class TriggerEngine:
         self.config = TriggerConfig()
         self.events: list[TriggerEvent] = []
         self.last_trigger_ts: float = 0.0
+        # חותמת backoff לכניסה שנכשלה/דולגה. מתקדמת גם בלי הצלחה כדי שכניסה
+        # נדונה-לכישלון (למשל אין יתרה) לא תיווסה שוב בכל טיק (~2ש׳) ותציף לוגים.
+        # ה-cooldown חוסם לפי max(last_trigger_ts, last_attempt_ts).
+        self.last_attempt_ts: float = 0.0
         self.triggers_this_window: int = 0
         self.current_window_epoch: int = 0
         self._task: Optional[asyncio.Task] = None
@@ -208,9 +212,11 @@ class TriggerEngine:
 
         await self._sync_window_epoch()
 
-        # cooldown
-        since_last = time.time() - self.last_trigger_ts
-        if self.last_trigger_ts > 0 and since_last < self.config.cooldown_sec:
+        # cooldown — חל גם על כניסה שנכשלה/דולגה (last_attempt_ts), לא רק על הצלחה,
+        # כדי שכניסה נדונה-לכישלון לא תנוסה שוב בכל טיק. אותו חלון זמן כמו הצלחה.
+        backoff_ref = max(self.last_trigger_ts, self.last_attempt_ts)
+        since_last = time.time() - backoff_ref
+        if backoff_ref > 0 and since_last < self.config.cooldown_sec:
             remaining = int(self.config.cooldown_sec - since_last)
             self.status = f"⏱ המתנה {remaining}ש׳"
             return
@@ -787,6 +793,48 @@ class TriggerEngine:
 
     # ── Trade execution ───────────────────────────────────────────────────────
 
+    def _register_entry_backoff(
+        self,
+        side: Optional[str],
+        cap: Optional[float],
+        contract_ask: Optional[float],
+        contracts: Optional[int],
+        *,
+        reason: str,
+        dedup_key: str,
+        fault_title: str,
+        fault_severity: str = "medium",
+        fault_category: str = "entry",
+        event_type: str = "skipped",
+    ) -> None:
+        """כניסה נכשלה/דולגה — אנטי-ספאם בלבד (בלי לשנות אילו טריידים מוצלחים קורים):
+          (b) מקדם את last_attempt_ts → שער ה-cooldown חוסם את הטיקים הבאים באותו חלון זמן.
+          (c) רושם תקלה אחת מנוכת-כפילויות (dedup_key) במקום מאות אירועי error per-tick.
+        שומר _log_event יחיד לפיד — לא per-tick, כי ה-backoff חוסם ניסיון נוסף עד תום ה-cooldown.
+        """
+        self.last_attempt_ts = time.time()
+        try:
+            from fault_tracker import record_fault
+            record_fault(
+                category=fault_category,
+                severity=fault_severity,
+                title=fault_title,
+                detail=reason,
+                source="trigger_engine",
+                dedup_key=dedup_key,
+                context={
+                    "mode": self.config.mode,
+                    "side": side,
+                    "cap": cap,
+                    "contract_ask": contract_ask,
+                    "contracts": contracts,
+                    "btc_window": self.config.btc_window,
+                },
+            )
+        except Exception:
+            pass
+        self._log_event(event_type, side, cap, contract_ask, contracts, reason)
+
     async def _execute_trade(
         self,
         side: str,
@@ -830,6 +878,27 @@ class TriggerEngine:
             contracts = int(amount / unit_cost) if unit_cost > 0 else 0
             contracts = max(oms, contracts)
         token_id = m.token_up if side == "Up" else m.token_down
+
+        # (a) קיצור-דרך לכניסה נדונה-לכישלון: אם העלות המתוכננת כבר גבוהה מהיתרה הזמינה —
+        # לא ננסה למלא (הדמו רק יחזיר 'אין יתרה מספקת' ויציף לוגים כל טיק). מדלגים נקי,
+        # מקדמים backoff ורושמים תקלה אחת מנוכת-כפילויות במקום spam.
+        est_fill = min(float(contract_ask), cap) if contract_ask is not None else cap
+        if est_fill <= 0 or est_fill > cap * 1.1:
+            est_fill = cap
+        planned_cost = est_fill * contracts * (1.0 + FEE_RATE)
+        balance = float(getattr(getattr(self._demo, "state", None), "balance_usd", 0.0) or 0.0)
+        if planned_cost > balance + 1e-9:
+            self._register_entry_backoff(
+                side, cap, contract_ask, contracts,
+                reason=f"אין יתרה מספקת (נדרש ~{planned_cost:.2f}$, יתרה {balance:.2f}$)",
+                dedup_key="trigger_insufficient_balance",
+                fault_title="Trigger: יתרת דמו לא מספקת לכניסה",
+            )
+            self.status = (
+                f"⛔ אין יתרה מספקת (נדרש ~{planned_cost:.2f}$, יתרה {balance:.2f}$) — "
+                f"המתנה {int(self.config.cooldown_sec)}ש׳"
+            )
+            return False
 
         # context מלא — ממלא את עמודות Gate / סיבה / epoch בטבלת העסקאות
         seconds_left = int(seconds_until_window_end(m.epoch, m.window_sec))
@@ -899,11 +968,25 @@ class TriggerEngine:
                 return True
             else:
                 err = result.get("error", "כשל לא ידוע")
-                self._log_event("error", side, cap, contract_ask, contracts, err)
+                # כשל מילוי — backoff + תקלה מנוכת-כפילויות במקום error per-tick
+                self._register_entry_backoff(
+                    side, cap, contract_ask, contracts,
+                    reason=err,
+                    dedup_key="trigger_entry_failed",
+                    fault_title="Trigger: כשל בביצוע כניסה",
+                    event_type="error",
+                )
                 self.status = f"⚠ כשל: {err}"
                 return False
         except Exception as e:
-            self._log_event("error", side, cap, contract_ask, None, str(e))
+            self._register_entry_backoff(
+                side, cap, contract_ask, None,
+                reason=str(e),
+                dedup_key="trigger_entry_exception",
+                fault_title="Trigger: חריגה בביצוע כניסה",
+                fault_severity="high",
+                event_type="error",
+            )
             self.status = f"⚠ שגיאה: {str(e)[:60]}"
             return False
 
@@ -1051,8 +1134,10 @@ class TriggerEngine:
 
     def to_dict(self) -> dict[str, Any]:
         cooldown_remaining: Optional[float] = None
-        if self.last_trigger_ts > 0:
-            remaining = self.config.cooldown_sec - (time.time() - self.last_trigger_ts)
+        # ה-cooldown חוסם לפי הצלחה או ניסיון-שנכשל (backoff) — הצג את המאוחר מביניהם
+        backoff_ref = max(self.last_trigger_ts, self.last_attempt_ts)
+        if backoff_ref > 0:
+            remaining = self.config.cooldown_sec - (time.time() - backoff_ref)
             cooldown_remaining = round(max(remaining, 0.0), 1)
 
         return {

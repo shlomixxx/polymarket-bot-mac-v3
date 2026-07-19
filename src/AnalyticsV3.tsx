@@ -8,6 +8,7 @@ import { api } from "./api";
 import { Card } from "./ui/Card";
 import { SectionTitle } from "./ui/SectionTitle";
 import { Button } from "./ui/Button";
+import { israelDateHM } from "./timeFormat";
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -53,10 +54,7 @@ type SubTab = "overview" | "timing" | "strategy" | "risk" | "backtest" | "insigh
 const fmtUsd = (v: number | null | undefined) => v == null ? "—" : `$${v.toFixed(2)}`;
 const fmtPct = (v: number | null | undefined) => v == null ? "—" : `${v.toFixed(1)}%`;
 const fmtNum = (v: number | null | undefined, d = 2) => v == null ? "—" : v.toFixed(d);
-const fmtTs = (ts: number) => {
-  const d = new Date(ts * 1000);
-  return `${d.getMonth() + 1}/${d.getDate()} ${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
-};
+const fmtTs = (ts: number) => israelDateHM(ts);
 
 const LEVEL_COLORS: Record<string, string> = {
   critical: "#ff4444",

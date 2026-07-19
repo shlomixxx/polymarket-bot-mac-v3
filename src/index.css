@@ -425,3 +425,390 @@ select:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   STRATEGY TAB — component styles ported from the approved mockup.
+   All colors resolve to the app's own design tokens (no hardcoded hex
+   except a couple of on-accent foregrounds that mirror the mockup).
+   Every class is "strat-" prefixed to avoid collisions.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* calm, consistent checkboxes across the whole strategy tab */
+.strat-root input[type="checkbox"] {
+  accent-color: var(--up);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+/* ── STATUS HERO ── */
+.strat-hero {
+  background: linear-gradient(180deg, var(--bg-elevated), var(--card));
+  border: 1px solid var(--border-strong) !important;
+  overflow: hidden;
+}
+.strat-hero-top {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: center;
+}
+.strat-status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--up);
+  box-shadow: 0 0 0 0 rgba(74, 155, 126, 0.5);
+  animation: strat-pulse 2.4s infinite;
+  flex: none;
+}
+@keyframes strat-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(74, 155, 126, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(74, 155, 126, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(74, 155, 126, 0);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .strat-status-dot {
+    animation: none;
+  }
+}
+.strat-mode-block {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+.strat-mode-block .strat-big {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--text);
+}
+.strat-mode-block .strat-lbl {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.strat-divider-v {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+}
+.strat-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.strat-metric .strat-k {
+  font-size: 11px;
+  color: var(--muted);
+}
+.strat-metric .strat-v {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.strat-metric .strat-v.up {
+  color: var(--up);
+}
+.strat-metric .strat-v.down {
+  color: var(--down);
+}
+
+/* ── segmented off / semi / auto run control ── */
+.strat-seg {
+  display: inline-flex;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  padding: 3px;
+  gap: 3px;
+}
+.strat-seg button {
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+.strat-seg button.on {
+  background: var(--up);
+  color: #04120c;
+}
+.strat-seg button.on.off {
+  background: var(--muted);
+  color: #0a0b0d;
+}
+
+/* ── save button ── */
+.strat-btn-save {
+  font-family: inherit;
+  font-weight: 600;
+  font-size: 14.5px;
+  border-radius: 8px;
+  padding: 11px 22px;
+  border: 0;
+  cursor: pointer;
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+.strat-btn-save:not(.dirty) {
+  background: var(--card-hover);
+  color: var(--text);
+}
+.strat-btn-save.dirty {
+  border: 2px solid var(--live);
+}
+
+/* ── generic token button (presets / helpers / approve-reject) ── */
+.strat-btn {
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  border-radius: 8px;
+  padding: 9px 16px;
+  cursor: pointer;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+.strat-btn:hover {
+  background: var(--card-hover);
+}
+.strat-btn.ok {
+  background: var(--up);
+  color: #04120c;
+  border-color: transparent;
+}
+.strat-btn.no {
+  background: transparent;
+  color: var(--down);
+  border-color: rgba(184, 92, 92, 0.4);
+}
+.strat-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ── settings fields: token control boxes with unit suffixes ── */
+.strat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+.strat-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.strat-field-label {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+.strat-desc {
+  font-size: 11px;
+  color: var(--muted);
+}
+.strat-control {
+  display: flex;
+  align-items: center;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0 10px;
+  height: 40px;
+}
+.strat-control input,
+.strat-control select {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14.5px;
+  height: 100%;
+  outline: none;
+  padding: 0;
+  font-variant-numeric: tabular-nums;
+}
+.strat-unit {
+  color: var(--muted);
+  font-size: 13px;
+  padding-inline-start: 6px;
+  flex: none;
+}
+.strat-readout {
+  font-size: 12px;
+  color: var(--up);
+  margin-top: 2px;
+}
+
+/* ── direction chip chooser ── */
+.strat-chips {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.strat-chip {
+  font-size: 13.5px;
+  font-weight: 600;
+  padding: 9px 15px;
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+}
+.strat-chip.on {
+  background: var(--accent);
+  color: var(--text-on-accent);
+  border-color: transparent;
+}
+
+/* ── safety card (warm accent) ── */
+.strat-safety {
+  border: 1px solid rgba(180, 83, 9, 0.35) !important;
+}
+.strat-stripe {
+  border-inline-start: 3px solid var(--live);
+  background: var(--live-bg);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin-bottom: 14px;
+  font-size: 13px;
+  color: #e6c893;
+  line-height: 1.5;
+}
+.strat-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.strat-toggle-row:last-child {
+  border-bottom: 0;
+}
+.strat-toggle-row .strat-t {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.strat-toggle-row .strat-d {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 2px;
+  line-height: 1.45;
+}
+.strat-row-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.strat-control.strat-mini {
+  width: 74px;
+  flex: none;
+}
+.strat-control.strat-mini input {
+  text-align: center;
+}
+
+/* ── toggle switch (styled checkbox replacement) ── */
+.strat-switch {
+  width: 42px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--up);
+  position: relative;
+  flex: none;
+  cursor: pointer;
+  border: 0;
+  padding: 0;
+  transition: background 0.15s ease;
+}
+.strat-switch.off {
+  background: var(--border-strong);
+}
+.strat-switch::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  inset-inline-start: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  transition: inset-inline-start 0.15s ease;
+}
+.strat-switch.off::after {
+  inset-inline-start: 21px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .strat-switch,
+  .strat-switch::after {
+    transition: none;
+  }
+}
+
+/* ── hero badges + circuit-breaker strip ── */
+.strat-badge {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+.strat-badge.demo {
+  background: var(--accent-muted, rgba(125, 147, 181, 0.14));
+  color: var(--accent-bright, var(--accent));
+}
+.strat-badge.live {
+  background: var(--down-bg, rgba(184, 92, 92, 0.14));
+  color: var(--down);
+  border-color: rgba(184, 92, 92, 0.4);
+}
+.strat-badge.venue {
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+}
+.strat-hero-cb {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  background: var(--down-bg, rgba(184, 92, 92, 0.14));
+  border-top: 1px solid var(--border);
+  color: #e7b3b3;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  padding: 10px 18px;
+  margin: 16px -18px -18px;
+}
+
+/* ── activity log ── */
+.strat-log {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--text-secondary);
+  max-height: 200px;
+  overflow: auto;
+  direction: ltr;
+  text-align: left;
+  white-space: pre-wrap;
+}

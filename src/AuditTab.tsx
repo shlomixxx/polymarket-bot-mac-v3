@@ -4,6 +4,7 @@ import { Card } from "./ui/Card";
 import { SectionTitle } from "./ui/SectionTitle";
 import { Button } from "./ui/Button";
 import { Collapsible } from "./ui/Collapsible";
+import { israelDateTimeMs } from "./timeFormat";
 
 /** לשונית "ביקורת עסקאות" — שורה לכל סשן עסקה שנסגר, עם drill-down מלא ללמידה. */
 
@@ -68,13 +69,7 @@ function statusChipColor(s: string): { color: string; bg: string } {
 // IMPORTANT: audit timestamps are in milliseconds — do NOT multiply by 1000.
 function fmtTime(ts: number | null): string {
   if (!ts) return "—";
-  try {
-    return new Date(ts).toLocaleString("he-IL", {
-      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
-    });
-  } catch {
-    return String(ts);
-  }
+  return israelDateTimeMs(ts);
 }
 
 function fmtUsd(v: number | null): string {

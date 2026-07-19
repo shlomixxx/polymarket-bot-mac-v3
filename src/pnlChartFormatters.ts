@@ -1,9 +1,8 @@
+import { israelTime } from "./timeFormat";
+
+/** PnL chart axis/tooltip time — HH:MM:SS in Israel time (see timeFormat.ts). */
 export function formatPnlAxisTime(tsSec: number): string {
-  return new Date(tsSec * 1000).toLocaleTimeString("he-IL", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+  return israelTime(tsSec);
 }
 
 export function formatPctAxisTick(v: number): string {

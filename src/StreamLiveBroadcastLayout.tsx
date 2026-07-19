@@ -15,6 +15,7 @@ import {
 } from "recharts";
 import { playEntryChime, playExitChime, resumeStreamAudio } from "./streamAudio";
 import type { RoundOutcomeRow } from "./StreamSpectatorLayout";
+import { israelDate, israelHM, israelTime, ISRAEL_TZ_LABEL } from "./timeFormat";
 
 /* ── local types ── */
 
@@ -149,8 +150,7 @@ function pxToCentsLabel(px: number | null | undefined): string {
 }
 
 function nowDateLabel(): string {
-  const d = new Date();
-  return d.toLocaleDateString("en-US", { month: "long", day: "numeric" });
+  return israelDate(Date.now() / 1000);
 }
 
 function nowTimeWindowLabel(market: Market | null): string {
@@ -159,13 +159,7 @@ function nowTimeWindowLabel(market: Market | null): string {
   const secsLeft = market.seconds_left ?? 0;
   const endTs = Date.now() + secsLeft * 1000;
   const startTs = endTs - windowSec * 1000;
-  const fmt = (ts: number) =>
-    new Date(ts).toLocaleTimeString("en-US", {
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true,
-    });
-  return `${fmt(startTs)} – ${fmt(endTs)} ET`;
+  return `${israelHM(startTs / 1000)} – ${israelHM(endTs / 1000)} (${ISRAEL_TZ_LABEL})`;
 }
 
 /* ── sub-components ── */
@@ -1569,17 +1563,7 @@ export function StreamLiveBroadcastLayout(
                           fill: "rgba(255,255,255,0.3)",
                           fontSize: 10,
                         }}
-                        tickFormatter={(v) =>
-                          new Date(Number(v) * 1000).toLocaleTimeString(
-                            "en-GB",
-                            {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                              second: "2-digit",
-                              hour12: false,
-                            }
-                          )
-                        }
+                        tickFormatter={(v) => israelTime(Number(v))}
                         stroke="rgba(255,255,255,0.08)"
                       />
                       <YAxis
@@ -1629,15 +1613,7 @@ export function StreamLiveBroadcastLayout(
                                   marginBottom: 3,
                                 }}
                               >
-                                {new Date(pt.t * 1000).toLocaleString(
-                                  "en-GB",
-                                  {
-                                    hour: "2-digit",
-                                    minute: "2-digit",
-                                    second: "2-digit",
-                                    hour12: false,
-                                  }
-                                )}
+                                {israelTime(pt.t)}
                               </div>
                               <div style={{ color: c, fontWeight: 700 }}>
                                 {formatUsdSigned(v)}

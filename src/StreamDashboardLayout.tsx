@@ -12,6 +12,7 @@ import {
   YAxis,
 } from "recharts";
 import type { StreamSpectatorLayoutProps, RoundOutcomeRow } from "./StreamSpectatorLayout";
+import { israelTime } from "./timeFormat";
 
 /* ── colours ────────────────────────────────── */
 const GREEN = "#34d399";
@@ -674,14 +675,7 @@ export function StreamDashboardLayout(props: StreamSpectatorLayoutProps) {
                     type="number"
                     domain={["dataMin", "dataMax"]}
                     tick={{ fill: "var(--muted)", fontSize: 11 }}
-                    tickFormatter={(v) =>
-                      new Date(Number(v) * 1000).toLocaleTimeString("en-GB", {
-                        hour: "2-digit",
-                        minute: "2-digit",
-                        second: "2-digit",
-                        hour12: false,
-                      })
-                    }
+                    tickFormatter={(v) => israelTime(Number(v))}
                   />
                   <YAxis
                     dataKey="usd"
@@ -718,12 +712,7 @@ export function StreamDashboardLayout(props: StreamSpectatorLayoutProps) {
                           }}
                         >
                           <div style={{ color: "var(--muted)", marginBottom: 4 }}>
-                            {new Date(best.t * 1000).toLocaleString("en-GB", {
-                              hour: "2-digit",
-                              minute: "2-digit",
-                              second: "2-digit",
-                              hour12: false,
-                            })}
+                            {israelTime(best.t)}
                           </div>
                           <div style={{ color: c, fontWeight: 700 }}>{formatUsdSigned(v)}</div>
                           <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 4 }}>

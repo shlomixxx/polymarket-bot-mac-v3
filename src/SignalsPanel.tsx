@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, isPageHidden } from "./api";
 import { Card } from "./ui/Card";
 import { SectionTitle } from "./ui/SectionTitle";
+import { israelHM, israelTimeMs } from "./timeFormat";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -110,8 +111,8 @@ function slugToLabel(slug: string | null | undefined): string {
   const winLabel = m[1] === "5m" ? "5 דק׳" : "15 דק׳";
   const epoch = parseInt(m[2]);
   const winSec = m[1] === "5m" ? 300 : 900;
-  const start = new Date(epoch * 1000).toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" });
-  const end = new Date((epoch + winSec) * 1000).toLocaleTimeString("he-IL", { hour: "2-digit", minute: "2-digit" });
+  const start = israelHM(epoch);
+  const end = israelHM(epoch + winSec);
   return `BTC ${winLabel} · ${start}–${end}`;
 }
 
@@ -626,7 +627,7 @@ export default function SignalsPanel() {
               )}
             </span>
             {lastRefresh && (
-              <span>סיגנלים: {new Date(lastRefresh).toLocaleTimeString("he-IL")}</span>
+              <span>סיגנלים: {israelTimeMs(lastRefresh)}</span>
             )}
           </div>
         </Card>

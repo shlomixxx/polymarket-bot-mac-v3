@@ -18,6 +18,8 @@ import {
   type WindowOutcome,
 } from "../windowStats";
 import { Collapsible } from "./Collapsible";
+import { israelDate, israelHM } from "../timeFormat";
+import type { EngineStat, EngineStatsView } from "../engineStats";
 
 const OUTCOME_BG: Record<WindowOutcome, string> = {
   up: "var(--up)",
@@ -150,9 +152,8 @@ export function WindowDetailPanel({ window: w, onClose }: { window: RecentWindow
   const outcomeColor = o === "up" ? "var(--up)" : o === "down" ? "var(--down)" : "var(--muted)";
   const durSec = windowSecForSlug(w.slug);
   const start = new Date(w.epoch * 1000);
-  const end = new Date((w.epoch + durSec) * 1000);
   const sameDay = start.toDateString() === new Date().toDateString();
-  const dateStr = sameDay ? "" : ` · ${start.toLocaleDateString("he-IL")}`;
+  const dateStr = sameDay ? "" : ` · ${israelDate(w.epoch)}`;
   const d = driftOf(w);
   const signedUsd = (n: number | null) =>
     n == null ? "—" : `${n >= 0 ? "+" : "−"}$${Math.abs(n).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
@@ -197,7 +198,7 @@ export function WindowDetailPanel({ window: w, onClose }: { window: RecentWindow
         <div style={{ color: "var(--text-secondary)" }}>
           מתי:{" "}
           <span dir="ltr" style={{ unicodeBidi: "isolate", display: "inline-block" }}>
-            {start.toLocaleTimeString("he-IL")} – {end.toLocaleTimeString("he-IL")}
+            {israelHM(w.epoch)} – {israelHM(w.epoch + durSec)}
           </span>
           {dateStr}
         </div>
@@ -252,6 +253,69 @@ function StatTile({
   );
 }
 
+/**
+ * BotWinsByEngine — מציג את "ניצחונות הבוט" בדמו מופרד לפי מנוע: האסטרטגיה (ראשי/כותרת)
+ * ולצידה, בנפרד ומסומן, המסחר-המהיר (טריגר) — כדי שתוצאות הטריגר לא יתחזו לביצועי
+ * האסטרטגיה. כשאין עדיין עסקאות-אסטרטגיה מוצגת הודעה במקום 0/0 שבור. אם אין כלל
+ * פיצול לפי מנוע (לפני סשן / שרת ישן) — נפילה חזרה לאריח המאוחד. */
+export function BotWinsByEngine({
+  view,
+  botWins,
+}: {
+  view: EngineStatsView | null;
+  botWins: { wins: number; n: number; pct: number | null };
+}) {
+  // fallback — אין פיצול לפי מנוע: הצג את האריח המאוחד הישן (תאימות לאחור).
+  if (!view) {
+    return (
+      <StatTile
+        label="ניצחונות הבוט"
+        value={`${botWins.wins}/${botWins.n}`}
+        sub={botWins.pct != null ? `${botWins.pct}%` : "—"}
+        color="var(--up)"
+      />
+    );
+  }
+  const { strategy, trigger, strategyEmpty } = view;
+  const pnlStr = (p: number) => `${p >= 0 ? "+" : "-"}$${Math.abs(p).toFixed(2)}`;
+  const subOf = (s: EngineStat) =>
+    s.pct != null ? `${s.pct}% · ${pnlStr(s.pnl)}` : s.n > 0 ? pnlStr(s.pnl) : "—";
+  return (
+    <div style={{ display: "grid", gap: "var(--s-2)", minWidth: 180 }}>
+      <div style={{ fontSize: 11, color: "var(--muted)" }}>ניצחונות הבוט (מופרד לפי מנוע)</div>
+      {strategyEmpty ? (
+        <div
+          style={{
+            fontSize: 12,
+            color: "var(--muted)",
+            padding: "8px 12px",
+            borderRadius: "var(--radius-sm)",
+            background: "var(--bg)",
+            border: "1px dashed var(--border)",
+            lineHeight: 1.5,
+            maxWidth: 260,
+          }}
+        >
+          אין עדיין עסקאות אסטרטגיה בדמו — כל הפעילות היא ממנוע המסחר המהיר
+        </div>
+      ) : (
+        <StatTile
+          label="אסטרטגיה — ניצחונות"
+          value={`${strategy.wins}/${strategy.n}`}
+          sub={subOf(strategy)}
+          color="var(--up)"
+        />
+      )}
+      <StatTile
+        label="מסחר מהיר (טריגר)"
+        value={`${trigger.wins}/${trigger.n}`}
+        sub={subOf(trigger)}
+        color="var(--muted)"
+      />
+    </div>
+  );
+}
+
 /** 24-cell heatmap (hour 0-23 UTC), tinted green↔red by up_rate. */
 export function HourlyHeatmap({ hourly }: { hourly: HourlyBucket[] }) {
   const byHour = new Map(hourly.map((h) => [h.hour, h]));
@@ -300,12 +364,14 @@ export function WindowsStatsPanel({
   selectedEpoch,
   onSelect,
   botWins,
+  byEngine,
 }: {
   windows: RecentWindow[];
   hourly: HourlyBucket[];
   selectedEpoch: number | null;
   onSelect: (e: number | null) => void;
   botWins: { wins: number; n: number; pct: number | null };
+  byEngine?: EngineStatsView | null;
 }) {
   const s = deriveWindowStats(windows);
   const selected = selectedEpoch != null ? windows.find((w) => w.epoch === selectedEpoch) : undefined;
@@ -353,7 +419,7 @@ export function WindowsStatsPanel({
         />
         <StatTile label="רצף הכי ארוך" value={`${s.longestStreak}`} />
         <StatTile label="ציון דשדוש" value={`${Math.round(s.chopScore * 100)}%`} sub="100% = 🔴🟢🔴🟢 מלא" color={s.chopScore >= 0.6 ? "var(--accent-bright)" : "var(--muted)"} />
-        <StatTile label="ניצחונות הבוט" value={`${botWins.wins}/${botWins.n}`} sub={botWins.pct != null ? `${botWins.pct}%` : "—"} color="var(--up)" />
+        <BotWinsByEngine view={byEngine ?? null} botWins={botWins} />
       </div>
 
       <Collapsible title="מה זה «ציון דשדוש»?" subtitle="למה זה חשוב לאסטרטגיית Chop-Armed FLW">

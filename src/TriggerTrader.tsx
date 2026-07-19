@@ -4,6 +4,7 @@ import { Card } from "./ui/Card";
 import { SectionTitle } from "./ui/SectionTitle";
 import { Button } from "./ui/Button";
 import { Collapsible } from "./ui/Collapsible";
+import { israelTime, israelDateTime } from "./timeFormat";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -88,8 +89,7 @@ const DEFAULT_CONFIG: TriggerConfig = {
 // ─── Small helpers ────────────────────────────────────────────────────────────
 
 function ts2time(ts: number) {
-  if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleTimeString("he-IL");
+  return israelTime(ts);
 }
 
 function eventIcon(type: TriggerEvent["event_type"]) {
@@ -1119,7 +1119,7 @@ export default function TriggerTrader() {
                           ["cap (מחיר מקס)", ev.price != null ? `${(ev.price * 100).toFixed(1)}¢` : "—"],
                           ["ask בפועל", ev.contract_ask != null ? `${(ev.contract_ask * 100).toFixed(1)}¢` : "—"],
                           ["חוזים", ev.contracts != null ? String(ev.contracts) : "—"],
-                          ["שעה", new Date(ev.ts * 1000).toLocaleString("he-IL")],
+                          ["שעה", israelDateTime(ev.ts)],
                         ].map(([k, v]) => (
                           <div key={k}>
                             <span style={{ color: "var(--muted)" }}>{k}: </span>

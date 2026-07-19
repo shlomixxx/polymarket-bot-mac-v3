@@ -3,6 +3,7 @@ import { api, isPageHidden } from "./api";
 import { Card } from "./ui/Card";
 import { SectionTitle } from "./ui/SectionTitle";
 import { Button } from "./ui/Button";
+import { israelDateTime } from "./timeFormat";
 
 /** לשונית "תקלות ובאגים" — מעקב אחרי כשלים במערכת: חומרה, ספירה, טופל/לא, שיתוף. */
 
@@ -52,14 +53,8 @@ function sevMeta(s: string) {
 }
 
 function fmtTime(ts: number): string {
-  if (!ts) return "—";
-  try {
-    return new Date(ts * 1000).toLocaleString("he-IL", {
-      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
-    });
-  } catch {
-    return String(ts);
-  }
+  // epoch SECONDS → Israel time "DD/MM HH:MM:SS"; helper guards invalid/zero → "—".
+  return israelDateTime(ts);
 }
 
 function fmtAgo(ts: number): string {
@@ -182,7 +177,7 @@ export default function FaultsTab() {
 
   const copyReport = async () => {
     const lines: string[] = [];
-    lines.push(`# דוח תקלות מערכת — ${new Date().toLocaleString("he-IL")}`);
+    lines.push(`# דוח תקלות מערכת — ${israelDateTime(Date.now() / 1000)}`);
     if (counts) {
       lines.push(
         `סה"כ: ${counts.total} | פתוחות: ${counts.open} | חמורות פתוחות: ${counts.open_severe} | טופלו: ${counts.handled}`

@@ -27,6 +27,7 @@ import {
   TIMEOUT_MS_ORDERBOOK_SUMMARY,
   TIMEOUT_MS_DEMO_STATE,
 } from "./api";
+import { israelTime } from "./timeFormat";
 
 async function safeApi<T>(path: string, opt?: { timeoutMs?: number }): Promise<T | null> {
   try {
@@ -417,8 +418,7 @@ function buildRoundOutcomes(
   });
   const sorted = [...exits].sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0));
   const out: RoundOutcome[] = [];
-  const fmt = (d: Date) =>
-    d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  const fmt = (d: Date) => israelTime(d.getTime() / 1000);
   /** פירוק בסוף חלון — לעיתים ה-ts מגיע שניה אחרי הקצה; מציגים דקה עגולה (שניות 00). */
   const exitTimeLabel = (sec: number, typ: string) => {
     const d = new Date(sec * 1000);
@@ -2395,14 +2395,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
                   type="number"
                   domain={["dataMin", "dataMax"]}
                   tick={{ fill: "var(--muted)", fontSize: 11 }}
-                  tickFormatter={(v) =>
-                    new Date(Number(v) * 1000).toLocaleTimeString("en-US", {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                      second: "2-digit",
-                      hour12: false,
-                    })
-                  }
+                  tickFormatter={(v) => israelTime(Number(v))}
                 />
                 <YAxis
                   dataKey="pct"
@@ -2420,14 +2413,7 @@ export default function LiveStreamTrade({ layout = "classic" }: { layout?: Strea
                     fontSize: 13,
                   }}
                   cursor={{ stroke: "rgba(248, 250, 252, 0.35)", strokeWidth: 1 }}
-                  labelFormatter={(v) =>
-                    new Date(Number(v) * 1000).toLocaleString("en-US", {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                      second: "2-digit",
-                      hour12: false,
-                    })
-                  }
+                  labelFormatter={(v) => israelTime(Number(v))}
                   formatter={(value: number) => [`${Number(value).toFixed(2)}%`, "PnL %"]}
                 />
                 <ReferenceLine y={0} stroke="var(--border-strong)" strokeDasharray="4 4" />

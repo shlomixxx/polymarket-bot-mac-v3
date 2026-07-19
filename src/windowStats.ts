@@ -4,6 +4,8 @@
  * so every circle in the app derives from one source of truth. No React, no I/O.
  */
 
+import { israelTime } from "./timeFormat";
+
 /** A closed 5m/15m window as returned by /api/history/recent. */
 export type RecentWindow = {
   epoch: number;
@@ -59,14 +61,9 @@ export function driftOf(w: RecentWindow): { abs: number | null; pct: number | nu
   return { abs, pct: (abs / o) * 100 };
 }
 
-/** Wall-clock HH:MM:SS (he-IL), or "—" for an invalid/zero epoch. */
+/** Wall-clock HH:MM:SS in Israel time, or "—" for an invalid/zero epoch. */
 export function clockHms(unixSec: number): string {
-  if (!Number.isFinite(unixSec) || unixSec <= 0) return "—";
-  return new Date(unixSec * 1000).toLocaleTimeString("he-IL", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+  return israelTime(unixSec);
 }
 
 /** Aggregate stats derived purely from the windows array. Order-independent (sorts by epoch). */
